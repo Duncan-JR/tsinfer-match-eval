@@ -1,0 +1,10 @@
+config.yaml
+.venv/
+.snakemake/
+.progress/
+.ruff_cache/
+__pycache__/
+*.egg-info/
+build/
+data/
+

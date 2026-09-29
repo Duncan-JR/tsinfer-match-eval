@@ -1,0 +1,12 @@
+data_dir: data/match_eval
+progress_dir: .progress
+
+datasets:
+  - name: out_of_africa_n300_1mbp
+    zarr_path: ../tsinfer-anc-eval/data/anc_eval/zarr_vcfs/OutOfAfrica_4J17-chr20-L0-R1e6-n300-s1-rep0-geno-0.0-phase0.0-mispol0.0.zarr
+    ts_path: ../tsinfer-anc-eval/data/anc_eval/simulated/OutOfAfrica_4J17-chr20-L0-R1e6-n300-s1-rep0.trees
+    ancestral_state:
+      field: variant_ancestral_state
+
+ancestor_chunk_size: 5000
+inference_threads: 1
