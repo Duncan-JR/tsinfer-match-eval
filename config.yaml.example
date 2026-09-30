@@ -10,3 +10,4 @@ datasets:
 
 ancestor_chunk_size: 5000
 inference_threads: 1
+matching_threads: 1

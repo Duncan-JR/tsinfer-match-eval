@@ -7,6 +7,7 @@ import subprocess
 
 import numpy as np
 import tomli_w
+import tsinfer
 import zarr
 
 logger = logging.getLogger(__name__)
@@ -63,13 +64,18 @@ def add_singleton_mask(
     zarr.consolidate_metadata(output)
     logger.info("Annotated %d observed singleton sites", int(mask[:].sum()))
 
+
 def write_inference_config(
     samples: pathlib.Path,
     ancestors: pathlib.Path,
     output: pathlib.Path,
     ancestral_state: dict,
 ) -> None:
-    """Write one native TOML with the fresh singleton annotation as a filter."""
+    """Write native inference/matching TOML for the selected ancestor panel.
+
+    Both sources stay in match.sources so ancestor matching obtains the full
+    sample contig length. A true-panel configuration is for matching only.
+    """
     source = {
         "name": "samples",
         "path": str(samples.resolve()),
@@ -88,6 +94,7 @@ def write_inference_config(
         "ancestors": [panel],
         "match": {
             "output": str(matched.resolve()),
+            "path_compression": False,
             "sources": {
                 "ancestors": {"node_flags": 0, "create_individuals": False},
                 "samples": {"node_flags": 1, "create_individuals": True},
