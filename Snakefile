@@ -1,6 +1,6 @@
 import pathlib
 
-from lib import ancestors, evaluation, matching, utils
+from lib import ancestors, evaluation, haplotypes, matching, utils
 
 
 configfile: "config.yaml"
@@ -48,6 +48,10 @@ rule all:
         ],
         expand(
             data_dir / "dataframes" / "{name}_inferred_focal_ancestor_stats.csv",
+            name=names,
+        ),
+        expand(
+            data_dir / "dataframes" / "{name}_inferred_focal_ancestor_chunks.csv",
             name=names,
         ),
 
@@ -180,6 +184,36 @@ rule find_focal_ancestors:
             datasets[wildcards.name]["ancestral_state"],
             dataframe_path,
         )
+
+
+rule construct_focal_ancestor_chunks:
+    input:
+        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
+        ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
+        focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+    output:
+        data_dir / "dataframes" / "{name}_inferred_focal_ancestor_chunks.csv",
+    params:
+        max_ac_cutoff=max(config["ac_cutoff"]),
+        max_mismatches=config["haplotype_compare"]["max_mismatches"],
+        ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
+    threads: workflow.cores
+    log:
+        progress_dir / "construct_focal_ancestor_chunks" / "{name}_inferred_construct_focal_ancestor_chunks.log",
+    run:
+        utils.setup_log(pathlib.Path(log[0]))
+        dataframe = haplotypes.construct_focal_ancestor_chunks(
+            pathlib.Path(input.samples),
+            pathlib.Path(input.ancestors),
+            pathlib.Path(input.focal),
+            params.ancestral_state,
+            params.max_ac_cutoff,
+            params.max_mismatches,
+            threads,
+        )
+        dataframe.insert(0, "panel_kind", "inferred")
+        dataframe.insert(0, "dataset", wildcards.name)
+        dataframe.to_csv(output[0], index=False)
 
 
 rule match_samples:
