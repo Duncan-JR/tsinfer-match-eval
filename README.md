@@ -1,9 +1,12 @@
 # tsinfer matching evaluation
 
-A small Snakemake pipeline that builds inferred and true ancestor panels,
-matches ancestors and samples separately, and records focal candidates per
-sample haplotype. It reads simulations from `../tsinfer-anc-eval` and uses
-an editable `../tsinfer` checkout. The workflow calls functions in `lib` directly.
+A small Snakemake pipeline that builds inferred ancestor panels, matches
+ancestors and samples separately, records focal candidates per sample haplotype,
+and evaluates copying from allele-count eligible focal ancestors. It reads
+simulations from `../tsinfer-anc-eval` and uses an editable `../tsinfer`
+checkout. The workflow calls functions in `lib` directly. True-panel rules
+remain available through explicit output targets, but the default workflow is
+inferred-only and never depends on `ts_path`.
 
 ## Run
 
@@ -15,17 +18,19 @@ uv sync
 uv run snakemake --cores all
 ```
 
-After changing code in `lib`, rerun affected outputs explicitly because these
-files are intentionally not Snakemake inputs:
+For the one-time count/config/focal format migration, run:
 
 ```sh
-uv run snakemake --cores all --forcerun mask_singletons
+uv run snakemake --cores all --forcerun mask_singletons write_inference_config find_focal_ancestors compute_focal_ancestor_stats
 ```
 
-After changing the TOML writer or truth extraction, force
-`write_inference_config`, `write_true_ancestors_config`, or
-`extract_true_ancestors` as appropriate. Rebuild ancestor TSs, raw sample TSs,
-and match files together after changing matching settings.
+Library files are intentionally not Snakemake inputs. After changing evaluation
+code, force `compute_focal_ancestor_stats`. After changing focal lookup, force
+`find_focal_ancestors` and the statistics rule. Rebuild configurations,
+ancestor/reference TSs, raw sample TSs, match files, and statistics together
+after changing HMM settings. A cutoff-only configuration change reruns only the
+statistics rule. To refresh the optional true CSV schema, explicitly target its
+output and force `extract_true_ancestors`.
 
 Edit `config.yaml` to choose datasets and output folders. Paths in the YAML are
 relative to this working directory; `~` is expanded for input paths. Each
@@ -35,6 +40,10 @@ Use `ts_path: null` to evaluate only inferred panels. Ancestral state may be
 phased, single-contig VCZ per dataset, with all samples included.
 `inference_threads` and `matching_threads` set each job's requested worker count;
 Snakemake allocates those workers and schedules independent panels in parallel.
+`ac_cutoff` is a nonempty, strictly increasing list of positive integers with
+inclusive allele-count thresholds. The `hmm.recombination` and `hmm.mismatch`
+values are scalar per-site probabilities written explicitly for both ancestor
+and sample matching; both must be strictly between zero and one.
 
 The `data_dir` setting contains category folders. For dataset `{name}`:
 
@@ -49,11 +58,13 @@ The `data_dir` setting contains category folders. For dataset `{name}`:
 {data_dir}/focal_ancestors/{name}_{kind}_focal_ancestors.npz
 {data_dir}/matches/{name}_{kind}_samples_raw.trees
 {data_dir}/matches/{name}_{kind}_samples_matches.jsonl
+{data_dir}/dataframes/{name}_inferred_focal_ancestor_stats.csv
 ```
 
-`{kind}` is `inferred` for every dataset and `true` only where truth is supplied.
-The four added rules are `write_true_ancestors_config`, `match_ancestors`,
-`find_focal_ancestors`, and `match_samples`.
+The default targets use `{kind}=inferred` for every dataset. Explicit true
+targets use `{kind}=true` where truth is supplied. The optional true rules are
+`extract_true_ancestors` and `write_true_ancestors_config`; the shared matching
+rules remain callable for either kind.
 
 Rule logs go under the separately configured `progress_dir`. The sample store
 is a regular copy of the input. Its genotypes are unchanged; the name
@@ -62,9 +73,10 @@ is a regular copy of the input. Its genotypes are unchanged; the name
 TOML excludes that mask. The annotation is computed from current genotype
 calls, so it remains correct after anc-eval has added genotype errors. A second
 annotation, `variant_match_eval_derived_af`, records derived allele count divided
-by called haplotypes. Missing calls contribute to neither count. Creating these
-annotations reads the genotype array into memory, which keeps this MVP simple
-and suits the example datasets.
+by called haplotypes. `variant_match_eval_derived_ac` stores the exact observed
+derived count as int64. Missing calls contribute to neither count. Creating
+these annotations reads the genotype array into memory, which keeps this MVP
+simple and suits the example datasets.
 
 The inferred panel's positions define the true panel's site axis. The true
 CSV records one selected derived mutation per inference site. A
@@ -84,8 +96,12 @@ The site-level CSV columns are:
 ```text
 inference_site_id, true_site_id, focal_position, inferred_ancestor_id,
 true_ancestor_id, true_mutation_id, true_mutation_is_singleton, true_node_id, true_node_time,
-inferred_node_time, derived_af, num_mutations
+inferred_node_time, derived_af, derived_ac, num_mutations
 ```
+
+`derived_ac` is the observed site count on the sample store's inference-site
+axis. It is available for both inferred and true IDs in each row and is not a
+truth-descendant count.
 
 `num_mutations` retains the original truth site's count. `true_mutation_id`
 identifies only the selected event; there are no primary-event or focal-allele
@@ -117,8 +133,9 @@ Ancestor matching retains both configured sources to obtain the sample VCZ's
 full contig length, and stops before the first sample group. Sample matching
 uses that unmodified TS as its reference and retains the sample source's name,
 order, filters, and individual metadata. Root nodes, pre-created individual rows,
-and node metadata survive the handoff. Both stages use default HMM parameters,
-disable path compression, and produce raw TSs without post-processing,
+and node metadata survive the handoff. Both stages use the explicit scalar HMM
+parameters from `config.yaml`, disable path compression, and produce raw TSs
+without post-processing,
 simplification, or site augmentation. No checkpoint work directory is used.
 
 Focal lookup polarises sample calls by allele strings and configured ancestral
@@ -140,9 +157,12 @@ Each compressed NPZ loads with `numpy.load(path, allow_pickle=False)` and contai
 | `ancestor_id` | Unicode panel IDs in Zarr column order |
 | `offsets` | int64 boundaries, one more entry than haplotype rows |
 | `ancestor_index` | int64 concatenation of sorted distinct candidate columns |
+| `derived_ac` | int64 observed focal allele count for each inferred panel column |
 
 Row `i` uses `ancestor_index[offsets[i]:offsets[i + 1]]`. Equal offsets preserve
 empty candidate sets. Indices refer to panel columns, never TS node IDs.
+The panel-level `derived_ac` array is present only in inferred focal files. All
+focal sites for one inferred ancestor have the same count.
 
 The native sample match JSONL contains one record per haplotype with `group`,
 `haplotype_index`, `source`, `sample_id`, `ploidy_index`, `time`, `path`
@@ -154,6 +174,38 @@ likelihood is currently emitted by tsinfer. Join records by
 Group and haplotype numbering belong to the sample-only invocation. Path parents
 are preserved raw TS node IDs; use their metadata to join to panel haplotypes.
 Each invocation writes its JSONL from scratch.
+
+The inferred statistics CSV has one row per haplotype and configured cutoff,
+in focal-NPZ row order with increasing cutoffs. Its columns are:
+
+```text
+dataset, panel_kind, source, sample_id, ploidy_index, ac_cutoff,
+evaluated_bp, covered_bp, fraction_covered_bp,
+evaluated_sites, covered_sites, fraction_covered_sites,
+num_switches, num_mismatches, path_log_likelihood, num_focal_ancestors
+```
+
+Evaluation clips the native copying path to the reference TS's
+`sequence_intervals`. Every parent, including synthetic roots, contributes to
+the base and site denominators. A segment contributes to a numerator when its
+parent is in that haplotype's focal candidate set and the parent's
+`derived_ac <= ac_cutoff`. Candidate counts are cumulative by the same rule.
+Sites are counted directly from reference positions with half-open segment
+boundaries.
+
+`num_switches` is the native traceback segment count minus one, and
+`num_mismatches` is the number of native mutation records. With mismatch
+probability `mu`, recombination probability `rho`, reference node count `n`,
+mismatches `m`, and switches `k`, the reported normalized score is:
+
+```text
+m * log(mu / (1 - mu))
+  + k * log((rho / n) / (1 - rho + rho / n))
+```
+
+Here `n` includes the reference's synthetic roots. The score removes the common
+match-emission and no-switch baseline; it is not an absolute sequence
+likelihood or posterior.
 
 ## Checked examples
 

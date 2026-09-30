@@ -1,5 +1,12 @@
 # Matching setup implementation plan
 
+> The later [matching evaluation plan](matching_eval.md) changes the default
+> workflow to inferred-only evaluation. True-panel rules described here remain
+> callable only through explicit targets. It also replaces implicit matcher
+> defaults with the explicit `hmm.recombination` and `hmm.mismatch` settings,
+> adds exact `derived_ac` annotations and inferred focal-NPZ counts, and adds
+> `{data_dir}/dataframes/{name}_inferred_focal_ancestor_stats.csv`.
+
 ## Scope and source review
 
 Extend [initial_mvp.md](initial_mvp.md) with ancestor matching, per-haplotype

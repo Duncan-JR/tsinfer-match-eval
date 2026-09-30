@@ -1,6 +1,6 @@
 import pathlib
 
-from lib import ancestors, matching, utils
+from lib import ancestors, evaluation, matching, utils
 
 
 configfile: "config.yaml"
@@ -9,9 +9,7 @@ data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
 datasets = {dataset["name"]: dataset for dataset in config["datasets"]}
 names = list(datasets)
-simulated_names = [name for name in names if datasets[name]["ts_path"] is not None]
 panels = [{"name": name, "kind": "inferred"} for name in names]
-panels.extend({"name": name, "kind": "true"} for name in simulated_names)
 
 
 def panel_config(wildcards):
@@ -32,8 +30,6 @@ wildcard_constraints:
 rule all:
     input:
         expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=names),
-        expand(data_dir / "ancestors" / "{name}_true_ancestors.zarr", name=simulated_names),
-        expand(data_dir / "dataframes" / "{name}_true_ancestors.csv", name=simulated_names),
         [
             data_dir / "ancestors" / "{name}_{kind}_ancestors.trees".format(**panel)
             for panel in panels
@@ -50,6 +46,10 @@ rule all:
             data_dir / "matches" / "{name}_{kind}_samples_matches.jsonl".format(**panel)
             for panel in panels
         ],
+        expand(
+            data_dir / "dataframes" / "{name}_inferred_focal_ancestor_stats.csv",
+            name=names,
+        ),
 
 
 rule mask_singletons:
@@ -74,6 +74,8 @@ rule write_inference_config:
         data_dir / "configs" / "{name}_ancestor_inference.toml",
     log:
         progress_dir / "write_inference_config" / "{name}_write_inference_config.log",
+    params:
+        hmm=config["hmm"],
     run:
         utils.setup_log(pathlib.Path(log[0]))
         dataset = datasets[wildcards.name]
@@ -81,6 +83,7 @@ rule write_inference_config:
         utils.write_inference_config(
             pathlib.Path(input[0]), ancestor_path, pathlib.Path(output[0]),
             dataset["ancestral_state"],
+            params.hmm,
         )
 
 
@@ -127,6 +130,8 @@ rule write_true_ancestors_config:
         data_dir / "configs" / "{name}_true_ancestors.toml",
     log:
         progress_dir / "write_true_ancestors_config" / "{name}_true_write_true_ancestors_config.log",
+    params:
+        hmm=config["hmm"],
     run:
         utils.setup_log(pathlib.Path(log[0]))
         dataset = datasets[wildcards.name]
@@ -135,6 +140,7 @@ rule write_true_ancestors_config:
             pathlib.Path(input.ancestors),
             pathlib.Path(output[0]),
             dataset["ancestral_state"],
+            params.hmm,
         )
 
 
@@ -197,3 +203,29 @@ rule match_samples:
             pathlib.Path(output.matches),
             threads,
         )
+
+
+rule compute_focal_ancestor_stats:
+    input:
+        focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+        reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+        matches=data_dir / "matches" / "{name}_inferred_samples_matches.jsonl",
+        config=data_dir / "configs" / "{name}_ancestor_inference.toml",
+    output:
+        data_dir / "dataframes" / "{name}_inferred_focal_ancestor_stats.csv",
+    params:
+        ac_cutoff=config["ac_cutoff"],
+    log:
+        progress_dir / "compute_focal_ancestor_stats" / "{name}_inferred_compute_focal_ancestor_stats.log",
+    run:
+        utils.setup_log(pathlib.Path(log[0]))
+        dataframe = evaluation.compute_focal_ancestor_stats(
+            pathlib.Path(input.focal),
+            pathlib.Path(input.reference),
+            pathlib.Path(input.matches),
+            pathlib.Path(input.config),
+            params.ac_cutoff,
+        )
+        dataframe.insert(0, "panel_kind", "inferred")
+        dataframe.insert(0, "dataset", wildcards.name)
+        dataframe.to_csv(output[0], index=False)

@@ -33,23 +33,43 @@ def match_ancestors(
     logger.info("Wrote raw ancestor reference to %s", output_path)
 
 
-def _inferred_focal_dataframe(ancestors_path: pathlib.Path) -> pd.DataFrame:
+def _inferred_focal_dataframe(
+    ancestors_path: pathlib.Path, samples_path: pathlib.Path
+) -> pd.DataFrame:
     """Relate each non-padding focal position to its panel sample_id string.
 
     Multi-focal ancestors contribute multiple rows to :func:`find_focal_ancestors`.
     """
     panel = tsinfer.vcz.open_store(ancestors_path)
+    samples = tsinfer.vcz.open_store(samples_path)
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
+    panel_positions = panel["variant_position"][:]
+    sample_positions = samples["variant_position"][:]
+    sample_rows = np.searchsorted(sample_positions, panel_positions)
+    if np.any(sample_rows == len(sample_positions)):
+        raise ValueError("An inferred focal position is absent from the sample store")
+    if not np.array_equal(sample_positions[sample_rows], panel_positions):
+        raise ValueError("An inferred focal position is absent from the sample store")
+    frequencies = samples["variant_match_eval_derived_af"][sample_rows]
+    allele_counts = samples["variant_match_eval_derived_ac"][sample_rows]
+    position_rows = {int(position): row for row, position in enumerate(panel_positions)}
     records = []
-    for ancestor_id, positions in zip(
-        ancestor_ids, panel["sample_focal_positions"][:], strict=True
+    for ancestor_id, ancestor_time, positions in zip(
+        ancestor_ids,
+        panel["sample_time"][:],
+        panel["sample_focal_positions"][:],
+        strict=True,
     ):
         for position in positions:
             if position >= 0:
+                row = position_rows[int(position)]
                 records.append(
                     {
                         "focal_position": int(position),
                         "inferred_ancestor_id": ancestor_id,
+                        "inferred_node_time": float(ancestor_time),
+                        "derived_af": float(frequencies[row]),
+                        "derived_ac": int(allele_counts[row]),
                     }
                 )
     return pd.DataFrame.from_records(records)
@@ -77,7 +97,7 @@ def find_focal_ancestors(
     positions = panel["variant_position"][:]
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
     if true_dataframe_path is None:
-        focal = _inferred_focal_dataframe(ancestors_path)
+        focal = _inferred_focal_dataframe(ancestors_path, samples_path)
         id_column = "inferred_ancestor_id"
     else:
         focal = pd.read_csv(
@@ -87,6 +107,11 @@ def find_focal_ancestors(
         focal = focal.loc[~focal.true_mutation_is_singleton]
         id_column = "true_ancestor_id"
     ancestor_columns = {ancestor_id: i for i, ancestor_id in enumerate(ancestor_ids)}
+    derived_ac = None
+    if true_dataframe_path is None:
+        first_relations = focal.drop_duplicates("inferred_ancestor_id", keep="first")
+        count_by_id = first_relations.set_index("inferred_ancestor_id")["derived_ac"]
+        derived_ac = count_by_id.loc[ancestor_ids].to_numpy(dtype=np.int64)
     position_columns = {}
     for position, ancestor_id in zip(
         focal.focal_position, focal[id_column], strict=True
@@ -124,14 +149,16 @@ def find_focal_ancestors(
             candidate_rows.append(candidate_array)
             offsets.append(offsets[-1] + len(candidate_array))
     ancestor_index = np.concatenate(candidate_rows)
-    np.savez_compressed(
-        output_path,
-        sample_id=np.repeat(sample_ids, ploidy),
-        ploidy_index=np.tile(np.arange(ploidy), len(sample_ids)),
-        ancestor_id=ancestor_ids,
-        offsets=np.asarray(offsets, dtype=np.int64),
-        ancestor_index=ancestor_index,
-    )
+    arrays = {
+        "sample_id": np.repeat(sample_ids, ploidy),
+        "ploidy_index": np.tile(np.arange(ploidy), len(sample_ids)),
+        "ancestor_id": ancestor_ids,
+        "offsets": np.asarray(offsets, dtype=np.int64),
+        "ancestor_index": ancestor_index,
+    }
+    if derived_ac is not None:
+        arrays["derived_ac"] = derived_ac
+    np.savez_compressed(output_path, **arrays)
     logger.info(
         "Wrote focal candidates for %d haplotypes to %s", len(offsets) - 1, output_path
     )

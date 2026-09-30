@@ -61,6 +61,12 @@ def add_singleton_mask(
         "variant_match_eval_derived_af", data=frequency, chunks=chunks
     )
     af.attrs["_ARRAY_DIMENSIONS"] = ["variants"]
+    ac = store.create_array(
+        "variant_match_eval_derived_ac",
+        data=allele_count.astype(np.int64),
+        chunks=chunks,
+    )
+    ac.attrs["_ARRAY_DIMENSIONS"] = ["variants"]
     zarr.consolidate_metadata(output)
     logger.info("Annotated %d observed singleton sites", int(mask[:].sum()))
 
@@ -70,6 +76,7 @@ def write_inference_config(
     ancestors: pathlib.Path,
     output: pathlib.Path,
     ancestral_state: dict,
+    hmm: dict,
 ) -> None:
     """Write native inference/matching TOML for the selected ancestor panel.
 
@@ -96,8 +103,16 @@ def write_inference_config(
             "output": str(matched.resolve()),
             "path_compression": False,
             "sources": {
-                "ancestors": {"node_flags": 0, "create_individuals": False},
-                "samples": {"node_flags": 1, "create_individuals": True},
+                "ancestors": {
+                    "node_flags": 0,
+                    "create_individuals": False,
+                    **hmm,
+                },
+                "samples": {
+                    "node_flags": 1,
+                    "create_individuals": True,
+                    **hmm,
+                },
             },
         },
     }

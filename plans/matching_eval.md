@@ -1,115 +1,174 @@
 # Matching evaluation implementation plan
 
-## Scope and result
+## Scope and outputs
 
-Add a diagnostic after focal lookup and full-panel sample matching. For each
-dataset, panel kind, sample haplotype, and configured allele-count cutoff, report
-how much of the existing copying path uses that haplotype's eligible focal
-ancestors. Also report switches and mismatches on the existing path. Changing
-the cutoff changes the classification of a parent, not the HMM result: no
-restricted-panel matching or additional inference is required.
+Evaluate only the inferred ancestor panel for now. For each sample haplotype
+and configured cumulative allele-count cutoff, report the bases and inference
+sites copied from that haplotype's eligible focal ancestors, the corresponding
+coverage fractions, switches, mismatches, and path log likelihood. Classification
+by cutoff uses the existing full-panel matching result; it does not rerun the
+HMM against restricted panels.
 
-The implementation described here will produce
-`{data_dir}/dataframes/{name}_{kind}_focal_ancestor_stats.csv`. Each panel's
-dataframe has exactly `num_haplotypes * len(ac_cutoff)` rows. A sample means a
-haplotype throughout this diagnostic; diploid individuals have separate rows
-for `ploidy_index=0` and `ploidy_index=1` at every cutoff.
+Produce one file per dataset:
 
-This planning task changes only this file. The implementation work below is
-future work. It follows the existing contracts in
+```text
+{data_dir}/dataframes/{name}_inferred_focal_ancestor_stats.csv
+```
+
+Each dataframe has exactly `num_haplotypes * len(ac_cutoff)` rows. A sample in
+this diagnostic means one haplotype, keyed by `(source, sample_id, ploidy_index)`.
+Diploid individuals therefore have two sets of cutoff rows.
+
+Change `rule all` to request inferred products only: the inferred ancestor Zarr,
+reference TS, focal NPZ, raw sample TS, match JSONL, and statistics CSV for each
+dataset. Remove the true ancestor Zarr/CSV and all true matching/focal products
+from its inputs. Keep the existing true rules callable through explicit output
+targets and leave existing true files on disk. True-panel evaluation is future
+work; the default inferred DAG must not depend on truth even when `ts_path`
+is supplied.
+
+The one preparation for both ancestor kinds is adding `derived_ac` to their
+dataframes, as detailed below. This revision changes only this plan. Production
+implementation is future work and follows
 [matching_setup.md](matching_setup.md), [initial_mvp.md](initial_mvp.md), and
 [../AGENTS.md](../AGENTS.md).
 
-## Decisions needed for meaningful statistics
+## Configuration and inferred-ancestor eligibility
 
-### Allele count versus allele frequency
-
-Add the following required top-level setting to both `config.yaml` and
-`config.yaml.example` when implementing:
+Add these required settings to `config.yaml` and `config.yaml.example` during
+implementation:
 
 ```yaml
 ac_cutoff: [3, 5, 10, 100, 600]
+hmm:
+  recombination: 0.01
+  mismatch: 1.0e-20
 ```
 
-These are inclusive, cumulative allele-count cutoffs. A cutoff of 3 includes
-eligible focal associations at observed doubleton and tripleton sites; 5
-includes those plus four- and five-carrier sites. These are not disjoint bins.
-Require a nonempty list of positive integers in strictly increasing order.
-Reject booleans, duplicates, descending values, and noninteger values with a
-`ValueError` naming `ac_cutoff`. Cutoffs above the dataset's haplotype count are
-valid and include all otherwise eligible candidates. Keep defaults in YAML,
-not Python constants.
+Cutoffs are inclusive and cumulative: 3 includes doubletons and tripletons, 5
+includes those plus four- and five-carrier focal ancestors. Require a nonempty
+list of positive integers in strictly increasing order; reject duplicates,
+booleans, and noninteger values. Values above the dataset's haplotype count
+are valid and include all eligible candidates. Keep defaults in YAML.
 
-The current true-ancestor CSV's `derived_af` is a proportion, calculated as
-`derived_count / called_count`, not a count. Comparing it directly with 3 or 5
-would include every focal site. Multiplying by the total number of haplotypes
-would also be wrong at sites with missing calls.
+The inferred builder groups focal sites by the same time and encoded genotype
+pattern. Consequently an inferred ancestor's focal sites share an observed
+carrier set and allele count. Store a single `derived_ac` per ancestor. There
+is no sample-specific minimum count or heterogeneous multi-focal reduction.
+An ancestor is eligible for haplotype `h` at cutoff `f` exactly when:
 
-Use exact observed derived counts on the shared panel site axis. In
-`find_focal_ancestors`, the sample calls have already been read and polarised
-into a boolean `derived` array of shape `(num_sites, num_samples, ploidy)`.
-Compute `site_derived_ac = derived.sum(axis=(1, 2))` before clearing excluded
-sites. This gives the count underlying `derived_af` without another genotype
-read, floating-point rounding, or any dependency on truth availability. Keep
-`derived_af` and the true CSV unchanged. An independent validation can check
-that `derived_af * called_count` agrees with these counts, using the existing
-sample-store annotation. Both ancestral-state modes must use allele strings,
-as focal lookup already does.
+```text
+ancestor is in h's existing focal candidate set
+and ancestor.derived_ac <= f
+```
 
-### Multi-focal ancestors and the sample-specific threshold
+Multiple focal sites do not multiply candidate membership or copied coverage.
+Eligibility applies to all evaluated portions of that parent's copying
+segments, not just to the positions of its focal sites. Precompute each
+ancestor's first eligible cutoff once for the entire dataset.
 
-An ancestor may have several focal sites. Their allele counts can differ,
-particularly for true ancestors formed by grouping sites selecting the same
-older truth node. Define eligibility on the focal associations carried by the
-particular sample haplotype:
+The local inference code assigns `sample_time = derived_ac / num_haplotypes`.
+The pipeline's existing `derived_af` annotation instead divides by the number
+of called haplotypes. These equal node time on fully called inputs, including
+the current example, but differ when calls are missing. Preserve the established
+`derived_af` meaning and use exact `derived_ac` for cutoffs. The fixed-pattern
+property still gives each inferred ancestor one count and one frequency.
+Do not recover counts by multiplying AF by the total haplotype count.
 
-1. Retain the existing eligible focal relations. Inferred relations come from
-   all non-padding panel focal positions. True relations come from CSV rows
-   with `true_mutation_is_singleton=False`.
-2. Retain relations whose focal derived allele the sample haplotype carries.
-   Missing and excluded calls do not contribute a relation.
-3. For each distinct candidate ancestor, retain the minimum `site_derived_ac`
-   among those carried focal relations.
-4. At cutoff `f`, the ancestor is a focal candidate exactly when this minimum
-   count is at most `f`.
+## Allele counts and dataframes
 
-Equivalently, filter focal-site relations by count before forming the sample's
-distinct candidate set. Do not take the minimum over all focal sites of an
-ancestor before checking sample carriage. For example, if an ancestor has
-focal counts 3 and 100, a sample carrying only the latter is eligible starting
-at 100; a sample carrying both is eligible starting at 3. The parent is counted
-once regardless of how many qualifying focal alleles are carried.
+`utils.add_singleton_mask` already computes the exact observed derived count
+while polarising the current sample genotypes. Persist that existing array as
+`variant_match_eval_derived_ac` in the copied sample VCZ. Use int64, the existing
+variant chunks and `_ARRAY_DIMENSIONS=["variants"]`, and refresh metadata with
+the existing Zarr v3 APIs. Missing calls contribute neither a derived call nor
+a called haplotype. This adds no genotype read or additional polarisation code.
 
-Eligibility applies to the parent across the evaluated portions of its copying
-segments, not only at the qualifying focal site's position. This implements
-the requested fraction copied from a subset of focal ancestors.
+Extend `matching._inferred_focal_dataframe` to accept both `ancestors_path` and
+`samples_path`, and return the existing in-memory focal-relation dataframe with
+these columns:
 
-For a 600-haplotype dataset, cutoff 600 reproduces the existing complete focal
-candidate sets. For larger datasets it need not include every candidate. True
-singleton-origin rows remain excluded even if their observed allele count is
-two or more due to recurrence or genotype errors.
+```text
+focal_position, inferred_ancestor_id, inferred_node_time, derived_af, derived_ac
+```
 
-### Evaluated bases and sites
+Continue emitting one row per non-padding focal position, so multi-focal
+ancestors have repeated rows with the same time, frequency, and count. Read
+`inferred_node_time` from panel `sample_time`; join sample-store AF/count
+annotations by exact focal position. `derived_ac` is an integer and
+`derived_af`/time are floats. This dataframe need not become another persisted
+CSV or workflow rule. In `find_focal_ancestors`, retain the first relation per
+ancestor to extract its count, then align counts to panel `sample_id` order.
+No minimum or aggregation policy is needed for inferred ancestors.
 
-Use the raw ancestor reference TS to supply both `sites_position` and its
-top-level `sequence_intervals` metadata. Those intervals identify the regions
-containing inference sites. They are sorted, disjoint, half-open intervals and
-are preserved from the panel by the current matching code.
+Also add integer `derived_ac` immediately after `derived_af` in the site-level
+CSV written by `ancestors.extract_true_ancestors`. Read it from the same sample
+annotation on the inference-site axis used for `derived_af`. Preserve every
+existing row, singleton-origin flag, ancestor association, sort order, and
+other column. Thus the count is available for both the true and inferred IDs
+in each CSV row. It describes the observed site count, not the number of truth
+descendants. Different focal rows belonging to a true ancestor may still have
+different counts; do not collapse them or assign a true-ancestor cutoff yet.
 
-For sample haplotype `h`, define its evaluated region as the intersection of
-the union of its matched path segments with the union of `sequence_intervals`.
-Intersect each path segment with those intervals before counting bases or
-sites. This also handles paths shortened by leading or trailing missing calls.
-Uncovered regions do not enter either denominator. Disjoint evaluation
-intervals do not cause intervening gaps to enter the denominator.
+The true extraction rule remains outside `rule all`. Validate this schema
+change with an explicit true-CSV output target on a small example, rather than
+reactivating true matching or evaluation.
 
-This clipping matters for the checked-in example: the TS's sequence length is
-64,444,167, while the evaluation interval is `[81,353, 999,745)`, spanning
-918,392 bases. Native paths can start at zero and end at the full contig length.
-Using their untrimmed lengths would largely measure copying through a padded
-region with no evaluated sites.
+## Focal NPZ and joins
 
-For a clipped fragment `[left, right)`, use:
+Preserve the existing inferred NPZ path, rows, candidate membership, and ragged
+storage. Add one panel-level array instead of the previously proposed
+per-association thresholds:
+
+| Array | Shape and dtype | Meaning |
+| --- | --- | --- |
+| `sample_id` | `(h,)`, Unicode | Existing sample ID for each haplotype row |
+| `ploidy_index` | `(h,)`, integer | Existing chromosome index |
+| `ancestor_id` | `(a,)`, Unicode | Existing panel IDs in Zarr column order |
+| `offsets` | `(h + 1,)`, int64 | Existing candidate slice boundaries |
+| `ancestor_index` | `(k,)`, int64 | Existing sorted distinct panel-column indices |
+| `derived_ac` | `(a,)`, int64 | One observed focal allele count per inferred ancestor, aligned to `ancestor_id` |
+
+Row `i` still takes its candidates from
+`ancestor_index[offsets[i]:offsets[i + 1]]`. Their counts come from indexing
+the panel-level `derived_ac` array with those columns. Save all candidates,
+independent of cutoffs. Empty sets retain equal offsets. Keep the current
+collect-and-unique implementation of candidate membership. Load NPZs with
+`allow_pickle=False`; no object arrays, new sample-by-ancestor matrices, or
+per-cutoff files are needed.
+
+This extension applies only to inferred NPZs. Existing explicitly requested
+true focal files keep their current format. The evaluator requires the inferred
+count array and must give a clear rebuild instruction if it is absent.
+
+Build a reference-node-to-panel-column array once by joining node metadata
+`(source="ancestors", sample_id, ploidy_index=0)` to `ancestor_id`. Preserve
+the metadata-free synthetic roots as noncandidates. Validate that every panel
+ID joins to exactly one ancestor node. Do not subtract a root count, interpret
+ID suffixes, or equate TS node IDs with Zarr columns.
+
+Join native match records to focal rows by
+`(source="samples", sample_id, ploidy_index)`, never by line order, `group`, or
+`haplotype_index`. Require exactly one record for every focal row: reject
+duplicates/unknown keys while streaming and missing keys at end of file. Check
+the basic NPZ offset, alignment, sorted-distinct candidate, and index invariants
+on load. Error messages should name the affected key or input and the necessary
+rebuild; do not introduce a generic validation framework.
+
+## Coverage denominators and boundaries
+
+Use the raw inferred ancestor reference TS's `sites_position` and top-level
+`sequence_intervals` metadata. For each haplotype, intersect its copying path
+with those evaluation intervals before accumulating bases or sites. The
+denominator includes copying from every parent, including synthetic roots;
+only eligible focal parents contribute covered bases/sites.
+
+The existing example has contig length 64,444,167 but evaluation interval
+`[81,353, 999,745)`, spanning 918,392 bases. Native paths can extend from zero
+to the contig end. Counting those untrimmed spans would mostly measure padded
+sequence with no inference sites.
+
+For each nonempty clipped fragment `[left, right)`:
 
 ```text
 fragment_bp = right - left
@@ -118,474 +177,362 @@ right_site = searchsorted(sites_position, right, side="left")
 fragment_sites = right_site - left_site
 ```
 
-A site exactly at `left` belongs to the fragment; one exactly at `right` belongs
-to the next fragment. Site fractions must count these sites explicitly: a
-base fraction cannot be rescaled into a site fraction because site density
-varies. Site denominators cover the reference inference sites reached by the
-path, including internal sites with missing sample calls. This measures parent
-selection; it does not claim that every counted site supplies an observed
-genotype. Input-only sites absent from the reference are not evaluated.
+A site at `left` is included and one at `right` belongs to the next segment.
+Compute site coverage explicitly; site density prevents conversion of a base
+fraction directly into a site fraction. Exclude gaps between evaluation
+intervals and uncovered leading/trailing path regions from both denominators.
+Include internal missing-call sites when their reference position is covered
+by the path: this diagnostic measures copying decisions, not observed-genotype
+completeness. Sites absent from the reference are not evaluated.
 
-Synthetic-root copying contributes to the denominators and never to the focal
-numerators. An empty candidate set therefore gives zero fractions whenever
-the corresponding denominator is positive. A zero denominator gives `NaN`
-for that fraction and zero for its numerator, making absence of evaluated data
-distinct from an evaluated path with no focal copying.
+Empty candidate sets give zero coverage at positive denominators. A zero
+denominator gives a zero numerator and `NaN` fraction. Validate increasing site
+positions and ordered, disjoint evaluation intervals once. Sort each native
+path by genomic left coordinate and clip it with a two-pointer sweep; no
+special path-array dataclass is necessary.
 
-### Switches and mismatches
+## Switch count, mismatches, and likelihood
 
-Count switches on the original complete matched path, once per haplotype.
-Sort segments by genomic left coordinate: native JSONL paths are usually in
-reverse genomic order. Count a switch at a boundary where two consecutive
-segments touch and their parent node IDs differ. Adjacent segments with the
-same parent add no switch; do not infer a switch across an uncovered gap.
-Overlapping segments are an invalid copying path and must raise an error.
+### What the current matcher exposes
 
-This is a count on the recorded path, so it can include a switch outside the
-evaluation intervals. The base and site fractions use the clipped region.
-Document that distinction explicitly. Do not derive switches from the clipped
-fragments, whose extra boundaries can arise merely from region clipping.
+Inspected the editable sibling tsinfer checkout at commit `a704308`, including
+the C implementation and Python bindings:
 
-Set `num_mismatches = len(record["mutations"])`. The local tsinfer matcher
-emits exactly the nonmissing sample calls that disagree with the selected
-parent haplotype within the matching range. These events include either
-canonical allele state; do not count only derived-state 1 or use the raw TS's
-total mutation count, which also contains ancestor mutations. Mismatches and
-switches repeat unchanged for every cutoff of the same sample haplotype.
+| Question | Source and finding |
+| --- | --- |
+| Is there a switch-count accessor? | `_tsinfermodule.c` exposes `find_path`, `get_traceback`, `mean_traceback_size`, and `total_memory`, with no switch-count accessor; `MatchResult` contains only `path` and `mutations` |
+| Does path length supply the count? | `lib/ancestor_matcher.c:ancestor_matcher_run_traceback` starts one segment and starts a new segment for each traceback recombination; the low-level binding returns that path length and the wrapper retains exactly those segments |
+| What is `n`? | `matcher_indexes_alloc` sets `num_nodes` to `tables->nodes.num_rows`; `ancestor_matcher_update_site_likelihood_values` uses that value when weighting by `n` |
+| Is weighting by `n` enabled? | The binding defaults `weight_by_n=1`; the pipeline does not override it |
+| Is an additional vestigial root introduced? | `tsinfer.matching.Matcher` builds `MatcherIndexes(ts, vestigial_root=False)`, so the matching index has exactly the reference TS's nodes |
+| What are match/mismatch emissions? | The C likelihood update uses `mu` for a mismatch and `1 - (num_alleles - 1) * mu` for a match or missing call |
+| Where are the probabilities? | `Matcher._match_one` uses scalar source-config overrides, otherwise literal defaults `recombination=1e-2` and `mismatch=1e-20` |
 
-Frequency is a proxy for recent origin, not a direct age measurement. Focal
-associations at recurrent sites describe allele sharing, as in existing focal
-lookup. The diagnostic measures the selected copying path rather than a
-posterior probability or the sample's true genealogical parent.
-
-## Data contracts
-
-### Extend the existing focal NPZ
-
-Continue writing one compressed NPZ per dataset and panel kind, at the existing
-path. Preserve the current row order and array meanings. Add one aligned array:
-
-| Array | Shape and dtype | Meaning |
-| --- | --- | --- |
-| `sample_id` | `(h,)`, Unicode | Existing sample ID for each haplotype row |
-| `ploidy_index` | `(h,)`, integer | Existing chromosome index |
-| `ancestor_id` | `(a,)`, Unicode | Existing panel IDs in Zarr column order |
-| `offsets` | `(h + 1,)`, int64 | Existing boundaries for candidate slices |
-| `ancestor_index` | `(k,)`, int64 | Existing sorted distinct panel columns |
-| `min_focal_derived_ac` | `(k,)`, int64 | Minimum count of a carried eligible focal relation for each aligned candidate |
-
-For row `i`, slice both candidate arrays with
-`offsets[i]:offsets[i + 1]`. Their entries correspond element for element.
-Rows still follow sample-store order then increasing ploidy index. Equal
-offsets preserve empty candidate sets. Save all eligible candidates, irrespective
-of the configured cutoffs; modifying `ac_cutoff` must not require regenerating
-this NPZ.
-
-Construct each row using a dictionary from ancestor column to minimum count.
-Sort its column keys once, then build both arrays in that order. This replaces
-the current collect-and-unique step while preserving candidate membership and
-ordering. Several relations for the same candidate update one dictionary
-entry. No sample-by-ancestor dense matrix, per-cutoff candidate files, or
-pickled object arrays are needed. Load using `allow_pickle=False`.
-
-Existing NPZs have no count array and must be regenerated with
-`--forcerun find_focal_ancestors`. The new loader must fail clearly when the
-array is missing, with that rebuild instruction. Do not invent thresholds from
-an ancestor-global minimum or add a legacy-format adapter.
-
-### Join parents and sample records explicitly
-
-Build the parent mapping once from the ancestor reference TS's node metadata:
+Accordingly use:
 
 ```text
-(source="ancestors", sample_id, ploidy_index=0)
-    -> ancestor_id entry
-    -> panel column index
+num_switches = max(len(record["path"]) - 1, 0)
+num_mismatches = len(record["mutations"])
+num_reference_nodes = reference_ts.num_nodes
 ```
 
-Node IDs, panel column indices, and numeric suffixes of ancestor ID strings
-are different namespaces. Use an `int64` node-to-column array indexed by TS
-node ID; represent the reference's metadata-free synthetic roots with a
-noncandidate sentinel. Every panel ancestor ID must join to exactly one
-reference ancestor node. Missing, duplicate, or unexpected source metadata is
-an error indicating inconsistent inputs. Roots must be identified from the
-actual reference metadata, not by assuming two roots or subtracting a root
-count. The current workflow disables path compression and has haploid panel
-entries, so no additional node classes need a compatibility policy.
+This is the simplest way to reuse the matcher's traceback count without
+modifying tsinfer, rerunning matching, or walking its private traceback maps.
+The current pipeline saves native paths directly, without splitting or
+postprocessing their segments. Validate this contract in integration checks:
+segments are contiguous, consecutive parents differ, and the segment-derived
+count equals an independent count of parent changes. Do not use the segment
+count on clipped fragments, which may be split by evaluation intervals.
 
-Use `(source, sample_id, ploidy_index)` to join each JSONL record to the focal
-row. The current pipeline has one sample source named `samples`; prefix NPZ
-row keys with that source. Never join by file line number, `group`, or
-`haplotype_index`, since threaded matching can change completion order.
+Mismatches include all native nonmissing disagreements, irrespective of the
+canonical target allele; do not count only derived-state 1 or all mutations
+in the final sample TS. Switches and mismatches describe the full recorded HMM
+path, even if coverage is clipped to evaluation intervals.
 
-Require exactly one record per focal row. Reject duplicate records and unknown
-keys when encountered, and missing records at end of file. Include the sample
-key in errors. Reject out-of-range parent node IDs. Validate NPZ offset
-boundaries, aligned array lengths, sorted distinct in-range candidate columns,
-and positive candidate counts on load. These checks enforce joins and ragged
-array invariants already used by this pipeline, without adding a generic file
-validation framework.
+For `n`, include every node in the reference, including its synthetic roots.
+Do not use panel column count, the number of nodes active at one site, the
+sample count, or the final raw sample TS's node count. The current inferred
+example has 4,639 ancestor haplotypes and `n=4,641` reference nodes.
 
-### Returned dataframe and saved CSV
+All contemporary samples currently match in a single sample-only group, before
+sample nodes are appended. Thus every record uses the same reference and `n`.
+Reject multiple sample match groups in this evaluator rather than silently
+scoring later groups with the initial reference's node count. Supporting
+additional sample-time groups would require recording the actual per-group
+reference size and is outside this inferred contemporary-sample diagnostic.
 
-`compute_focal_ancestor_stats` returns the following columns, in this order:
+### Path log likelihood
+
+For the current binary, biallelic input contract, the matching emission is
+`q = 1 - mu`. Add a `path_log_likelihood` column with exactly the requested
+normalised path score:
+
+\[
+\log \widetilde L
+= m\log(\mu/q)
++ k\log\left(\frac{\rho/n}{1-\rho+\rho/n}\right).
+\]
+
+Here `m` and `k` are the original path counts, and `mu`/`rho` are the scalar
+per-site HMM probabilities used for sample matching. They are not rates per
+base. This score has factored out the common match-emission and no-switch
+baseline; do not label it an absolute sequence probability or posterior.
+It repeats unchanged for every cutoff of a haplotype. It is a metric column,
+so adding it does not add rows or change the sample-by-cutoff row contract.
+
+Read sample probabilities from the native TOML's
+`cfg.match.sources["samples"].mismatch` and `.recombination`. The defaults in
+`_match_one` are not exposed through a simple default-value API. Avoid source
+parsing or callable introspection: mirror the verified defaults in YAML's
+`hmm` setting and write them explicitly to native match-source configuration
+using `utils.write_inference_config`. Apply these configured values to both
+the ancestor and sample source settings. Their initial values reproduce
+current matching, while later edits keep matching and scoring consistent.
+The evaluator requires explicit probabilities in its matching TOML and does
+not silently apply a different fallback to old match products.
+
+Validate `0 < mu < 1` and `0 < rho < 1` for this initial scoring contract.
+Precompute two penalties once using stable natural-log expressions:
+
+```text
+log_mismatch_penalty = log(mu) - log1p(-mu)
+log_switch_penalty = log(rho) - log(n) - log1p(-rho + rho/n)
+path_log_likelihood = m * log_mismatch_penalty + k * log_switch_penalty
+```
+
+Using `log1p(-mu)` preserves the small matching-emission correction even when
+floating-point `1 - 1e-20` rounds to one. A path with no mismatches or switches
+has score zero. Site-specific probabilities, multiallelic emissions, disabled
+weighting by `n`, and altered traceback formats are future extensions, not
+cases to infer implicitly. Log `n`, `mu`, `rho`, and the existing tsinfer commit
+along with evaluation dimensions for auditability.
+
+## Returned dataframe and functions
+
+`evaluation.compute_focal_ancestor_stats` returns these columns:
 
 | Column | Type | Meaning |
 | --- | --- | --- |
-| `source` | string | `samples` for this workflow |
+| `source` | string | `samples` |
 | `sample_id` | string | Actual sample-store ID |
 | `ploidy_index` | integer | Haplotype index within the sample |
 | `ac_cutoff` | integer | Inclusive allele-count threshold |
-| `evaluated_bp` | float64 | Total clipped path span, including root copying |
-| `focal_bp` | float64 | Clipped span whose selected parent is an eligible focal candidate |
-| `fraction_focal_bp` | float64 | `focal_bp / evaluated_bp`, or `NaN` for zero denominator |
+| `evaluated_bp` | float64 | Clipped path span, including root copying |
+| `covered_bp` | float64 | Evaluated bases copied from eligible focal parents |
+| `fraction_covered_bp` | float64 | `covered_bp / evaluated_bp`, or `NaN` |
 | `evaluated_sites` | int64 | Reference sites covered by the clipped path |
-| `focal_sites` | int64 | Such sites copied from eligible focal candidates |
-| `fraction_focal_sites` | float64 | `focal_sites / evaluated_sites`, or `NaN` for zero denominator |
-| `num_switches` | int64 | Parent changes on the original path |
-| `num_mismatches` | int64 | Native mismatch events for this sample |
-| `num_focal_ancestors` | int64 | Distinct eligible candidates at this cutoff, including candidates not selected on the path |
+| `covered_sites` | int64 | Such sites copied from eligible focal parents |
+| `fraction_covered_sites` | float64 | `covered_sites / evaluated_sites`, or `NaN` |
+| `num_switches` | int64 | Native traceback switch count |
+| `num_mismatches` | int64 | Native mismatch events |
+| `path_log_likelihood` | float64 | Normalised score defined above |
+| `num_focal_ancestors` | int64 | Eligible candidates, including those never selected |
 
-The numerators, denominators, and candidate count are useful diagnostic
-variables beyond the four requested metrics. They make the fractions auditable
-and distinguish no candidates from candidates that are never selected. They
-require no additional matching or genotype reads.
+Numerators, denominators, and candidate counts make results auditable without
+additional matching. Return focal-NPZ row order, with increasing cutoffs within
+each row. The rule prepends `dataset` and `panel_kind="inferred"`, then writes
+CSV with `index=False`. Preserve sample IDs as strings on readback.
 
-Return rows in focal-NPZ row order, with cutoffs increasing within each row.
-At the workflow boundary, prepend `dataset` and `panel_kind` columns using the
-wildcards, then write CSV with `index=False`. Thus each saved file is
-self-describing and can be concatenated across datasets and panels. Preserve
-sample IDs as strings when reading it. Use standard pandas missing-value CSV
-encoding for undefined fractions. Keep all file and column names lower case
-with underscores.
-
-## Functions and responsibilities
-
-Keep focal construction and matching in `lib/matching.py`. Put the new
-diagnostic in `lib/evaluation.py` to keep statistics independent of running the
-HMM. Use module imports, one module logger, module-level imports, pathlib
-paths, PEP 604 annotations, and linked docstrings in both modules.
+Keep existing matching/focal work in `lib/matching.py`; put evaluation in
+`lib/evaluation.py`. The inferred-only simplification needs just three new
+functions and two small dataclasses:
 
 | Function or dataclass | Inputs | Output and responsibility |
 | --- | --- | --- |
-| `matching._inferred_focal_dataframe` | `ancestors_path: pathlib.Path` | Existing two-column focal-relation dataframe; its contract remains unchanged |
-| `matching.find_focal_ancestors` | Existing sample/panel/output paths, ancestral-state mapping, optional true CSV path | Writes the extended NPZ; computes exact site counts from already polarised calls and reduces carried relations to sample-specific candidate thresholds |
-| `evaluation._validate_ac_cutoff` | `ac_cutoff: list[int]` | Sorted-as-supplied int64 array after enforcing the configuration contract; no implicit sorting or defaults |
-| `evaluation.FocalCandidates` | Loaded NPZ arrays | Dataclass containing `sample_id`, `ploidy_index`, `ancestor_id`, `offsets`, `ancestor_index`, and `min_focal_derived_ac` |
-| `evaluation._load_focal_candidates` | `focal_ancestors_path: pathlib.Path` | `FocalCandidates`, detached from the closed NPZ handle, with storage invariants checked |
-| `evaluation._build_parent_columns` | Raw reference `ts: tskit.TreeSequence`, `ancestor_id: np.ndarray` | Node-to-panel-column array, validating the metadata join and distinguishing synthetic roots |
-| `evaluation.PathArrays` | Numeric arrays `left`, `right`, `parent` | Dataclass for a genomic-order path or clipped fragments; arrays are aligned |
-| `evaluation._ordered_path` | Native record `path: list[dict]`, reference sequence length and node count | `PathArrays` sorted by `left`, validating bounds, positive spans, parents, and nonoverlap |
-| `evaluation._clip_path` | Ordered `PathArrays`, reference `sequence_intervals: np.ndarray` | `PathArrays` containing only nonempty intersections, using a two-pointer scan |
-| `evaluation.HaplotypeStats` | Counts and cutoff vectors | Dataclass containing `evaluated_bp`, `evaluated_sites`, `num_switches`, `num_mismatches`, and arrays `focal_bp`, `focal_sites`, `num_focal_ancestors` of length `num_cutoffs` |
-| `evaluation._compute_haplotype_stats` | One native record, candidate columns/counts for its focal row, validated cutoff array, site positions, intervals, parent mapping, reference sequence length | `HaplotypeStats`; traverses this path once to accumulate all cutoffs and path diagnostics |
-| `evaluation.compute_focal_ancestor_stats` | `focal_ancestors_path: pathlib.Path`, `ancestors_ts_path: pathlib.Path`, `match_file_path: pathlib.Path`, `ac_cutoff: list[int]` | Requested `pd.DataFrame`; loads shared context once, streams records, verifies key completeness, and orders rows deterministically |
+| `utils.add_singleton_mask` | Existing input/output paths and ancestral-state mapping | Existing masked copy plus the exact derived-count annotation |
+| `utils.write_inference_config` | Existing paths and ancestral-state mapping, plus `hmm: dict` | Native TOML with explicit scalar matching probabilities |
+| `ancestors.extract_true_ancestors` | Existing arguments | Existing panel and site-level CSV, with added integer `derived_ac` |
+| `matching._inferred_focal_dataframe` | `ancestors_path: pathlib.Path`, `samples_path: pathlib.Path` | In-memory relation dataframe including frequency, count, and time |
+| `matching.find_focal_ancestors` | Existing arguments | Existing candidate NPZ with inferred-only panel-aligned `derived_ac` |
+| `evaluation.EvaluationContext` | Shared numeric arrays and scoring values | Dataclass holding cutoffs, ancestor first-cutoff indices, reference parent mapping, positions, intervals, sequence length, reference node count, and the two log penalties |
+| `evaluation._build_context` | Reference TS, NPZ ancestor IDs/counts, cutoff list, sample `MatchSourceConfig` | Validated `EvaluationContext`; computes joins, cutoff bins, and penalties once |
+| `evaluation.HaplotypeStats` | Per-sample totals and cutoff vectors | Dataclass holding denominators, switches, mismatches, score, and vectors `covered_bp`, `covered_sites`, `num_focal_ancestors` |
+| `evaluation._compute_haplotype_stats` | One native record, its candidate-column slice, shared context | `HaplotypeStats`, calculated for every cutoff together |
+| `evaluation.compute_focal_ancestor_stats` | `focal_ancestors_path: pathlib.Path`, `ancestors_ts_path: pathlib.Path`, `match_file_path: pathlib.Path`, `config_path: pathlib.Path`, `ac_cutoff: list[int]` | Requested `pd.DataFrame`; loads shared inputs once, streams records, validates keys/groups, and returns deterministic rows |
 
-Expose `compute_focal_ancestor_stats` as a module function, matching the existing
-functional library API. It returns data; writing the output belongs to the
-Snakemake rule. No class wrapping the pipeline or new global configuration
-object is required. Dataclasses replace multi-value tuple returns, not simple
-single-array results.
+Keep NPZ loading, record bookkeeping, and dataframe construction directly in
+the public function. Keep path ordering/clipping in the per-haplotype function
+with explicit intermediate variables. Separate helpers for NPZ loading, cutoff
+validation, ordered paths, clipping, and row conversion are unnecessary.
+The two dataclasses give clear multi-value contracts without a pipeline wrapper
+or generic framework. Follow repository import, logger, pathlib, and docstring
+conventions, and keep all tunable defaults in configuration.
 
-The reference must have increasing site positions and valid, ordered,
-nonoverlapping evaluation intervals within its sequence length, covering its
-site axis. Validate this shared context once. The reference already provides
-the correct site positions and ancestor metadata, so the evaluation rule needs
-neither the raw sample TS nor the panel/sample Zarrs. Library code must not
-rewrite either input TS or the JSONL.
+## One match-file pass for all cutoffs
 
-## Single-pass accumulation
+1. Load the inferred NPZ, reference TS, and native matching configuration.
+   Build shared context, mapping each ancestor's integer count to its first
+   eligible cutoff with `searchsorted(cutoffs, derived_ac, side="left")`.
+   A result equal to the number of cutoffs contributes to none of them.
+2. Build the sample-key-to-focal-row mapping and seen-row/result arrays.
+   Stream one JSONL record at a time and select its candidate-column slice.
+3. Index the precomputed ancestor bins for those candidates and build a small
+   column-to-bin dictionary. Count candidates into first-cutoff buckets once.
+4. Obtain `k` from native path length and `m` from mutation-list length; compute
+   the scalar score from shared penalties. Sort the original path and clip it
+   against evaluation intervals using a linear sweep.
+5. Compute fragment base lengths and site counts using vectorised boundary
+   searchsorted. Every parent contributes to denominators. Translate each
+   parent through the shared reference mapping; eligible sample candidates
+   contribute their fragments to the bucket of their first eligible cutoff.
+6. Cumulatively sum the three bucket arrays to obtain covered bases, covered
+   sites, and candidate counts for all cutoffs. Use float64 base buckets and
+   int64 site/candidate buckets; `numpy.add.at` or a short loop preserves integer
+   site counts without float-weight conversion.
+7. After checking record completeness, create output rows in focal order and
+   compute fractions with explicit zero-denominator handling.
 
-### Shared setup
+The path is never revisited for individual cutoffs. With `a` ancestors, `h`
+haplotypes, `f` cutoffs, `k` total candidate associations, `p_h` segments per
+haplotype, `q` clipped fragments, and `s` sites, bin preparation costs
+`O(a log f)`, candidate work `O(k)`, sorting costs `sum O(p_h log p_h)`, site
+lookups `O(q log s)`, and required output/cumulative sums `O(h f)`. Clipping
+is a linear segment/interval sweep. Memory consists of loaded NPZ/reference
+arrays, the `O(h f)` output, and one current path. There is no `O(h a)` dense
+membership matrix or `O(f p)` path traversal.
 
-1. Validate cutoffs and load the focal NPZ.
-2. Load the raw ancestor TS once. Obtain `sites_position`, evaluation
-   intervals, sequence length, and the parent-column lookup.
-3. Build the sample-key-to-focal-row mapping once. Allocate a seen-row boolean
-   array and result slots in focal-row order.
-4. Stream the match JSONL. Keep only one decoded match record at a time; do
-   not create a dataframe of all segments or load the complete JSONL.
+Use NumPy and serial streaming initially: the current 600-haplotype inferred
+probe, including focal reconstruction, ran in about one second. Snakemake can
+schedule independent datasets across available workers. If substantially larger
+workloads make per-dataset evaluation long-running, follow AGENTS.md by using
+bounded multiprocessing queues for independent record batches across allocated
+CPU workers. Add a configured worker count only with that measured need; load
+shared context once per worker and restore result order by focal row. Numba is
+not needed for this initial scope.
 
-### Per-haplotype calculation
+## Workflow, migration, and documentation
 
-1. Slice the focal candidate columns and their minimum counts using the row's
-   offsets. For each count `c`, compute its first eligible cutoff index using
-   `searchsorted(cutoffs, c, side="left")`. An index equal to the number of
-   cutoffs means that candidate contributes to none of them.
-2. Build a small dictionary from candidate column to first eligible cutoff
-   index. This depends only on that sample's candidates. It avoids clearing a
-   panel-sized array for each haplotype.
-3. Normalise path order and count actual parent switches on the original path.
-   Read the mismatch count once from the mutation list.
-4. Clip the path against evaluation intervals with a two-pointer scan. A
-   segment can produce several fragments when it spans disjoint intervals.
-   Advance through segments and intervals monotonically, avoiding a nested
-   comparison of every segment with every interval.
-5. Compute fragment lengths and site counts. Apply vectorised `searchsorted`
-   to the left and right boundary arrays. Sum all fragments for the two
-   denominators, including fragments whose parents are roots or noncandidates.
-6. Translate parent nodes through the shared node-to-column array and then
-   the sample's candidate dictionary. Add each eligible fragment's length
-   and site count to the bucket of its first eligible cutoff. The sample's
-   candidates similarly supply a bucketed candidate count.
-7. Take cumulative sums of the buckets to obtain all cutoff numerators and
-   candidate counts. Use float64 buckets for bases and int64 buckets for
-   sites/candidates. For integer additions use `numpy.add.at` or a simple
-   loop; do not silently convert large site counts to float weights.
-8. Store one `HaplotypeStats`. After every record has been seen exactly once,
-   create output rows in focal order, calculate fractions with explicit
-   zero-denominator handling, and construct the final dataframe.
-
-One parent with several copied segments contributes each segment's span and
-sites, but one candidate in `num_focal_ancestors`. Nothing is rescanned for
-smaller cutoffs. There is no assumption that the largest configured cutoff
-includes all focal ancestors.
-
-Let `h` be haplotypes, `a` panel ancestors, `n` reference nodes, `s` sites,
-`k` total candidate associations, `p` total path segments, `q` total clipped
-fragments, and `f` cutoffs. Shared setup is linear in the loaded arrays and
-metadata. Per-path sorting costs the sum of `p_h log(p_h)`. Candidate binning
-costs `O(k log f)`, fragment site lookups cost `O(q log s)`, and cumulative
-output costs `O(h f)`. Interval clipping uses a linear sweep per path.
-Memory is `O(n + a + s + k + h f)` plus one current path and its fragments.
-There is no `O(h a)` membership matrix or `O(f p)` path traversal.
-
-Start with NumPy and a serial streaming evaluator. The read-only probe below
-processed each complete current example panel, including reconstructing focal
-counts from genotypes, in about one second. A separate Numba dependency or
-process queue would add complexity without evidence of a long-running step
-here. Snakemake can schedule independent dataset/panel evaluation jobs across
-the allocated cores. If profiling larger real workloads shows a long-running
-per-panel calculation, follow AGENTS.md by distributing independent record
-batches through multiprocessing queues across the allocated CPU workers.
-Load shared context once per worker, keep queues bounded, assemble results by
-focal row, and propagate worker failures. Add a worker-count setting in YAML
-only when implementing that measured need. Do not repeatedly pickle the full
-candidate arrays or reference TS per record.
-
-## Snakemake integration and rebuilds
-
-Add `evaluation` to the existing `from lib import ...` import in `Snakefile`.
-Add one rule named `compute_focal_ancestor_stats` with:
+Add `evaluation` to the Snakefile imports and add a rule named
+`compute_focal_ancestor_stats`. Its paths explicitly select inferred products:
 
 | Rule element | Value |
 | --- | --- |
-| `input.focal` | `{data_dir}/focal_ancestors/{name}_{kind}_focal_ancestors.npz` |
-| `input.reference` | `{data_dir}/ancestors/{name}_{kind}_ancestors.trees` |
-| `input.matches` | `{data_dir}/matches/{name}_{kind}_samples_matches.jsonl` |
-| `output` | `{data_dir}/dataframes/{name}_{kind}_focal_ancestor_stats.csv` |
+| `input.focal` | `{data_dir}/focal_ancestors/{name}_inferred_focal_ancestors.npz` |
+| `input.reference` | `{data_dir}/ancestors/{name}_inferred_ancestors.trees` |
+| `input.matches` | `{data_dir}/matches/{name}_inferred_samples_matches.jsonl` |
+| `input.config` | `{data_dir}/configs/{name}_ancestor_inference.toml` |
+| `output` | `{data_dir}/dataframes/{name}_inferred_focal_ancestor_stats.csv` |
 | `params.ac_cutoff` | `config["ac_cutoff"]` |
-| `log` | `{progress_dir}/compute_focal_ancestor_stats/{name}_{kind}_compute_focal_ancestor_stats.log` |
+| `log` | `{progress_dir}/compute_focal_ancestor_stats/{name}_inferred_compute_focal_ancestor_stats.log` |
 
-The run block calls `utils.setup_log`, passes pathlib paths and the configured
-cutoff list to `evaluation.compute_focal_ancestor_stats`, prepends the dataset
-and panel-kind columns, and writes the returned dataframe. Log haplotype and
-cutoff counts, output rows, and the destination. Use Snakemake's existing
-directory/output handling; no additional CLI wrapper or rule for each cutoff
-is necessary.
+The run block sets up logging, calls the dataframe-returning function with
+pathlib paths, prepends dataset/panel identity, and writes the CSV. The cutoff
+parameter makes changes to the cutoff list invalidate only statistics. Add
+`params.hmm=config["hmm"]` to both native-TOML writer rules and pass it through
+to the writer, so probability changes rebuild the affected matching products
+and statistics together. Evaluation reads the same explicit probabilities
+from its native config input.
 
-Extend `rule all` with one statistics CSV for each entry in the existing
-`panels` collection. The true branch remains present only for datasets with
-truth; the evaluation code itself is panel-independent. Keep the existing
-`find_focal_ancestors` and `match_samples` branches independent until this rule
-joins their products.
+Use an inferred-only `panels` collection for `rule all`, removing its current
+extension with true panels and its explicit true Zarr/CSV targets. Keep optional
+true rules and their input routing. No new rule receives a true statistics
+output, and no truth dataset list is necessary to enumerate default targets.
 
-Putting the cutoff list in `params` records this configuration dependency, so
-changing cutoffs reruns statistics without rebuilding focal candidates or
-matching. Do not add library source files as Snakemake inputs, consistent with
-the established pipeline. Because existing NPZs lack the new count array,
-perform the first migration using:
+The first migration needs the new sample annotation, explicit native matching
+probabilities, and extended inferred NPZ. Because library code is intentionally
+not a Snakemake input, regenerate from source with:
 
 ```sh
-uv run snakemake --cores all --forcerun find_focal_ancestors compute_focal_ancestor_stats
+uv run snakemake --cores all --forcerun mask_singletons write_inference_config find_focal_ancestors compute_focal_ancestor_stats
 ```
 
-When only evaluation code changes later, force only
-`compute_focal_ancestor_stats`. Focal lookup changes require regenerating its
-NPZs and downstream statistics. Existing ancestor inference, truth extraction,
-TOMLs, ancestor TSs, raw sample TSs, and match files can be reused because their
-contracts are unchanged by this diagnostic.
+The changed masked/config inputs may also rebuild inferred descendants through
+the DAG. This is a one-time format/configuration migration; default probabilities
+keep numerical matching unchanged. Existing true products are neither required
+nor rewritten by this command. To refresh a true CSV later, explicitly target
+it and force `extract_true_ancestors` using the refreshed count annotation.
 
-Update README to describe the cutoff configuration, cumulative eligibility,
-new NPZ array, CSV columns, evaluated-region definition, sample key, and force
-commands. During implementation, amend matching_setup.md's focal-file schema
-to link to this extension. Do not alter dependencies for the initial version.
+After migration, cutoff-only changes rerun only statistics; evaluation-code
+changes require forcing only `compute_focal_ancestor_stats`. Changes to focal
+lookup require regenerating inferred focal NPZs and statistics. Matching/HMM
+changes require rebuilding reference/sample TSs, match files, and statistics
+together. Do not add library files as workflow inputs or extra dependencies.
 
-## Internal verification
+Update README and matching_setup.md with inferred-only default targets,
+`derived_ac` annotation/dataframe/NPZ meanings, output schema, likelihood
+definition and reference node count, explicit HMM settings, and rebuild commands.
+Retain true-stage documentation as an explicitly requested optional workflow.
 
-Use read-only `uv run` probes and small in-memory synthetic cases; no permanent
-unit-test suite or pytest dependency is needed for this implementation. Keep
-the verification oracle deliberately independent: for each cutoff, explicitly
-filter that sample's focal relations and inspect its intervals/site positions.
-The production calculation uses buckets and cumulative sums; the oracle may
-repeat work on tiny cases to make correctness easy to see.
+## Internal verification and completion
 
-### Focal-threshold checks
+Use short `uv run` scripts with in-memory fixtures and an independent per-cutoff
+oracle. No permanent unit-test suite or new testing dependency is required.
+The oracle may repeat tiny calculations; production uses shared ancestor bins
+and one match-file pass.
 
-| Case | Required assertion |
-| --- | --- |
-| Multi-focal counts 3 and 100 | A haplotype carrying only the count-100 allele has threshold 100; carrying only count-3 or both has threshold 3 |
-| Several carried focal sites for one ancestor | One sorted candidate entry with its minimum carried count; no duplicate candidate or duplicated copied span |
-| Site with 3 derived calls, 10 called haplotypes, 20 total haplotypes | Threshold is exactly 3 although `derived_af=0.3`; multiplying AF by 20 would incorrectly yield 6 |
-| Reference allele is derived | Allele-string polarisation yields the same count and candidates as an equivalent ancestral-first encoding |
-| Missing focal call and excluded focal site | Neither contributes a candidate, even if an ancestor has another qualifying focal site not carried by this sample |
-| True singleton origin at an observed doubleton site | Its flagged CSV row contributes no ancestor; site remains on the reference axis |
-| Empty candidate row | Equal offsets, empty aligned count slice, and all positive-denominator focal fractions equal zero |
-| Cutoff 3, 5, 10 | Counts exactly equal to the cutoff are included; a count of 4 first appears at 5; a count above the maximum contributes nowhere |
-| No truth dataset | Counts come from observed calls and inferred relations without reading any true CSV |
+1. Verify exact counts under both ancestral-state modes and missing calls.
+   For three derived calls among ten called and twenty total haplotypes, assert
+   `derived_ac=3`, observed `derived_af=0.3`, and inferred time `3/20`. Check
+   annotations against direct genotype counts and preserve original calls.
+2. For inferred multi-focal ancestors, verify identical carrier masks/counts
+   across focal sites, one panel-level count, unchanged candidate NPZ rows and
+   membership, and equality of first-focal-site eligibility with the direct
+   per-cutoff oracle. Cover empty sets, missing/excluded focal calls, exact cutoff
+   equality, and a count above the largest configured cutoff.
+3. Explicitly request a small true dataframe and check that every row's new
+   `derived_ac` matches observed calls, including flagged singleton-origin
+   rows. All older fields, IDs, times, row order, and panel contents remain
+   unchanged. Do not evaluate true coverage or choose a true-ancestor count.
+4. Check a hand-calculated coverage fixture: reference sites `[10, 20, 30, 50]`,
+   evaluation interval `[10, 51)`, and reverse-order native path with genomic
+   segments `[0, 20)` from candidate A with count 3, `[20, 40)` from candidate B
+   with count 5, and `[40, 100)` from a root. Denominators are 41 bases and
+   four sites. Cutoff 3 covers ten bases/one site; cutoff 5 and above covers
+   thirty bases/three sites. The path has two switches. Verify the site at 20
+   belongs to B and root copying enters only the denominators.
+5. Cover multiple disjoint evaluation intervals, omitted gaps, one segment
+   spanning several intervals, shortened path ends, internal missing calls,
+   a fragment containing no sites, and zero evaluated intersection. Clipping
+   must not change switch count, mismatch count, or score.
+6. Compare native `len(path)-1` against independently counted contiguous parent
+   changes on all actual example records. Single-segment paths have zero
+   switches; an empty synthetic path has zero denominators and count. Do not
+   manufacture split same-parent paths and assume the native segment-count
+   contract applies to that transformed representation.
+7. For likelihood, compare the requested formula with a directly multiplied
+   probability ratio on a tiny biallelic fixture. Use `mu=0.1`, `rho=0.2`,
+   `n=5`, eight sites, two mismatches, and three switches; divide by the all-match,
+   no-switch baseline. Check the zero-event score, negative default penalties,
+   default tiny-mu numerical stability, and exact equality across cutoff rows.
+   Assert that `n` includes roots and excludes appended sample nodes. Verify
+   explicit configured probabilities reach both matching TOML and evaluation;
+   reject multiple sample match groups and missing explicit probabilities.
+8. Check metadata joins with shuffled node/column order and nonnumeric ancestor
+   IDs. Shuffled JSONL completion order must give identical ordered output.
+   Missing/duplicate/unknown keys, invalid candidate indices, and a stale NPZ
+   must fail clearly. Invalid cutoff/probability settings must fail explicitly.
+9. Run `uv run ruff check lib`, `uv run ruff format --check lib`, and
+   `uv run snakemake --cores all --dry-run`. Use an isolated temporary manifest
+   containing the existing zero-error, genotype-error, and no-truth n300 inputs.
+   Expect three inferred statistics files, each with 3,000 rows. The default
+   DAG must contain no true outputs or truth-dependent extraction jobs.
+10. Compare every sample/cutoff metric with the independent oracle. Assert
+    unique row keys, exact row counts, coverage/candidate monotonicity, bounded
+    fractions, and fixed denominators/switches/mismatches/score across cutoffs.
+    In the zero-error inferred example, each complete path evaluates 918,392
+    bases and 6,120 sites, and total sample mismatches are zero.
+11. Change only cutoffs, adding 2 and 20, and confirm only statistics rerun;
+    shared cutoff rows must be unchanged. Separately change HMM probabilities
+    and verify matching and scoring are regenerated consistently. Profile
+    evaluation on its own to confirm streaming memory and one record read
+    regardless of cutoff count.
 
-Compare the old and extended NPZ candidate IDs, row keys, offsets, and sorted
-candidate arrays on both actual panels. They must be identical; only the new
-aligned count array is added.
+Read-only checks performed for this revision confirmed all 793 multi-focal
+inferred ancestors have identical observed focal counts, AFs, and carrier masks,
+and that their AFs equal node times on this fully called dataset. All 600 native
+paths satisfy the segment-count switch identity and use one sample match group.
+Ancestor metadata joins bijectively to all 4,639 panel IDs. The checked sources
+show `n=4,641`, `mu=1e-20`, `rho=0.01`, and no public switch-count accessor.
 
-### Path and interval checks
+For those parameters, the mismatch log penalty is approximately -46.051702
+and the switch log penalty -13.037807. Current sample scores range from
+-691.003780 to zero; their sum is approximately -165,541.037585. A separate
+hand-calculated probability-ratio fixture passed. These are observations about
+the current matching products, not invariant expected values across future
+tsinfer revisions.
 
-Use a tiny hand-checkable fixture with positions `[10, 20, 30, 50]`, evaluation
-interval `[10, 51)`, and a reverse-order native path whose genomic-order
-segments are `[0, 20)` from ancestor A, `[20, 40)` from ancestor B, and
-`[40, 100)` from a root. Candidate A has threshold 3 and B has threshold 5.
+The earlier read-only coverage oracle remains applicable to this inferred
+dataset because the former per-carried-site minimum equals the single ancestor
+count. A second read-only probe used the simplified panel-level cutoff bins
+and matched all 3,000 sample/cutoff results against independently filtered
+candidate sets, including both coverage numerators and candidate counts. Its
+pooled fractions were:
 
-Expected denominators are 41 bases and 4 sites. At cutoff 3, focal totals are
-10 bases and 1 site; at cutoff 5 and above they are 30 bases and 3 sites.
-Fractions are therefore `10/41` and `1/4`, then `30/41` and `3/4`. The switch
-count is 2. An arbitrary two-entry mismatch list gives 2 mismatches at every
-cutoff. The site at 20 belongs to B, demonstrating half-open boundaries and
-why base and site fractions differ.
+| Cutoff | Fraction covered bases | Fraction covered sites |
+| --- | ---: | ---: |
+| 3 | 0.456260 | 0.457898 |
+| 5 | 0.562427 | 0.564406 |
+| 10 | 0.662139 | 0.664306 |
+| 100 | 0.783609 | 0.785775 |
+| 600 | 0.798774 | 0.800666 |
 
-Also check:
+Implement in order: count annotation and dataframe fields; inferred NPZ scalar
+counts; the small evaluation module; explicit HMM settings and inferred-only
+workflow targets; documentation and independent verification. Completion means
+all inferred datasets produce the specified sample-by-cutoff rows with correct
+coverage and likelihood, default execution performs no true work, count fields
+are available for both dataframe kinds, and cutoff edits reuse matching.
 
-- Splitting A into adjacent same-parent segments leaves all metrics unchanged
-  and adds no switch. Reusing A later in the path adds a switch and copied span,
-  but does not add another candidate.
-- Several disjoint evaluation intervals omit gap lengths and gap sites. A
-  segment spanning several intervals is clipped into several fragments without
-  adding switches to the original path.
-- A switch entirely outside the evaluation intervals still appears in
-  `num_switches`, as specified by the full-path definition.
-- Leading and trailing uncovered regions are absent from denominators. Internal
-  missing sample calls do not remove a reference site covered by a path.
-- No evaluated intersection yields zero numerators/denominators and `NaN`
-  fractions. A fragment with bases but no reference sites produces a defined
-  base fraction and an undefined site fraction.
-- A single-parent path has zero switches. Empty paths have zero switches and
-  denominators; an empty file with expected sample rows is a missing-record
-  error. Path overlap and out-of-range parents fail explicitly.
-- A deliberately shuffled node-to-panel relationship, with nonnumeric IDs,
-  yields the correct result through metadata. Root copying remains nonfocal.
-- Shuffled JSONL records produce the same deterministic dataframe. Duplicate,
-  unknown, and missing sample keys fail. Old NPZs fail with the focal rebuild
-  instruction; malformed offsets or misaligned counts fail on load.
-- Invalid cutoff lists fail before match-file streaming. A cutoff above the
-  haplotype count is valid and saturates the complete candidate set.
-
-For every evaluated sample and cutoff, assert bounds on numerators and
-fractions, monotonic focal totals/candidate counts with increasing cutoff,
-identical denominators and path diagnostics across cutoffs, unique output keys,
-and the exact expected row count. Compare site counts against explicitly
-enumerated reference positions rather than another searchsorted expression.
-
-### Existing-example integration
-
-1. Run `uv run ruff check lib` and `uv run ruff format --check lib`, then
-   `uv run snakemake --cores all --dry-run`.
-2. Use a temporary YAML manifest with separate output/progress directories and
-   the existing zero-error n300 input, genotype-error n300 input, and a no-truth
-   copy. Set the five requested cutoffs. Reuse existing compatible match
-   products where available; run the pipeline to create missing prerequisites
-   in the isolated integration directory. Do not modify source stores or the
-   truth TS.
-3. Expect 3,000 dataframe rows per panel for 600 haplotypes and five cutoffs.
-   Expect five panels across the three datasets: inferred and true for the
-   two truth datasets and inferred only for no truth. Confirm schema, string
-   IDs, ordering, uniqueness, and aligned candidate counts.
-4. Compare every row with a straightforward per-cutoff reference calculation.
-   On these examples this is small enough to validate all haplotypes, rather
-   than relying on aggregate monotonicity alone. For the zero-error panels,
-   all complete paths evaluate 918,392 bases and 6,120 sites per haplotype.
-5. Sum `num_mismatches` once per haplotype, not across repeated cutoff rows.
-   The checked-in zero-error inferred matches contain 0 events; the true
-   matches contain 6. Independently compare path switches and mutations with
-   native JSONL and, for selected samples, raw sample TS edges and mutations.
-6. Modify only `ac_cutoff`, for example adding 2 and 20, and dry-run/run the
-   workflow. Only statistics outputs should be invalidated. Confirm that
-   cutoffs shared between runs have identical values and the row counts change
-   as expected. No-truth evaluation must request no true dependencies.
-7. Time evaluation separately from matching and focal lookup. Confirm it reads
-   each match record once and remains insensitive to the number of cutoffs
-   except for candidate binning and the required output size. Compare peak
-   memory with NPZ/reference/output sizes; no complete match-file dataframe
-   should appear in memory. Use profiling evidence before considering Numba
-   or multiprocessing.
-
-### Read-only experiments performed while preparing this plan
-
-Inspected the current local tsinfer implementation and existing default n300
-products. The matcher emits mismatch events for nonmissing disagreements, and
-the pipeline writes parent node IDs and native path order directly. Both
-ancestor references have 6,120 sites, sequence length 64,444,167, and the
-single evaluation interval `[81,353, 999,745)`. There are 793 multi-focal
-inferred ancestors and 1,167 multi-focal true ancestors. Native paths are in
-descending genomic order for 580 inferred and 582 true records; one-segment
-paths do not require reordering.
-
-A read-only prototype rebuilt the sample-specific minimum carried focal counts
-from sample genotypes, reproduced all 600 existing candidate sets for each
-panel, and checked the `derived_af * called_count` relationship. The input had
-no missing calls. It then clipped paths and computed all requested cumulative
-cutoffs. Rounded pooled fractions were:
-
-| Panel | Cutoff | Fraction focal bases | Fraction focal sites |
-| --- | ---: | ---: | ---: |
-| inferred | 3 | 0.456260 | 0.457898 |
-| inferred | 5 | 0.562427 | 0.564406 |
-| inferred | 10 | 0.662139 | 0.664306 |
-| inferred | 100 | 0.783609 | 0.785775 |
-| inferred | 600 | 0.798774 | 0.800666 |
-| true | 3 | 0.398478 | 0.400293 |
-| true | 5 | 0.471093 | 0.473373 |
-| true | 10 | 0.551720 | 0.554388 |
-| true | 100 | 0.650127 | 0.653713 |
-| true | 600 | 0.658269 | 0.661876 |
-
-These are total focal bases/sites divided by total evaluated bases/sites,
-pooling haplotypes. They are reference observations for the current matching
-products and the specified semantics, not universal expected values for future
-tsinfer revisions. The aggregate switch counts were 12,697 inferred and 15,736
-true; mismatch counts were 0 and 6. Runtime including focal reconstruction was
-about 0.99 seconds inferred and 0.81 seconds true. The prototype used a direct
-per-cutoff calculation to provide an independent oracle; the implementation
-will use the bucket accumulation described above.
-
-A separate in-memory check verified the hand-calculated 41-base/four-site
-fixture and its integer bucket accumulation. Both real references also passed
-checks that their ancestor metadata maps bijectively to panel IDs, all panel
-ancestors are haploid, and reference positions equal panel positions. No
-production code, configuration, source data, or existing output was changed
-by these experiments.
-
-## Implementation sequence and completion criteria
-
-1. Extend `matching.find_focal_ancestors` with exact site counts and minimum
-   carried counts. Preserve existing focal relationships and candidate ordering.
-2. Add `lib/evaluation.py` with the data contracts, metadata joins, clipping,
-   and single-pass cumulative calculation described above. Verify the synthetic
-   cases before integrating output writing.
-3. Add the required YAML setting, the new rule, its cutoff parameter and logs,
-   and the `rule all` targets. Keep diagnostic work downstream of matching.
-4. Update README and the focal-storage section of matching_setup.md with the
-   implemented contracts and rebuild instructions.
-5. Run style checks, dry-run the DAG, rebuild focal files, and perform the
-   independent example comparisons. Record actual verification results and
-   timings in the implementation report.
-
-The implementation is complete when every configured panel produces the
-requested number of sample-by-cutoff rows; cutoff eligibility is correct for
-multi-focal and missing-call cases; base/site fractions use the correct region
-and half-open boundaries; switches and mismatches agree with native paths;
-root and ID joins are correct; cutoff changes reuse matching products; and
-the independent validation agrees with all output metrics.
-
-Possible later diagnostics include the fraction copied from roots, the number
-of distinct eligible focal parents actually selected, mismatches per evaluated
-site, and direct ancestor-time stratification. They can answer different
-questions but are not necessary to deliver this requested diagnostic.
+Future true-panel evaluation must define a count/eligibility policy for its
+heterogeneous multi-focal ancestors before reactivating true statistics. Keep
+that policy and any additional diagnostics outside this initial implementation.

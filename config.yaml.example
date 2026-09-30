@@ -1,5 +1,9 @@
 data_dir: data/match_eval
 progress_dir: .progress
+ac_cutoff: [3, 5, 10, 100, 600]
+hmm:
+  recombination: 0.01
+  mismatch: 1.0e-20
 
 datasets:
   - name: out_of_africa_n300_1mbp

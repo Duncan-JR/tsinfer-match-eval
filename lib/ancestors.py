@@ -72,6 +72,7 @@ def extract_true_ancestors(
     true_site_ids = np.searchsorted(ts.sites_position, positions)
     sample_site_ids = np.searchsorted(samples["variant_position"][:], positions)
     frequencies = samples["variant_match_eval_derived_af"][sample_site_ids]
+    allele_counts = samples["variant_match_eval_derived_ac"][sample_site_ids]
     inferred_ids = inferred["sample_id"][:]
     inferred_times = inferred["sample_time"][:]
     focal_columns = {}
@@ -108,6 +109,7 @@ def extract_true_ancestors(
                 "true_node_time": node_time,
                 "inferred_node_time": float(inferred_times[column]),
                 "derived_af": float(frequencies[inference_site_id]),
+                "derived_ac": int(allele_counts[inference_site_id]),
                 "num_mutations": num_mutations,
             }
         )
