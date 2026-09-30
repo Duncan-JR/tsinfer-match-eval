@@ -1,4 +1,4 @@
-"""Write mutation-level true ancestors on an inferred panel's site axis."""
+"""Relate inference sites to unique, older truth-node haplotypes."""
 
 import logging
 import pathlib
@@ -52,7 +52,18 @@ def extract_true_ancestors(
     dataframe_path: pathlib.Path,
     chunk_size: int,
 ) -> None:
-    """Enumerate original mutation events, then decode their node haplotypes."""
+    """Select one derived event per site and decode each eligible truth node once.
+
+    The CSV retains every inference site. Rows selecting the same older node
+    share a panel sample_id and contribute multiple focal positions to its column.
+    Zero-time selections have true_mutation_is_singleton=True and no ancestor ID;
+    their sites remain on the matching axis for sample-stage mutations. This flag
+    describes the selected terminal origin, including at recurrent sites.
+
+    true_node_id refers to the original truth TS. Haplotypes retain final states,
+    missing calls, and original node times. :func:`lib.matching.find_focal_ancestors`
+    uses only rows with an eligible ancestor association.
+    """
     inferred = tsinfer.vcz.open_store(inferred_path)
     samples = tsinfer.vcz.open_store(samples_path)
     ts = tskit.load(truth_path)
@@ -66,46 +77,64 @@ def extract_true_ancestors(
     focal_columns = {}
     for column, focal_positions in enumerate(inferred["sample_focal_positions"][:]):
         for position in focal_positions:
-            if position != -2:
+            if position >= 0:
                 focal_columns[int(position)] = column
 
     variant = tskit.Variant(ts, isolated_as_missing=False)
     records = []
     for inference_site_id, true_site_id in enumerate(true_site_ids):
         site = ts.site(int(true_site_id))
-        primary = primary_mutation(site, ts, variant)
-        if primary is None:
-            continue
-        column = focal_columns[int(site.position)]
-        for mutation in site.mutations:
-            records.append(
-                {
-                    "inference_site_id": inference_site_id,
-                    "true_site_id": site.id,
-                    "focal_position": int(site.position),
-                    "focal_allele": int(mutation.derived_state != site.ancestral_state),
-                    "inferred_ancestor_id": str(inferred_ids[column]),
-                    "true_ancestor_id": "",
-                    "true_mutation_id": mutation.id,
-                    "true_node_id": mutation.node,
-                    "true_node_time": float(ts.nodes_time[mutation.node]),
-                    "inferred_node_time": float(inferred_times[column]),
-                    "derived_af": float(frequencies[inference_site_id]),
-                    "num_mutations": len(site.mutations),
-                    "is_primary_for_site": mutation.id == primary.id,
-                }
+        num_mutations = len(site.mutations)
+        if num_mutations == 1:
+            mutation = site.mutations[0]
+        else:
+            mutation = primary_mutation(site, ts, variant)
+        if mutation is None:
+            raise ValueError(
+                f"No derived carriers at truth site {site.id} ({site.position})"
             )
-    records.sort(
-        key=lambda row: (
-            -row["true_node_time"],
-            row["inference_site_id"],
-            row["true_mutation_id"],
+        column = focal_columns[int(site.position)]
+        node_time = float(ts.nodes_time[mutation.node])
+        records.append(
+            {
+                "inference_site_id": inference_site_id,
+                "true_site_id": site.id,
+                "focal_position": int(site.position),
+                "inferred_ancestor_id": str(inferred_ids[column]),
+                "true_ancestor_id": None,
+                "true_mutation_id": mutation.id,
+                "true_mutation_is_singleton": node_time == 0,
+                "true_node_id": mutation.node,
+                "true_node_time": node_time,
+                "inferred_node_time": float(inferred_times[column]),
+                "derived_af": float(frequencies[inference_site_id]),
+                "num_mutations": num_mutations,
+            }
         )
-    )
-    for column, row in enumerate(records):
+    records.sort(key=lambda row: (-row["true_node_time"], row["inference_site_id"]))
+    node_columns = {}
+    ancestor_nodes = []
+    focal_positions = []
+    for row in records:
+        if row["true_mutation_is_singleton"]:
+            continue
+        node_id = row["true_node_id"]
+        column = node_columns.get(node_id)
+        if column is None:
+            column = len(ancestor_nodes)
+            node_columns[node_id] = column
+            ancestor_nodes.append(node_id)
+            focal_positions.append([])
         row["true_ancestor_id"] = f"a{column}"
+        focal_positions[column].append(row["focal_position"])
+    ancestor_nodes = np.asarray(ancestor_nodes, dtype=np.int32)
     dataframe = pd.DataFrame.from_records(records)
-    logger.info("Selected %d mutation-level ancestors", len(dataframe))
+    logger.info(
+        "Selected %d site records and %d unique older ancestors; %d singleton origins",
+        len(dataframe),
+        len(ancestor_nodes),
+        int(dataframe.true_mutation_is_singleton.sum()),
+    )
 
     # Flag internal nodes in a private copy so tskit can decode their haplotypes.
     tables = ts.dump_tables()
@@ -122,18 +151,17 @@ def extract_true_ancestors(
         contig_id=str(inferred["contig_id"][0]),
         contig_length=int(inferred["contig_length"][0]),
     )
-    num_ancestors = len(dataframe)
+    num_ancestors = len(ancestor_nodes)
     root["call_genotype"].resize((len(positions), num_ancestors, 1))
     for field in ("sample_time", "sample_start_position", "sample_end_position"):
         root[field].resize((num_ancestors,))
-    root["sample_time"][:] = dataframe.true_node_time.to_numpy()
+    root["sample_time"][:] = ts.nodes_time[ancestor_nodes]
 
     for start in range(0, num_ancestors, chunk_size):
         end = min(start + chunk_size, num_ancestors)
-        nodes = dataframe.true_node_id.iloc[start:end].to_numpy()
-        unique_nodes, inverse = np.unique(nodes, return_inverse=True)
-        genotypes = expanded_ts.genotype_matrix(samples=unique_nodes)
-        haplotypes = genotypes[true_site_ids][:, inverse].astype(np.int8)
+        nodes = ancestor_nodes[start:end]
+        genotypes = expanded_ts.genotype_matrix(samples=nodes)
+        haplotypes = genotypes[true_site_ids].astype(np.int8)
         called = haplotypes >= 0
         if not np.all(called.any(axis=0)):
             raise ValueError("An extracted ancestor has no nonmissing inference sites")
@@ -143,6 +171,5 @@ def extract_true_ancestors(
         root["sample_start_position"][start:end] = positions[first]
         root["sample_end_position"][start:end] = positions[last] + 1
         logger.info("Wrote true ancestor columns %d:%d", start, end)
-    focal_positions = [[int(position)] for position in dataframe.focal_position]
     tsinfer.vcz.finalize_ancestor_zarr(root, focal_positions)
     dataframe.to_csv(dataframe_path, index=False)

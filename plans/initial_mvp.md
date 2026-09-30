@@ -4,14 +4,16 @@
 
 Read existing single-contig, phased sample VCZs. Produce an inferred ancestor
 VCZ for every dataset and, where `ts_path` is supplied, a true ancestor VCZ and
-mutation-level CSV. Reuse `../tsinfer-anc-eval` inputs and the editable local
-`../tsinfer` code. Matching and ARG comparisons come later. Assume correct
-polarisation and binary, biallelic simulations. Do not add a unit-test suite.
+site-level CSV. Reuse `../tsinfer-anc-eval` inputs and the editable local
+`../tsinfer` code. Matching is extended in [matching_setup.md](matching_setup.md);
+ARG comparisons remain out of scope. Assume correct polarisation and binary,
+biallelic simulations. Do not add a unit-test suite.
 
-The implementation has two small modules: `lib/utils.py` for the copied sample
-store, TOML, and inference; `lib/ancestors.py` for truth extraction. The Snakefile
-calls those functions in `run` blocks and uses explicit rules and output names,
-following `tsinfer-anc-eval`. Run the workflow with `uv run snakemake --cores all`.
+The initial implementation has two small modules: `lib/utils.py` for the copied
+sample store and TOML; `lib/ancestors.py` for inference and truth extraction.
+The Snakefile calls those functions in `run` blocks and uses explicit rules and
+output names, following `tsinfer-anc-eval`. Run the workflow with
+`uv run snakemake --cores all`.
 No rule invokes `uv run` internally or lists source files as inputs.
 After a code edit, use Snakemake's `--forcerun` for affected rules.
 
@@ -58,9 +60,9 @@ Output paths use `{name}` followed by a suffix under the configured data folder:
    with eight-bit genotype encoding. Its output `variant_position` is the
    authoritative analysis site list.
 4. `extract_true_ancestors` maps those positions to the original truth TS and
-   enumerates every mutation at each site, including recurrence and back
-   mutations. A private TS copy flags internal nodes as samples for genotype
-   decoding. Decode ancestor columns in simple sequential batches of
+   selects one derived-mutation ancestor per site, retaining recurrent sites
+   on the shared axis. A private TS copy flags internal nodes as samples for
+   genotype decoding. Decode ancestor columns in simple sequential batches of
    `ancestor_chunk_size`; the tskit matrix covers all truth sites for nodes in
    one batch, then select the inferred sites. The data are written with
    tsinfer's native ancestor Zarr setup/finalisation helpers.
@@ -76,32 +78,45 @@ Select one representative mutation per inference site. For a site with one
 mutation, select it. For a recurrent site, decode current derived carriers on
 the original TS and choose the derived-state mutation whose node covers the
 most tracked carriers, breaking ties by mutation order. If no derived carriers
-remain, warn and omit that site's mutation rows; leave the site on the panel
-axis. This selection occurs before internal nodes are flagged as samples.
+remain, raise an error identifying the site. Ordinary sites use their sole
+mutation directly, without decoding carriers. This selection occurs before
+internal nodes are flagged as samples.
 
-Emit one CSV row for each original mutation at every represented site. Sort
-rows by decreasing `true_node_time`, then `inference_site_id` and
-`true_mutation_id`. The true panel has exactly one haplotype column per row.
+Emit exactly one CSV row for each inference site, retaining only the selected
+mutation. Sort rows by decreasing `true_node_time`, then `inference_site_id`.
+The true panel has one haplotype column per unique positive-time selected truth
+node. Multiple sites choosing the same node have separate CSV rows sharing
+`true_ancestor_id`; their focal positions belong to the same panel column.
+Panel columns follow the nodes' first occurrence in the sorted CSV.
 Write the original node's *final* genotype state at each inference site; never
 force the focal genotype to match a transient mutation state.
 
 The CSV columns are `inference_site_id`, `true_site_id`, `focal_position`,
-`focal_allele`, `inferred_ancestor_id`, `true_ancestor_id`, `true_mutation_id`,
+`inferred_ancestor_id`, `true_ancestor_id`, `true_mutation_id`, `true_mutation_is_singleton`,
 `true_node_id`, `true_node_time`, `inferred_node_time`, `derived_af`,
-`num_mutations`, and `is_primary_for_site`. The focal allele is 1 for a derived
-event and 0 for a back mutation. `derived_af` always describes observed
-derived-allele frequency in the sample VCZ, including on back-mutation rows.
+and `num_mutations`. There are no `focal_allele` or `is_primary_for_site` columns.
+`num_mutations` retains the original truth site's count, including recurrence.
+`derived_af` describes observed derived-allele frequency in the sample VCZ.
 True and inferred times use different scales.
+
+`true_mutation_is_singleton` is `True` for a selected mutation whose node has
+time zero. Keep its CSV row and site position but leave `true_ancestor_id`
+blank and omit its node from the panel. The flag identifies a terminal origin,
+including at recurrent sites where separate singleton mutations jointly form
+an observed doubleton. `num_mutations` preserves that distinction. Focal lookup
+uses only rows whose flag is `False`.
 
 The true store reuses inferred positions, ancestral-first allele strings,
 contig information, and sequence intervals. It writes `call_genotype` with
 shape `(num_inference_sites, num_true_ancestors, 1)`, `sample_time` from the
 original node, a start/end span from its first/last nonmissing inference site,
-and the mutation's focal position. It retains internal missing calls. The
+and all associated focal positions. It retains internal missing calls. The
 matcher creates its own ultimate and virtual root nodes, so no synthetic root
-haplotypes belong in this store. Original zero-time nodes keep time zero; a
-later separate ancestor-TS/sample-matching experiment needs a time policy for
-them.
+haplotypes belong in this store. Original node times are unchanged. Zero-time
+selections remain in the CSV; sample matching places their mutations in the
+final TS. Split matching requires ancestor groups strictly before contemporary
+sample groups and a reference with at most one mutation per site. Recurrence
+is allowed in the final raw sample TS.
 
 ## Which ID links a matched node to a Zarr haplotype?
 
@@ -112,7 +127,7 @@ haploid ancestor entry. tsinfer labels its ancestor columns with strings such
 as `"a17"`; `a` is just the label prefix. It is not an allele, node, or second
 index.
 
-Both `inferred_ancestor_id` and `true_ancestor_id` in the CSV mean the **actual
+Both nonmissing `inferred_ancestor_id` and `true_ancestor_id` in the CSV mean the **actual
 `sample_id` string** in their respective Zarr stores. There are no separate
 `inferred_sample_id` and `true_sample_id` columns. During matching, tsinfer
 adds node metadata including `source`, `sample_id`, and `ploidy_index`. To find
@@ -125,10 +140,13 @@ whose haplotype was decoded, not a node created by matching.
 
 ## Completed checks
 
-The n300 zero-error run produced 6,120 inference sites, 4,639 inferred
-ancestors, and 6,157 true records. The genotype-error run produced 6,063,
-5,443, and 6,100 respectively, and the no-truth branch omitted truth outputs.
+The original mutation-level n300 zero-error run produced 6,120 inference sites,
+4,639 inferred ancestors, and 6,157 true records. The genotype-error run produced
+6,063, 5,443, and 6,100 respectively, and the no-truth branch omitted truth outputs.
 The fresh mask disagreed with the inherited one at 365 genotype-error sites.
 The simplified implementation yielded identical inferred/true arrays and CSVs
-to the original implementation for both simulated inputs. Lint and formatting
-are checked with `uv run ruff check lib` and `uv run ruff format --check lib`.
+to the original implementation for both simulated inputs. The site-level
+extraction above supersedes that historical schema and keeps one site record
+per inference site, with shared older-node ancestor columns. Lint and formatting
+are checked with
+`uv run ruff check lib` and `uv run ruff format --check lib`.
