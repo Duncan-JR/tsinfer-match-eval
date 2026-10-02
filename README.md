@@ -22,7 +22,7 @@ uv run snakemake --cores all
 For the one-time count/config/focal format migration, run:
 
 ```sh
-uv run snakemake --cores all --forcerun mask_singletons write_inference_config find_focal_ancestors compute_focal_ancestor_stats
+uv run snakemake --cores all --forcerun annotate_derived_counts write_inference_config find_focal_ancestors compute_focal_ancestor_stats
 ```
 
 Library files are intentionally not Snakemake inputs. After changing evaluation
@@ -38,7 +38,7 @@ relative to this working directory; `~` is expanded for input paths. Each
 `datasets` entry gives a `name`, `zarr_path`, `ts_path`, and `ancestral_state`.
 Use `ts_path: null` to evaluate only inferred panels. Ancestral state may be
 `{field: variant_ancestral_state}` or `{is_reference: true}`. The input is one
-phased, single-contig VCZ per dataset, with all samples included.
+phased, single-contig VCZ per dataset, with optional native sample selection.
 `inference_threads` and `matching_threads` set each job's requested worker count;
 Snakemake allocates those workers and schedules independent panels in parallel.
 `ac_cutoff` is a nonempty, strictly increasing list of positive integers with
@@ -69,16 +69,43 @@ targets use `{kind}=true` where truth is supplied. The optional true rules are
 rules remain callable for either kind.
 
 Rule logs go under the separately configured `progress_dir`. The sample store
-is a regular copy of the input. Its genotypes are unchanged; the name
-`_samples_masked.zarr` means that the copy contains the fresh
-`variant_match_eval_singleton_mask` annotation. The generated native tsinfer
-TOML excludes that mask. The annotation is computed from current genotype
-calls, so it remains correct after anc-eval has added genotype errors. A second
-annotation, `variant_match_eval_derived_af`, records derived allele count divided
-by called haplotypes. `variant_match_eval_derived_ac` stores the exact observed
-derived count as int64. Missing calls contribute to neither count. Creating
-these annotations reads the genotype array into memory, which keeps this MVP
-simple and suits the example datasets.
+is a regular copy of the input, retaining its original variant and sample axes.
+The historical `_samples_masked.zarr` output name is retained. It contains
+`variant_match_eval_derived_ac` and `variant_match_eval_derived_af`, computed
+from the selected cohort in genotype chunks. Missing calls enter neither the
+derived count nor its called-genome denominator. There is no singleton mask;
+tsinfer determines ancestral eligibility, duplicate handling, and inference sites.
+
+Optional dataset `include`, `exclude`, and `samples` strings pass unchanged into
+native TOML. Omitted or null values are omitted. Native validation treats include
+and exclude as alternatives. For example, `include: 'POS >= 1000000 & POS < 2000000'`
+and exclude-only `exclude: 'POS < 1000000 | POS >= 2000000'` select the same interval.
+Coordinates remain absolute. `samples` takes comma-separated IDs (or native `^`
+exclusions), rather than a file path. Copy the literal frozen value from
+[data/tgp_chr20_n100_samples.yaml](data/tgp_chr20_n100_samples.yaml) for the
+33 CEU, 33 CHB, and 34 YRI cohort. All three native stages and local readers use
+that same selection; generated ancestors do not receive the participant string.
+Optional per-dataset `matching_cache_size` passes the native cache size in MiB
+to both matching stages; omitted or null uses the native default. The 10 Mbp
+real-data example uses 1024 MiB because its native source chunk needs 501.2 MiB.
+
+Changing site filters rebuilds native configurations and downstream products;
+changing samples also refreshes counts, focal rows, and chunks.
+
+Population enrichment is disabled when `metadata_source` is omitted or null.
+`metadata_source: ts` requires the original `ts_path` and joins selected IDs to
+`map_to_vcf_model()` names and haploid nodes. It adds `truth_node_id`,
+`truth_individual_id`, `population_id`, and `population` to both inferred CSVs.
+`metadata_source: csv` requires `csv_path`, `zarr_id_field`, `csv_id_field`, and
+`pop_field`, and adds only `population`. CSV identifiers are strings and unique;
+selected IDs and labels must exist. Canonical output sample IDs always come from
+Zarr `sample_id`. The example uses the pedigree's `superpopulation` labels:
+66 EUR, 66 EAS, and 68 AFR genomes. Metadata-only edits rebuild the two CSVs
+without inference or matching; row keys, order, and numerical values are retained.
+
+The real chr20 input retains a multi-contig header. The corrected native tsinfer
+checkout resolves chr20 and its 64,444,167-base length in both inference and
+matching; this pipeline does not normalize contigs or modify the source store.
 
 The inferred panel's positions define the true panel's site axis. The true
 CSV records one selected derived mutation per inference site. A
@@ -361,3 +388,34 @@ annotation, inference configuration, ancestor inference, focal lookup, and this
 analysis. Smaller cutoff changes left the existing output current, while maximum
 AC or K changes selected only the chunk rule. HMM changes showed the documented
 upstream TOML invalidation. No formal test suite was added.
+
+
+## Checked real-data runs
+
+The frozen 100-individual chr20 cohort completed both 1 Mbp and 10 Mbp runs on
+2026-10-01 after the native contig fix. The final configuration retains
+`include: 'POS >= 1000000 & POS < 11000000'`, the original sample string, and
+CSV superpopulation enrichment.
+
+| Metric | 1 Mbp | 10 Mbp |
+| --- | ---: | ---: |
+| Inference sites | 7,478 | 82,072 |
+| Ancestors | 3,618 | 35,829 |
+| Sample haplotypes / match records | 200 / 200 | 200 / 200 |
+| Statistics rows | 1,000 | 1,000 |
+| Chunk rows | 885,171 | 9,763,548 |
+| Mean bp coverage at AC ≤ 200 | 99.495367% | 99.953116% |
+| Total sample switches | 53 | 179 |
+| Total sample mismatches | 0 | 0 |
+
+Native evaluation intervals span 999,908 and 9,999,700 bp, respectively. Both
+raw tree sequences retain chr20's full sequence length. All selected decoded
+calls agree with source genotypes. Population labels are complete: 66 EUR,
+66 EAS, and 68 AFR genomes, giving 330 EUR, 330 EAS, and 340 AFR statistics rows
+at five cutoffs. Independent checks confirm copying coverage, scores, raw
+edges/JSONL joins, and sampled chunk boundaries. Final lint/format checks pass
+and the full workflow's second dry run has no pending work.
+
+See [the completed plan](plans/real_data.md#completed-real-data-evaluation-2026-10-01)
+for all cutoff summaries, native intervals, validation evidence, and the
+1024 MiB native matching-cache setting required by this input's large chunks.

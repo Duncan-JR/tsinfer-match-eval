@@ -50,7 +50,14 @@ class BlockBounds:
     jit_seconds: float | None = None
 
 
-def _prepare(samples_path, ancestors_path, focal_path, ancestral_state, max_ac_cutoff):
+def _prepare(
+    samples_path,
+    ancestors_path,
+    focal_path,
+    ancestral_state,
+    max_ac_cutoff,
+    sample_selection,
+):
     """Align and polarise calls and expand seeds for construct_focal_ancestor_chunks."""
     samples = tsinfer.vcz.open_store(samples_path)
     panel = tsinfer.vcz.open_store(ancestors_path)
@@ -74,20 +81,20 @@ def _prepare(samples_path, ancestors_path, focal_path, ancestral_state, max_ac_c
     canonical_alleles[~reference_ancestral] = alleles[~reference_ancestral, :2][:, ::-1]
     if not np.array_equal(panel["variant_allele"][:], canonical_alleles):
         raise ValueError("Panel allele order disagrees with sample ancestral polarity")
-    calls = samples["call_genotype"].oindex[rows, :, :]
+    columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
+    calls = samples["call_genotype"].oindex[rows, columns, :]
     if np.any((calls < -1) | (calls > 1)):
         raise ValueError("Sample calls must be biallelic codes 0, 1, or missing -1")
     swapped = ~reference_ancestral[:, None, None] & (calls >= 0)
     calls[swapped] = 1 - calls[swapped]
     ploidy = calls.shape[2]
     calls = calls.reshape(len(positions), -1)
-    ids = np.asarray(samples["sample_id"][:].tolist(), dtype=str)
+    ids = np.asarray(samples["sample_id"].oindex[columns].tolist(), dtype=str)
     sample_ids = np.repeat(ids, ploidy)
     ploidy_indices = np.tile(np.arange(ploidy), len(ids))
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
     counts = samples["variant_match_eval_derived_ac"].oindex[rows]
     frequencies = samples["variant_match_eval_derived_af"].oindex[rows]
-    excluded = samples["variant_match_eval_singleton_mask"].oindex[rows]
     starts = panel["sample_start_position"][:]
     ends = panel["sample_end_position"][:]
     intervals = panel["sequence_intervals"][:]
@@ -134,7 +141,7 @@ def _prepare(samples_path, ancestors_path, focal_path, ancestral_state, max_ac_c
             selected = selected[derived_ac[selected] <= max_ac_cutoff]
             for ancestor in selected:
                 indices = ancestor_focals[ancestor]
-                carried = (calls[indices, haplotype] >= 0) & ~excluded[indices]
+                carried = calls[indices, haplotype] >= 0
                 indices = indices[carried]
                 if np.any(calls[indices, haplotype] != 1):
                     raise ValueError("Selected focal sample call is not derived")
@@ -463,6 +470,7 @@ def construct_focal_ancestor_chunks(
     max_ac_cutoff: int,
     max_mismatches: int,
     threads: int,
+    sample_selection: str | None = None,
 ) -> pd.DataFrame:
     """Compare each carried focal site with its inferred ancestor haplotype.
 
@@ -488,6 +496,7 @@ def construct_focal_ancestor_chunks(
         focal_ancestors_path,
         ancestral_state,
         max_ac_cutoff,
+        sample_selection,
     )
     data = _prepare(*arguments)
     prepared = time.perf_counter()

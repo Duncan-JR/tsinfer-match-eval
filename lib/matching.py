@@ -13,7 +13,10 @@ logger = logging.getLogger(__name__)
 
 
 def match_ancestors(
-    config_path: pathlib.Path, output_path: pathlib.Path, threads: int
+    config_path: pathlib.Path,
+    output_path: pathlib.Path,
+    threads: int,
+    cache_size: int | None = None,
 ) -> None:
     """Match ancestors before samples, preserving the raw reference TS.
 
@@ -28,7 +31,9 @@ def match_ancestors(
     ancestor_groups = [job["group"] for job in jobs if job["source"] == "ancestors"]
     if any(group >= first_sample_group for group in ancestor_groups):
         raise ValueError("All ancestor groups must precede the first sample group")
-    ts = tsinfer.pipeline.match(cfg, group_stop=first_sample_group, num_threads=threads)
+    ts = tsinfer.pipeline.match(
+        cfg, group_stop=first_sample_group, num_threads=threads, cache_size=cache_size
+    )
     ts.dump(output_path)
     logger.info("Wrote raw ancestor reference to %s", output_path)
 
@@ -81,6 +86,7 @@ def find_focal_ancestors(
     output_path: pathlib.Path,
     ancestral_state: dict,
     true_dataframe_path: pathlib.Path | None = None,
+    sample_selection: str | None = None,
 ) -> None:
     """Save derived-focal candidates separately for each sample haplotype.
 
@@ -121,7 +127,8 @@ def find_focal_ancestors(
 
     sample_positions = samples["variant_position"][:]
     sample_rows = np.searchsorted(sample_positions, positions)
-    genotypes = samples["call_genotype"][sample_rows]
+    columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
+    genotypes = samples["call_genotype"].oindex[sample_rows, columns, :]
     alleles = samples["variant_allele"][sample_rows]
     ancestral = alleles[:, 0]
     if not ancestral_state.get("is_reference", False):
@@ -131,10 +138,8 @@ def find_focal_ancestors(
     allele_indices = np.maximum(genotypes, 0)
     called_alleles = np.take_along_axis(alleles[:, None, :], allele_indices, axis=2)
     derived = called & (called_alleles != ancestral[:, None, None])
-    excluded = samples["variant_match_eval_singleton_mask"][sample_rows]
-    derived[excluded] = False
 
-    sample_ids = np.asarray(samples["sample_id"][:].tolist(), dtype=str)
+    sample_ids = np.asarray(samples["sample_id"].oindex[columns].tolist(), dtype=str)
     ploidy = genotypes.shape[2]
     offsets = [0]
     candidate_rows = []
@@ -170,6 +175,7 @@ def match_samples(
     output_path: pathlib.Path,
     match_file_path: pathlib.Path,
     threads: int,
+    cache_size: int | None = None,
 ) -> None:
     """Match samples against the unmodified reference from :func:`match_ancestors`.
 
@@ -196,7 +202,10 @@ def match_samples(
         augment_sites=None,
     )
     ts = tsinfer.pipeline.match(
-        sample_cfg, num_threads=threads, match_file=match_file_path
+        sample_cfg,
+        num_threads=threads,
+        match_file=match_file_path,
+        cache_size=cache_size,
     )
     ts.dump(output_path)
     logger.info(

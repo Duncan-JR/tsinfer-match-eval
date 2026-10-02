@@ -23,6 +23,41 @@ def focal_dataframe(wildcards):
     return [data_dir / "dataframes" / f"{wildcards.name}_true_ancestors.csv"]
 
 
+def metadata_input(wildcards):
+    dataset = datasets[wildcards.name]
+    source = dataset.get("metadata_source")
+    if source is None:
+        return []
+    if source == "ts":
+        field = "ts_path"
+    elif source == "csv":
+        field = "csv_path"
+    else:
+        raise ValueError(f"Unknown metadata_source: {source}")
+    if dataset.get(field) is None:
+        raise ValueError(f"metadata_source: {source} requires {field}")
+    return [pathlib.Path(dataset[field]).expanduser()]
+
+
+def metadata_params(wildcards):
+    dataset = datasets[wildcards.name]
+    fields = (
+        "metadata_source", "ts_path", "csv_path",
+        "zarr_id_field", "csv_id_field", "pop_field", "samples",
+    )
+    return {field: dataset.get(field) for field in fields}
+
+
+def enrich_populations(dataframe, samples_path, dataset):
+    metadata = utils.read_population_metadata(samples_path, dataset)
+    if metadata is None:
+        return dataframe
+    return dataframe.merge(
+        metadata, on=["source", "sample_id", "ploidy_index"],
+        how="left", validate="many_to_one", sort=False,
+    )
+
+
 wildcard_constraints:
     kind="inferred|true",
 
@@ -56,18 +91,21 @@ rule all:
         ),
 
 
-rule mask_singletons:
+rule annotate_derived_counts:
     input:
         lambda wildcards: pathlib.Path(datasets[wildcards.name]["zarr_path"]).expanduser(),
     output:
         directory(data_dir / "samples" / "{name}_samples_masked.zarr"),
     log:
-        progress_dir / "mask_singletons" / "{name}_mask_singletons.log",
+        progress_dir / "annotate_derived_counts" / "{name}_annotate_derived_counts.log",
+    params:
+        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
+        ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        dataset = datasets[wildcards.name]
-        utils.add_singleton_mask(
-            pathlib.Path(input[0]), pathlib.Path(output[0]), dataset["ancestral_state"]
+        utils.annotate_derived_counts(
+            pathlib.Path(input[0]), pathlib.Path(output[0]),
+            params.ancestral_state, params.samples,
         )
 
 
@@ -80,14 +118,18 @@ rule write_inference_config:
         progress_dir / "write_inference_config" / "{name}_write_inference_config.log",
     params:
         hmm=config["hmm"],
+        ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
+        include=lambda wildcards: datasets[wildcards.name].get("include"),
+        exclude=lambda wildcards: datasets[wildcards.name].get("exclude"),
+        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        dataset = datasets[wildcards.name]
         ancestor_path = data_dir / "ancestors" / f"{wildcards.name}_inferred_ancestors.zarr"
         utils.write_inference_config(
             pathlib.Path(input[0]), ancestor_path, pathlib.Path(output[0]),
-            dataset["ancestral_state"],
+            params.ancestral_state,
             params.hmm,
+            params.include, params.exclude, params.samples,
         )
 
 
@@ -136,15 +178,19 @@ rule write_true_ancestors_config:
         progress_dir / "write_true_ancestors_config" / "{name}_true_write_true_ancestors_config.log",
     params:
         hmm=config["hmm"],
+        ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
+        include=lambda wildcards: datasets[wildcards.name].get("include"),
+        exclude=lambda wildcards: datasets[wildcards.name].get("exclude"),
+        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        dataset = datasets[wildcards.name]
         utils.write_inference_config(
             pathlib.Path(input.samples),
             pathlib.Path(input.ancestors),
             pathlib.Path(output[0]),
-            dataset["ancestral_state"],
+            params.ancestral_state,
             params.hmm,
+            params.include, params.exclude, params.samples,
         )
 
 
@@ -157,10 +203,14 @@ rule match_ancestors:
         data_dir / "ancestors" / "{name}_{kind}_ancestors.trees",
     log:
         progress_dir / "match_ancestors" / "{name}_{kind}_match_ancestors.log",
+    params:
+        cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
     threads: config["matching_threads"]
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        matching.match_ancestors(pathlib.Path(input.config), pathlib.Path(output[0]), threads)
+        matching.match_ancestors(
+            pathlib.Path(input.config), pathlib.Path(output[0]), threads, params.cache_size
+        )
 
 
 rule find_focal_ancestors:
@@ -172,6 +222,8 @@ rule find_focal_ancestors:
         data_dir / "focal_ancestors" / "{name}_{kind}_focal_ancestors.npz",
     log:
         progress_dir / "find_focal_ancestors" / "{name}_{kind}_find_focal_ancestors.log",
+    params:
+        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
     run:
         utils.setup_log(pathlib.Path(log[0]))
         dataframe_path = None
@@ -183,17 +235,21 @@ rule find_focal_ancestors:
             pathlib.Path(output[0]),
             datasets[wildcards.name]["ancestral_state"],
             dataframe_path,
+            params.samples,
         )
 
 
 rule construct_focal_ancestor_chunks:
     input:
+        metadata=metadata_input,
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
         focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
     output:
         data_dir / "dataframes" / "{name}_inferred_focal_ancestor_chunks.csv",
     params:
+        metadata=metadata_params,
+        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
         max_ac_cutoff=max(config["ac_cutoff"]),
         max_mismatches=config["haplotype_compare"]["max_mismatches"],
         ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
@@ -210,9 +266,13 @@ rule construct_focal_ancestor_chunks:
             params.max_ac_cutoff,
             params.max_mismatches,
             threads,
+            params.samples,
         )
         dataframe.insert(0, "panel_kind", "inferred")
         dataframe.insert(0, "dataset", wildcards.name)
+        dataframe = enrich_populations(
+            dataframe, pathlib.Path(input.samples), datasets[wildcards.name]
+        )
         dataframe.to_csv(output[0], index=False)
 
 
@@ -227,6 +287,8 @@ rule match_samples:
         matches=data_dir / "matches" / "{name}_{kind}_samples_matches.jsonl",
     log:
         progress_dir / "match_samples" / "{name}_{kind}_match_samples.log",
+    params:
+        cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
     threads: config["matching_threads"]
     run:
         utils.setup_log(pathlib.Path(log[0]))
@@ -236,11 +298,14 @@ rule match_samples:
             pathlib.Path(output.trees),
             pathlib.Path(output.matches),
             threads,
+            params.cache_size,
         )
 
 
 rule compute_focal_ancestor_stats:
     input:
+        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
+        metadata=metadata_input,
         focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
         reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
         matches=data_dir / "matches" / "{name}_inferred_samples_matches.jsonl",
@@ -248,6 +313,8 @@ rule compute_focal_ancestor_stats:
     output:
         data_dir / "dataframes" / "{name}_inferred_focal_ancestor_stats.csv",
     params:
+        metadata=metadata_params,
+        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
         ac_cutoff=config["ac_cutoff"],
     log:
         progress_dir / "compute_focal_ancestor_stats" / "{name}_inferred_compute_focal_ancestor_stats.log",
@@ -262,4 +329,7 @@ rule compute_focal_ancestor_stats:
         )
         dataframe.insert(0, "panel_kind", "inferred")
         dataframe.insert(0, "dataset", wildcards.name)
+        dataframe = enrich_populations(
+            dataframe, pathlib.Path(input.samples), datasets[wildcards.name]
+        )
         dataframe.to_csv(output[0], index=False)

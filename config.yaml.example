@@ -14,6 +14,23 @@ datasets:
     ancestral_state:
       field: variant_ancestral_state
 
+  - name: tgp_chr20_n100
+    zarr_path: ~/work/dphil-analysis/data/zarr_vcfs/tgp/chr20/data.zarr
+    ts_path: null
+    ancestral_state:
+      field: variant_ancestral_allele
+    # Native include and exclude are alternatives; null omits either key.
+    # samples is a literal ID string, copied from data/tgp_chr20_n100_samples.yaml.
+    include: 'POS >= 1000000 & POS < 11000000'
+    matching_cache_size: 1024
+    samples: NA06989,NA06993,NA06995,NA07019,NA07031,NA07345,NA07347,NA10831,NA10840,NA10843,NA10851,NA10864,NA11917,NA11995,NA12005,NA12006,NA12045,NA12056,NA12274,NA12282,NA12286,NA12336,NA12400,NA12546,NA12716,NA12740,NA12750,NA12752,NA12753,NA12761,NA12877,NA12889,NA12890,NA18489,NA18497,NA18504,NA18507,NA18516,NA18518,NA18519,NA18528,NA18532,NA18533,NA18536,NA18538,NA18552,NA18557,NA18565,NA18566,NA18571,NA18574,NA18579,NA18582,NA18591,NA18593,NA18606,NA18609,NA18611,NA18617,NA18618,NA18619,NA18623,NA18625,NA18630,NA18637,NA18640,NA18641,NA18642,NA18644,NA18648,NA18745,NA18747,NA18748,NA18853,NA18858,NA18865,NA18869,NA18877,NA18881,NA18906,NA18909,NA18923,NA18924,NA18930,NA19092,NA19097,NA19102,NA19109,NA19128,NA19129,NA19141,NA19142,NA19149,NA19150,NA19189,NA19203,NA19207,NA19210,NA19211,NA19223
+    # Omit metadata_source to disable enrichment; ts uses the original ts_path.
+    metadata_source: csv
+    csv_path: ~/work/dphil-analysis/data/misc/tgp_3202_pedigree.csv
+    zarr_id_field: sample_id
+    csv_id_field: sample_id
+    pop_field: superpopulation
+
 ancestor_chunk_size: 5000
 inference_threads: 1
 matching_threads: 1
