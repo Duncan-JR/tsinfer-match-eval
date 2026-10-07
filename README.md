@@ -3,7 +3,7 @@
 A small Snakemake pipeline that builds inferred ancestor panels, matches
 ancestors and samples separately, records focal candidates per sample haplotype,
 evaluates copying from allele-count eligible focal ancestors, and constructs
-direct focal haplotype chunks without matching. It reads
+direct focal-ancestor intervals without matching. It reads
 simulations from `../tsinfer-anc-eval` and uses an editable `../tsinfer`
 checkout. The workflow calls functions in `lib` directly. True-panel rules
 remain available through explicit output targets, but the default workflow is
@@ -29,9 +29,10 @@ Library files are intentionally not Snakemake inputs. After changing evaluation
 code, force `compute_focal_ancestor_stats`. After changing focal lookup, force
 `find_focal_ancestors` and the statistics rule. Rebuild configurations,
 ancestor/reference TSs, raw sample TSs, match files, and statistics together
-after changing HMM settings. A cutoff-only configuration change reruns only the
-statistics rule. To refresh the optional true CSV schema, explicitly target its
-output and force `extract_true_ancestors`.
+after changing HMM settings. Changing smaller cutoffs reruns only the statistics
+rule; changing the maximum also regenerates direct intervals. To refresh the
+optional true CSV schema, explicitly target its output and force
+`extract_true_ancestors`.
 
 Edit `config.yaml` to choose datasets and output folders. Paths in the YAML are
 relative to this working directory; `~` is expanded for input paths. Each
@@ -60,7 +61,7 @@ The `data_dir` setting contains category folders. For dataset `{name}`:
 {data_dir}/matches/{name}_{kind}_samples_raw.trees
 {data_dir}/matches/{name}_{kind}_samples_matches.jsonl
 {data_dir}/dataframes/{name}_inferred_focal_ancestor_stats.csv
-{data_dir}/dataframes/{name}_inferred_focal_ancestor_chunks.csv
+{data_dir}/haplotype_intervals/{name}_inferred_focal_ancestor_intervals.npz
 ```
 
 The default targets use `{kind}=inferred` for every dataset. Explicit true
@@ -90,17 +91,18 @@ to both matching stages; omitted or null uses the native default. The 10 Mbp
 real-data example uses 1024 MiB because its native source chunk needs 501.2 MiB.
 
 Changing site filters rebuilds native configurations and downstream products;
-changing samples also refreshes counts, focal rows, and chunks.
+changing samples also refreshes counts, focal candidates, and intervals.
 
 Population enrichment is disabled when `metadata_source` is omitted or null.
 `metadata_source: ts` requires the original `ts_path` and joins selected IDs to
 `map_to_vcf_model()` names and haploid nodes. It adds `truth_node_id`,
-`truth_individual_id`, `population_id`, and `population` to both inferred CSVs.
+`truth_individual_id`, `population_id`, and `population` to the inferred
+statistics CSV.
 `metadata_source: csv` requires `csv_path`, `zarr_id_field`, `csv_id_field`, and
 `pop_field`, and adds only `population`. CSV identifiers are strings and unique;
 selected IDs and labels must exist. Canonical output sample IDs always come from
 Zarr `sample_id`. The example uses the pedigree's `superpopulation` labels:
-66 EUR, 66 EAS, and 68 AFR genomes. Metadata-only edits rebuild the two CSVs
+66 EUR, 66 EAS, and 68 AFR genomes. Metadata-only edits rebuild the statistics CSV
 without inference or matching; row keys, order, and numerical values are retained.
 
 The real chr20 input retains a multi-contig header. The corrected native tsinfer
@@ -295,100 +297,108 @@ See [plans/initial_mvp.md](plans/initial_mvp.md) for extraction and ID contracts
 and [plans/matching_setup.md](plans/matching_setup.md) for matching contracts.
 The source VCZs and truth TS are read without modification.
 
-## Direct focal haplotype chunks
+## Direct focal-ancestor intervals
 
-`construct_focal_ancestor_chunks` compares sample haplotypes directly with
-eligible inferred ancestors, independently of matching or truth. It is included
-in the default targets. To generate only this analysis, run:
+`construct_focal_ancestor_intervals` compares sample haplotypes directly with
+eligible inferred ancestors and writes one compressed numeric archive per
+dataset. It is included in the default targets. To generate only this product,
+select the dataset in your manifest and run:
 
 ```sh
-uv run snakemake --cores all data/match_eval/dataframes/out_of_africa_n300_1mbp_inferred_focal_ancestor_chunks.csv
+uv run snakemake --cores all data/match_eval/haplotype_intervals/out_of_africa_n300_1mbp_inferred_focal_ancestor_intervals.npz
 ```
 
-Select the dataset in your manifest first. Set `haplotype_compare.max_mismatches`
-to a nonnegative integer (initially 2). The maximum of `ac_cutoff` selects eligible
-ancestors inclusively; smaller cutoffs are filters on the resulting `focal_ac`
-column and do not require further comparisons. Changing that maximum or the
-mismatch maximum reruns the chunk rule. After editing `lib/haplotypes.py`, force
-`construct_focal_ancestor_chunks`.
+Each ancestor uses its leftmost non-padding focal position, chosen before
+expanding sample associations or sweeping. Identical carrier patterns at
+multiple focal sites do not imply identical intervals. Both sample and ancestor
+must have matching derived calls at that anchor; inconsistent inputs fail.
 
-The CSV columns, in order, are:
+Generation uses the inclusive maximum of `ac_cutoff`, retaining exact AC for
+each association. Lower cutoffs select `focal_ac <= cutoff` without repeating
+comparisons. Changing smaller configured cutoffs leaves the archive current
+when the maximum stays fixed. Changing the maximum AC or
+`haplotype_compare.max_mismatches` regenerates intervals. After editing
+`lib/haplotypes.py`, force `construct_focal_ancestor_intervals`.
 
-```text
-dataset, panel_kind, source, sample_id, ploidy_index, ancestor_id,
-ancestor_index, focal_site_index, focal_position, focal_ac, focal_af,
-max_mismatches, left_site_index, right_site_index, left_position, right_position
-```
+Load with `numpy.load(path, allow_pickle=False)`. For H haplotypes, P eligible
+associations, and B = max_mismatches + 1, the archive contains:
 
-Each row identifies one carried focal site for a sample haplotype and ancestor,
-then one budget from zero through the configured maximum. Multi-focal ancestors
-retain every carried focal association. Rows follow NPZ haplotype order, ancestor
-column, focal index, and budget. Haplotypes without seeds contribute no rows;
-coverage denominators must therefore come from the sample/NPZ identities.
-`ancestor_index` is a panel column, and `ancestor_id` is the panel's string ID.
-`focal_ac` and `focal_af` are observed sample annotations, with AF calculated
-among called haplotypes.
+| Array | Shape | Meaning |
+| --- | --- | --- |
+| `sample_id` | `(H,)` | Unicode IDs in focal-NPZ haplotype order |
+| `ploidy_index` | `(H,)` | Haplotype index within each sample |
+| `offsets` | `(H + 1,)` | Ragged association slices per haplotype |
+| `focal_ac` | `(P,)` | Exact focal allele count per association |
+| `left_site_index` | `(P, B)` | Inclusive left bounds, column k for budget k |
+| `right_site_index` | `(P, B)` | Exclusive right bounds, column k for budget k |
+| `num_sites` | scalar | Length of the inferred-panel site axis |
+| `max_ac_cutoff` | scalar | Inclusive generation maximum AC |
+| `max_mismatches` | scalar | Largest generated directional budget |
 
-`max_mismatches = k` allows **k mismatches per side**, so the combined interval
-can contain up to 2k. The focal call must match and consumes neither budget.
-The next mismatch is excluded. Missing sample or ancestor calls terminate the
-chunk, as do ancestor support and inference-interval boundaries. Site indices
-are zero-based on the inferred panel axis with half-open bounds. For support
-[0, 10), focal 4, left mismatches 3 and 1, and right mismatches 6 and 8, budgets
-0, 1, 2 give [4, 6), [2, 8), [0, 10).
+All numeric arrays and scalars are int64. Associations follow haplotype order,
+then increasing ancestor column. Distinct ancestors with identical bounds
+remain separate associations. The roster includes haplotypes with empty slices;
+`offsets[0] == 0`, `offsets[-1] == P`, and offsets never decrease. An entirely
+empty selection has bounds of shape `(0, B)`. Ancestor IDs, focal indices, BP
+bounds, frequencies, and population labels are not repeated in the archive.
 
-BP bounds use absolute site positions: the retained left site's position and
-exclusive right site's position, clipped to ancestor support and the containing
-inference interval. At an interval's end, its BP endpoint supplies the right
-bound. No chunk bridges an inference gap or extends to the full contig length.
-Filter a table with `chunks.loc[chunks.focal_ac <= cutoff]`; there is no cutoff
-column or repeated computation per cutoff.
+Budget k allows **k mismatches per side**, potentially 2k overall. The focal
+call matches and consumes neither budget; the next mismatch is excluded.
+Missing sample or ancestor calls terminate extension. Bounds are half-open on
+the inferred-panel site axis, confined to ancestor support intersected with
+the inference interval containing the anchor. For support [0, 10), focal 4,
+left mismatches 3 and 1, and right mismatches 6 and 8, budgets 0, 1, 2 retain
+[4, 6), [2, 8), [0, 10). Increasing budgets produces nested intervals.
 
-The reader reuses each physical ancestor-column block across sample haplotypes
-and both sweeps. Larger site axes stream physical site blocks while preserving
-active state. Spawned processes use the allocated workflow cores, with bounded
-submissions and deterministic result assembly. The small aligned sample-call
-matrix stays resident in each worker. Output memory scales with the number of
-focal seeds times the number of budgets.
+Each physical ancestor-column block is reused across sample associations. A
+full-height block serves both directions; multiple physical site blocks retain
+numeric sweep state. A spawned multiprocessing Pool uses allocated cores,
+capped by physical column blocks, and assembles results in canonical order.
+Failures propagate before the archive is written. Completion logs record
+association counts and allocated workers.
 
-For fixed upstream stores the chunk values are independent of HMM settings and
-match files. The existing inference TOML tracks both inference and HMM settings,
-so an HMM edit can still invalidate that TOML and regenerate upstream ancestors.
-The chunk rule itself reads no HMM or tree-sequence products.
+The interval rule reads only annotated samples, the inferred ancestor store,
+and focal candidates. It has no matching, truth, HMM, or tree-sequence inputs.
+The existing inference TOML tracks inference and HMM settings, so an HMM edit
+can still invalidate that TOML and regenerate upstream ancestors.
 
-The initial K=2 implementation runs used the existing zero-error products with
-maximum AC 600 for n300 and 200 for n100. Both actual CSVs were reread and checked
-against an independent oracle that finds all called mismatch positions and
-selects bounds by mismatch rank. Every seed and budget agreed with that oracle;
-the CSVs also matched the one-worker production results in canonical order.
+`dphil-analysis/src/ch5_analysis.py` reads the archive, checks its roster and
+site count, selects requested budget columns, and computes coverage with its
+numeric endpoint sweep. Requested AC limits or budgets cannot exceed those
+generated. Population metadata continues to come from statistics or the original
+truth TS. Coverage summaries and plots remain analysis responsibilities.
+Chapter 5 preserves its existing AC >= 2 eligibility: AC=1 associations stay
+in the archive and loaded arrays but do not enter its coverage tasks. The
+existing 1 Mb simulation and 1KGP stores contain 199 and 180 such associations,
+respectively; including them would change the previous coverage summaries.
 
-| Dataset | Focal seeds | CSV rows | CSV bytes | Workflow wall time | Maximum child RSS |
+Measured K=2 archive generation on the existing stores (2026-10-07):
+
+| Dataset | Maximum AC | Associations | NPZ bytes | Generation seconds | Workers |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| n300, 1 Mb | 393,585 | 1,180,755 | 136,513,772 | 7.05 s | 680,050,688 bytes |
-| n100, 10 Mb | 1,404,159 | 4,212,477 | 478,019,729 | 16.59 s | 1,877,557,248 bytes |
+| out_of_africa_n100_10mbp | 200 | 925,918 | 10,246,398 | 3.90 | 18 |
+| out_of_africa_n100_1mbp | 200 | 114,035 | 945,806 | 1.23 | 18 |
+| out_of_africa_n300_1mbp | 600 | 325,711 | 2,775,343 | 1.63 | 18 |
+| tgp_chr20_n100_1mbp | 200 | 205,293 | 1,605,287 | 1.80 | 18 |
+| tgp_chr20_n100 | 200 | 2,110,059 | 23,873,256 | 12.95 | 18 |
 
-Both workflows used 18 allocated workers. The wall times include process
-startup, compilation, assembly, and CSV writing. Maximum child RSS was measured
-with `resource.getrusage(RUSAGE_CHILDREN)` on macOS; it is a process peak rather
-than the aggregate memory of simultaneously running workers. Rule logs record
-worker metadata/JIT durations and first-result elapsed times. Worker JIT took
-approximately 0.26–0.39 s in these runs; first results arrived at approximately
-2.34 s for n300 and 5.72 s for n100, including startup, setup, and the first task.
-These measurements are not multiprocessing speedup claims.
-
-Manual probes checked the worked mismatch example, zero budgets, exhausted and
-unexhausted budgets, no mismatches, sample/ancestor missing barriers, multi-focal
-ancestors, simultaneous seeds, first/last focal sites, a partial column block,
-inference gaps, seven site-block layouts, both ancestral-state modes, reversed
-allele polarity, and empty selections. Spawned worker failures propagated before
-output writing. The n300 one/three-worker frames matched exactly, smaller-AC
-results equalled filtered full results, and increasing K preserved shared rows.
-Dry-runs confirmed the explicit target's dependency chain contains only sample
-annotation, inference configuration, ancestor inference, focal lookup, and this
-analysis. Smaller cutoff changes left the existing output current, while maximum
-AC or K changes selected only the chunk rule. HMM changes showed the documented
-upstream TOML invalidation. No formal test suite was added.
-
+These are library-call wall times including preparation, spawning, comparison,
+and compressed writing, measured once without a benchmarking subsystem. They
+are NPZ measurements, not workflow timings or multiprocessing speedup claims.
+Every generated association and budget was checked against independent direct
+mismatch ranks at the leftmost focal. One-worker and multiple-worker n300 arrays
+matched exactly; smaller maximum AC selected the same associations and bounds,
+and increasing K preserved existing columns. Manual probes checked empty
+selections, repeated bounds from distinct ancestors, missing-call barriers,
+support ends, zero budgets, and eight physical site-block layouts. All captured
+chapter 5 summaries agree exactly at budgets 0 and 1 and the notebook cutoffs
+for all five datasets, with chapter 5's existing AC >= 2 eligibility retained.
+The existing chapter 5 tests and lint/format checks pass. Explicit and default
+workflow dry-runs target NPZ intervals; the explicit branch requires no matching.
+A workflow execution succeeded. Smaller cutoff changes left intervals current;
+maximum-AC or maximum-budget changes selected only the interval rule.
+The coverage notebook produces all five existing plots for both the 1 Mb and
+10 Mb simulation/1KGP pairs.
 
 ## Checked real-data runs
 
@@ -403,7 +413,6 @@ CSV superpopulation enrichment.
 | Ancestors | 3,618 | 35,829 |
 | Sample haplotypes / match records | 200 / 200 | 200 / 200 |
 | Statistics rows | 1,000 | 1,000 |
-| Chunk rows | 885,171 | 9,763,548 |
 | Mean bp coverage at AC ≤ 200 | 99.495367% | 99.953116% |
 | Total sample switches | 53 | 179 |
 | Total sample mismatches | 0 | 0 |
@@ -413,7 +422,7 @@ raw tree sequences retain chr20's full sequence length. All selected decoded
 calls agree with source genotypes. Population labels are complete: 66 EUR,
 66 EAS, and 68 AFR genomes, giving 330 EUR, 330 EAS, and 340 AFR statistics rows
 at five cutoffs. Independent checks confirm copying coverage, scores, raw
-edges/JSONL joins, and sampled chunk boundaries. Final lint/format checks pass
+edges/JSONL joins, and direct interval bounds. Final lint/format checks pass
 and the full workflow's second dry run has no pending work.
 
 See [the completed plan](plans/real_data.md#completed-real-data-evaluation-2026-10-01)

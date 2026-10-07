@@ -1,15 +1,12 @@
 """Direct inferred focal-ancestor comparisons, independent of HMM matching."""
 
-import concurrent.futures as cf
 import dataclasses
 import logging
 import multiprocessing
 import pathlib
-import time
 
 import numba
 import numpy as np
-import pandas as pd
 import tsinfer
 
 logger = logging.getLogger(__name__)
@@ -17,26 +14,32 @@ logger = logging.getLogger(__name__)
 
 @dataclasses.dataclass
 class ComparisonData:
-    """Validated site axis, resident sample calls, and canonical seed order."""
+    """Validated site axis, resident sample calls, and canonical association order."""
 
     panel: object
-    positions: np.ndarray
+    num_sites: int
+    num_ancestors: int
     calls: np.ndarray
     sample_ids: np.ndarray
     ploidy_indices: np.ndarray
-    ancestor_ids: np.ndarray
-    counts: np.ndarray
-    frequencies: np.ndarray
+    offsets: np.ndarray
+    focal_ac: np.ndarray
     haplotypes: np.ndarray
     ancestors: np.ndarray
     focals: np.ndarray
     left: np.ndarray
     right: np.ndarray
-    bp_left: np.ndarray
-    bp_right: np.ndarray
     column_width: int
     site_height: int
     block_seeds: dict
+
+
+@dataclasses.dataclass
+class IntervalBounds:
+    """Canonical bounds for every association and generated budget."""
+
+    left: np.ndarray
+    right: np.ndarray
 
 
 @dataclasses.dataclass
@@ -46,8 +49,6 @@ class BlockBounds:
     seeds: np.ndarray
     left: np.ndarray
     right: np.ndarray
-    setup_seconds: float | None = None
-    jit_seconds: float | None = None
 
 
 def _prepare(
@@ -58,7 +59,7 @@ def _prepare(
     max_ac_cutoff,
     sample_selection,
 ):
-    """Align and polarise calls and expand seeds for construct_focal_ancestor_chunks."""
+    """Prepare leftmost associations for :func:`construct_focal_ancestor_intervals`."""
     samples = tsinfer.vcz.open_store(samples_path)
     panel = tsinfer.vcz.open_store(ancestors_path)
     positions = panel["variant_position"][:]
@@ -94,7 +95,6 @@ def _prepare(
     ploidy_indices = np.tile(np.arange(ploidy), len(ids))
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
     counts = samples["variant_match_eval_derived_ac"].oindex[rows]
-    frequencies = samples["variant_match_eval_derived_af"].oindex[rows]
     starts = panel["sample_start_position"][:]
     ends = panel["sample_end_position"][:]
     intervals = panel["sequence_intervals"][:]
@@ -120,34 +120,40 @@ def _prepare(
             or np.any((columns < 0) | (columns >= len(ancestor_ids)))
         ):
             raise ValueError("Invalid focal NPZ ragged candidate indices")
-        ancestor_focals = []
+        ancestor_focals = np.full(len(ancestor_ids), -1, dtype=np.int64)
         for ancestor, values in enumerate(focal_positions):
             values = values[values >= 0]
-            indices = np.searchsorted(positions, values)
-            if np.any(indices >= len(positions)):
+            if len(values) == 0:
+                continue
+            position = np.min(values)
+            index = np.searchsorted(positions, position)
+            if index >= len(positions) or positions[index] != position:
                 raise ValueError("Ancestor focal position is absent from panel")
-            if not np.array_equal(positions[indices], values):
-                raise ValueError("Ancestor focal position is absent from panel")
-            if np.any(counts[indices] != derived_ac[ancestor]):
-                raise ValueError("Focal NPZ counts disagree with sample annotations")
-            ancestor_focals.append(np.sort(indices))
+            ancestor_focals[ancestor] = index
         haplotypes = []
         ancestors = []
         focals = []
+        output_offsets = [0]
         for haplotype in range(len(sample_ids)):
             selected = columns[offsets[haplotype] : offsets[haplotype + 1]]
             if np.any(np.diff(selected) <= 0):
                 raise ValueError("Candidate columns must be sorted and distinct")
             selected = selected[derived_ac[selected] <= max_ac_cutoff]
             for ancestor in selected:
-                indices = ancestor_focals[ancestor]
-                carried = calls[indices, haplotype] >= 0
-                indices = indices[carried]
-                if np.any(calls[indices, haplotype] != 1):
-                    raise ValueError("Selected focal sample call is not derived")
-                haplotypes.extend([haplotype] * len(indices))
-                ancestors.extend([ancestor] * len(indices))
-                focals.extend(indices)
+                index = ancestor_focals[ancestor]
+                if index == -1:
+                    continue
+                if counts[index] != derived_ac[ancestor]:
+                    raise ValueError("Focal NPZ counts disagree with sample annotations")
+                if calls[index, haplotype] != 1:
+                    raise ValueError(
+                        "Selected leftmost focal sample call is not derived"
+                    )
+                haplotypes.append(haplotype)
+                ancestors.append(ancestor)
+                focals.append(index)
+            output_offsets.append(len(focals))
+        focal_ac = derived_ac[ancestors].astype(np.int64)
     haplotypes = np.asarray(haplotypes, dtype=np.int64)
     ancestors = np.asarray(ancestors, dtype=np.int64)
     focals = np.asarray(focals, dtype=np.int64)
@@ -176,24 +182,22 @@ def _prepare(
         groups = np.split(order, first[1:])
         block_seeds = dict(zip(unique_blocks.tolist(), groups, strict=True))
     return ComparisonData(
-        panel,
-        positions,
-        calls,
-        sample_ids,
-        ploidy_indices,
-        ancestor_ids,
-        counts,
-        frequencies,
-        haplotypes,
-        ancestors,
-        focals,
-        left,
-        right,
-        bp_left,
-        bp_right,
-        column_width,
-        site_height,
-        block_seeds,
+        panel=panel,
+        num_sites=len(positions),
+        num_ancestors=len(ancestor_ids),
+        calls=calls,
+        sample_ids=sample_ids,
+        ploidy_indices=ploidy_indices.astype(np.int64),
+        offsets=np.asarray(output_offsets, dtype=np.int64),
+        focal_ac=focal_ac,
+        haplotypes=haplotypes,
+        ancestors=ancestors,
+        focals=focals,
+        left=left.astype(np.int64),
+        right=right.astype(np.int64),
+        column_width=column_width,
+        site_height=site_height,
+        block_seeds=block_seeds,
     )
 
 
@@ -215,7 +219,7 @@ def _sweep_block(
 ):
     """Advance a directional event sweep through one physical site block.
 
-    Used by :func:`construct_focal_ancestor_chunks`. Bounds are half-open;
+    Used by :func:`construct_focal_ancestor_intervals`. Bounds are half-open;
     budgets apply independently to each side. With support [0, 10), focal 4,
     left mismatches 3, 1 and right mismatches 6, 8, budgets 0, 1, 2 retain
     [4, 6), [2, 8), [0, 10). The (k + 1)th mismatch is excluded.
@@ -279,7 +283,7 @@ def _block_bounds(data, block, max_mismatches):
     """
     seeds = data.block_seeds[block]
     column_start = block * data.column_width
-    column_end = min(column_start + data.column_width, len(data.ancestor_ids))
+    column_end = min(column_start + data.column_width, data.num_ancestors)
     columns = data.ancestors[seeds] - column_start
     haplotypes = data.haplotypes[seeds]
     focals = data.focals[seeds]
@@ -287,7 +291,7 @@ def _block_bounds(data, block, max_mismatches):
     left = np.repeat(data.left[seeds, None], max_mismatches + 1, axis=1)
     right = np.repeat(data.right[seeds, None], max_mismatches + 1, axis=1)
     genotypes = data.panel["call_genotype"]
-    num_sites = len(data.positions)
+    num_sites = data.num_sites
     resident = None
     if data.site_height >= num_sites:
         resident = genotypes[:, column_start:column_end, 0]
@@ -332,155 +336,61 @@ def _block_bounds(data, block, max_mismatches):
 
 
 def _initialise_worker(arguments, max_mismatches):
-    """Give each spawned process its own read-only stores and numeric kernel."""
-    global _worker_data, _worker_max_mismatches, _worker_timings
-    started = time.perf_counter()
+    """Give each spawned process its own read-only stores and numeric inputs."""
+    global _worker_data, _worker_max_mismatches
     _worker_data = _prepare(*arguments)
     _worker_max_mismatches = max_mismatches
-    prepared = time.perf_counter()
-    # Compile once without reading any ancestor calls or caching on disk.
-    _sweep_block(
-        np.empty((0, 0), dtype=np.int8),
-        0,
-        _worker_data.calls,
-        np.empty(0, dtype=np.int64),
-        np.empty(0, dtype=np.int64),
-        np.empty(0, dtype=np.int64),
-        np.empty(0, dtype=np.int64),
-        np.empty(0, dtype=np.int64),
-        np.empty(0, dtype=np.int64),
-        np.empty(0, dtype=np.int64),
-        np.zeros(2, dtype=np.int64),
-        np.empty((0, max_mismatches + 1), dtype=np.int64),
-        1,
-    )
-    _worker_timings = (prepared - started, time.perf_counter() - prepared)
 
 
 def _worker_block(block):
-    global _worker_timings
-    result = _block_bounds(_worker_data, block, _worker_max_mismatches)
-    if _worker_timings is not None:
-        result.setup_seconds, result.jit_seconds = _worker_timings
-        _worker_timings = None
-    return result
+    return _block_bounds(_worker_data, block, _worker_max_mismatches)
 
 
 def _collect_bounds(data, arguments, max_mismatches, threads):
-    """Bound process submissions/results by allocation; propagate worker errors."""
+    """Assemble block results in canonical association order; propagate failures."""
     shape = (len(data.focals), max_mismatches + 1)
     left = np.empty(shape, dtype=np.int64)
     right = np.empty(shape, dtype=np.int64)
-    blocks = iter(data.block_seeds)
     workers = min(threads, len(data.block_seeds))
     if workers <= 1:
-        for block in blocks:
+        for block in data.block_seeds:
             result = _block_bounds(data, block, max_mismatches)
             left[result.seeds] = result.left
             right[result.seeds] = result.right
     else:
         context = multiprocessing.get_context("spawn")
-        started = time.perf_counter()
-        with cf.ProcessPoolExecutor(
-            max_workers=workers,
-            mp_context=context,
+        with context.Pool(
+            workers,
             initializer=_initialise_worker,
             initargs=(arguments, max_mismatches),
-        ) as executor:
-            pending = {
-                executor.submit(_worker_block, next(blocks)) for _ in range(workers)
-            }
-            while len(pending) > 0:
-                completed, pending = cf.wait(pending, return_when=cf.FIRST_COMPLETED)
-                for future in completed:
-                    result = future.result()
-                    if result.setup_seconds is not None:
-                        logger.info(
-                            "First worker result at %.3fs: metadata setup %.3fs, "
-                            "JIT %.3fs (elapsed includes process startup and task)",
-                            time.perf_counter() - started,
-                            result.setup_seconds,
-                            result.jit_seconds,
-                        )
-                    left[result.seeds] = result.left
-                    right[result.seeds] = result.right
-                    block = next(blocks, None)
-                    if block is not None:
-                        pending.add(executor.submit(_worker_block, block))
-    return BlockBounds(np.arange(len(data.focals)), left, right)
+        ) as pool:
+            results = pool.imap_unordered(_worker_block, data.block_seeds, chunksize=1)
+            for result in results:
+                left[result.seeds] = result.left
+                right[result.seeds] = result.right
+    return IntervalBounds(left, right)
 
 
-def _positions(data, bounds):
-    """Convert half-open site cells to BP, clipped to support/inference intervals.
-
-    See :func:`construct_focal_ancestor_chunks`. At an internal inference-interval
-    end the next site's position is clipped to the containing interval's BP end.
-    """
-    left = data.positions[bounds.left]
-    left = np.maximum(left, data.bp_left[:, None])
-    # A terminal right index can equal num_sites; replace it before site lookup.
-    lookup = np.minimum(bounds.right, len(data.positions) - 1)
-    right = data.positions[lookup].copy()
-    terminal = bounds.right == len(data.positions)
-    endpoints = np.broadcast_to(data.bp_right[:, None], right.shape)
-    right[terminal] = endpoints[terminal]
-    right = np.minimum(right, endpoints)
-    return BlockBounds(bounds.seeds, left, right)
-
-
-def _dataframe(data, bounds, max_mismatches):
-    """Assemble numeric columns and categorical identifiers without row dictionaries."""
-    bp = _positions(data, bounds)
-    budgets = max_mismatches + 1
-    haplotypes = np.repeat(data.haplotypes, budgets)
-    ancestors = np.repeat(data.ancestors, budgets)
-    focals = np.repeat(data.focals, budgets)
-    num_rows = len(focals)
-    return pd.DataFrame(
-        {
-            "source": pd.Categorical.from_codes(
-                np.zeros(num_rows, dtype=np.int8), ["samples"]
-            ),
-            "sample_id": pd.Categorical(
-                data.sample_ids[haplotypes], categories=np.unique(data.sample_ids)
-            ),
-            "ploidy_index": data.ploidy_indices[haplotypes],
-            "ancestor_id": pd.Categorical.from_codes(ancestors, data.ancestor_ids),
-            "ancestor_index": ancestors,
-            "focal_site_index": focals,
-            "focal_position": data.positions[focals],
-            "focal_ac": data.counts[focals].astype(np.int64),
-            "focal_af": data.frequencies[focals].astype(np.float64),
-            "max_mismatches": np.tile(
-                np.arange(budgets, dtype=np.int64), len(data.focals)
-            ),
-            "left_site_index": bounds.left.ravel(),
-            "right_site_index": bounds.right.ravel(),
-            "left_position": bp.left.ravel(),
-            "right_position": bp.right.ravel(),
-        }
-    )
-
-
-def construct_focal_ancestor_chunks(
+def construct_focal_ancestor_intervals(
     samples_path: pathlib.Path,
     ancestors_path: pathlib.Path,
     focal_ancestors_path: pathlib.Path,
+    output_path: pathlib.Path,
     ancestral_state: dict,
     max_ac_cutoff: int,
     max_mismatches: int,
     threads: int,
     sample_selection: str | None = None,
-) -> pd.DataFrame:
-    """Compare each carried focal site with its inferred ancestor haplotype.
+) -> None:
+    """Write compressed raw intervals anchored at each ancestor's leftmost focal.
 
-    Return one row per NPZ haplotype, eligible ancestor, carried focal site, and
-    budget 0..max_mismatches, in that order. Counts use an inclusive maximum AC.
-    Each direction tolerates k called mismatches; the anchored half-open interval
-    can contain up to 2k in total. Missing calls terminate extension. Comparisons
-    use the panel site axis and canonical ancestral/derived codes, never an HMM.
-    See :func:`_sweep_block` for a worked example and :func:`_positions` for BP
-    conversion. Dataset and panel identity are prepended by the workflow rule.
+    One association per eligible ancestor is retained in focal-NPZ haplotype
+    order, then increasing ancestor column. Exact AC uses an inclusive maximum.
+    Budget column k tolerates k called mismatches on each side; the matching
+    derived focal consumes neither budget. Missing calls terminate extension.
+    Bounds are half-open on the inferred panel axis and confined to ancestor
+    support and the containing inference interval. See :func:`_sweep_block` for
+    a worked example. No HMM or coverage statistics enter this comparison.
     """
     for name, value, minimum in (
         ("max_ac_cutoff", max_ac_cutoff, 1),
@@ -489,7 +399,6 @@ def construct_focal_ancestor_chunks(
     ):
         if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
             raise ValueError(f"{name} must be an integer >= {minimum}")
-    started = time.perf_counter()
     arguments = (
         samples_path,
         ancestors_path,
@@ -499,19 +408,29 @@ def construct_focal_ancestor_chunks(
         sample_selection,
     )
     data = _prepare(*arguments)
-    prepared = time.perf_counter()
+    workers = min(threads, len(data.block_seeds))
+    logger.info("Comparing %d associations with %d workers", len(data.focals), workers)
     bounds = _collect_bounds(data, arguments, max_mismatches, threads)
-    compared = time.perf_counter()
-    dataframe = _dataframe(data, bounds, max_mismatches)
-    logger.info(
-        "Constructed %d rows from %d seeds: setup %.3fs, sweeps %.3fs, "
-        "assembly %.3fs, total %.3fs, workers %d",
-        len(dataframe),
-        len(data.focals),
-        prepared - started,
-        compared - prepared,
-        time.perf_counter() - compared,
-        time.perf_counter() - started,
-        min(threads, len(data.block_seeds)),
+    if np.any(
+        (bounds.left < 0)
+        | (bounds.left > data.focals[:, None])
+        | (bounds.right <= data.focals[:, None])
+        | (bounds.right > data.num_sites)
+    ):
+        raise ValueError(
+            "Interval bounds must contain the chosen focal on the panel axis"
+        )
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        sample_id=data.sample_ids,
+        ploidy_index=data.ploidy_indices,
+        offsets=data.offsets,
+        focal_ac=data.focal_ac,
+        left_site_index=bounds.left,
+        right_site_index=bounds.right,
+        num_sites=np.int64(data.num_sites),
+        max_ac_cutoff=np.int64(max_ac_cutoff),
+        max_mismatches=np.int64(max_mismatches),
     )
-    return dataframe
+    logger.info("Wrote %d associations to %s", len(data.focals), output_path)

@@ -86,7 +86,7 @@ rule all:
             name=names,
         ),
         expand(
-            data_dir / "dataframes" / "{name}_inferred_focal_ancestor_chunks.csv",
+            data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
             name=names,
         ),
 
@@ -239,42 +239,34 @@ rule find_focal_ancestors:
         )
 
 
-rule construct_focal_ancestor_chunks:
+rule construct_focal_ancestor_intervals:
     input:
-        metadata=metadata_input,
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
         focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
     output:
-        data_dir / "dataframes" / "{name}_inferred_focal_ancestor_chunks.csv",
+        data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
     params:
-        metadata=metadata_params,
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
         max_ac_cutoff=max(config["ac_cutoff"]),
         max_mismatches=config["haplotype_compare"]["max_mismatches"],
         ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
     threads: workflow.cores
     log:
-        progress_dir / "construct_focal_ancestor_chunks" / "{name}_inferred_construct_focal_ancestor_chunks.log",
+        progress_dir / "construct_focal_ancestor_intervals" / "{name}_inferred_construct_focal_ancestor_intervals.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        dataframe = haplotypes.construct_focal_ancestor_chunks(
+        haplotypes.construct_focal_ancestor_intervals(
             pathlib.Path(input.samples),
             pathlib.Path(input.ancestors),
             pathlib.Path(input.focal),
+            pathlib.Path(output[0]),
             params.ancestral_state,
             params.max_ac_cutoff,
             params.max_mismatches,
             threads,
             params.samples,
         )
-        dataframe.insert(0, "panel_kind", "inferred")
-        dataframe.insert(0, "dataset", wildcards.name)
-        dataframe = enrich_populations(
-            dataframe, pathlib.Path(input.samples), datasets[wildcards.name]
-        )
-        dataframe.to_csv(output[0], index=False)
-
 
 rule match_samples:
     input:
