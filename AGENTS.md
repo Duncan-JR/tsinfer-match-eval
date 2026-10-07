@@ -2,7 +2,12 @@
 
 ## Overview
 
-This is a pipeline to evaluate tsinfer's matching engine under various constraints.
+This is a pipeline to evaluate tsinfer's matching engine under various
+constraints. The code here is focused on data generation, not exploratory
+analysis. As such, the user will often request analysis to be done in
+~/work/dphil-analysis/notebooks/, which you should always assume to be a
+jupytext-synced notebook where you edit the py. Otherwise, code lives in lib for
+the use of the pipeline.
 
 ## Code Style
 
