@@ -1,3 +1,4 @@
+import csv
 import pathlib
 
 from lib import ancestors, evaluation, haplotypes, matching, utils
@@ -8,6 +9,13 @@ configfile: "config.yaml"
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
 datasets = {dataset["name"]: dataset for dataset in config["datasets"]}
+for dataset in datasets.values():
+    dataset["samples"] = None
+    sample_list = dataset.get("sample_list")
+    if sample_list is not None:
+        with pathlib.Path(sample_list).expanduser().open(newline="") as sample_file:
+            sample_ids = [sample_id for row in csv.reader(sample_file) for sample_id in row]
+        dataset["samples"] = ",".join(sample_ids)
 names = list(datasets)
 panels = [{"name": name, "kind": "inferred"} for name in names]
 

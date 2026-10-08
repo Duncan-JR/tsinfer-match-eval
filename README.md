@@ -77,14 +77,15 @@ from the selected cohort in genotype chunks. Missing calls enter neither the
 derived count nor its called-genome denominator. There is no singleton mask;
 tsinfer determines ancestral eligibility, duplicate handling, and inference sites.
 
-Optional dataset `include`, `exclude`, and `samples` strings pass unchanged into
-native TOML. Omitted or null values are omitted. Native validation treats include
+Optional dataset `include` and `exclude` strings pass unchanged into native TOML.
+Omitted or null values are omitted. Native validation treats include
 and exclude as alternatives. For example, `include: 'POS >= 1000000 & POS < 2000000'`
 and exclude-only `exclude: 'POS < 1000000 | POS >= 2000000'` select the same interval.
-Coordinates remain absolute. `samples` takes comma-separated IDs (or native `^`
-exclusions), rather than a file path. Copy the literal frozen value from
-[data/tgp_chr20_n100_samples.yaml](data/tgp_chr20_n100_samples.yaml) for the
-33 CEU, 33 CHB, and 34 YRI cohort. All three native stages and local readers use
+Coordinates remain absolute. `sample_list` specifies a headerless CSV containing
+only sample IDs, for example `sample_list: sample_lists/tgp_chr20_n100.csv` for the
+33 CEU, 33 CHB, and 34 YRI cohort. The pipeline joins these IDs into tsinfer's
+native `samples` string; omitted or null `sample_list` selects all samples.
+All three native stages and local readers use
 that same selection; generated ancestors do not receive the participant string.
 Optional per-dataset `matching_cache_size` passes the native cache size in MiB
 to both matching stages; omitted or null uses the native default. The 10 Mbp
