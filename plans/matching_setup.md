@@ -92,7 +92,7 @@ calls inside `run` blocks, following the existing workflow style:
 
 | Rule | Inputs | Outputs | Function and location |
 | --- | --- | --- | --- |
-| `write_true_ancestors_config` | Masked sample Zarr; true ancestor Zarr | `{name}_true_ancestors.toml` | Reuse `utils.write_inference_config` in `lib/utils.py` |
+| `make_true_ancestors_config` | Masked sample Zarr; true ancestor Zarr | `{name}_true_ancestors.toml` | Reuse `utils.make_inference_config` in `lib/utils.py` |
 | `match_ancestors` | Panel Zarr; masked sample Zarr; inferred or true TOML | `{name}_{kind}_ancestors.trees` | `matching.match_ancestors(config_path, output_path, threads)` in `lib/matching.py` |
 | `find_focal_ancestors` | Masked sample Zarr; panel Zarr; true CSV for the true branch only | `{name}_{kind}_focal_ancestors.npz` | `matching.find_focal_ancestors(samples_path, ancestors_path, output_path, ancestral_state, true_dataframe_path=None)` in `lib/matching.py` |
 | `match_samples` | Ancestor TS; masked sample Zarr; panel TOML | `{name}_{kind}_samples_raw.trees`; `{name}_{kind}_samples_matches.jsonl` | `matching.match_samples(config_path, ancestors_ts_path, output_path, match_file_path, threads)` in `lib/matching.py` |
@@ -191,8 +191,8 @@ which is not used as a reference for another matching group.
 
 ## Native TOML and the ancestor/sample boundary
 
-Update `utils.write_inference_config` to explicitly disable path compression.
-The optional `write_true_ancestors_config` rule calls the same writer with the
+Update `utils.make_inference_config` to explicitly disable path compression.
+The optional `make_true_ancestors_config` rule calls the same writer with the
 true panel path. It only writes configuration; never run ancestor inference
 using that TOML, since that would overwrite the extracted true panel.
 

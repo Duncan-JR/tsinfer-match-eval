@@ -80,13 +80,13 @@ rule annotate_derived_counts:
         )
 
 
-rule write_inference_config:
+rule make_inference_config:
     input:
         data_dir / "samples" / "{name}_samples_masked.zarr",
     output:
         data_dir / "configs" / "{name}_ancestor_inference.toml",
     log:
-        progress_dir / "write_inference_config" / "{name}_write_inference_config.log",
+        progress_dir / "make_inference_config" / "{name}_make_inference_config.log",
     params:
         hmm=config["hmm"],
         ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
@@ -96,7 +96,7 @@ rule write_inference_config:
     run:
         utils.setup_log(pathlib.Path(log[0]))
         ancestor_path = data_dir / "ancestors" / f"{wildcards.name}_inferred_ancestors.zarr"
-        utils.write_inference_config(
+        utils.make_inference_config(
             pathlib.Path(input[0]), ancestor_path, pathlib.Path(output[0]),
             params.ancestral_state,
             params.hmm,
@@ -139,14 +139,14 @@ rule extract_true_ancestors:
         )
 
 
-rule write_true_ancestors_config:
+rule make_true_ancestors_config:
     input:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_true_ancestors.zarr",
     output:
         data_dir / "configs" / "{name}_true_ancestors.toml",
     log:
-        progress_dir / "write_true_ancestors_config" / "{name}_true_write_true_ancestors_config.log",
+        progress_dir / "make_true_ancestors_config" / "{name}_true_make_true_ancestors_config.log",
     params:
         hmm=config["hmm"],
         ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
@@ -155,7 +155,7 @@ rule write_true_ancestors_config:
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        utils.write_inference_config(
+        utils.make_inference_config(
             pathlib.Path(input.samples),
             pathlib.Path(input.ancestors),
             pathlib.Path(output[0]),
@@ -206,7 +206,7 @@ rule find_focal_ancestors:
         )
 
 
-rule construct_focal_ancestor_intervals:
+rule make_ancestor_intervals:
     input:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
@@ -220,10 +220,10 @@ rule construct_focal_ancestor_intervals:
         focal_choice=focal_choice,
     threads: workflow.cores
     log:
-        progress_dir / "construct_focal_ancestor_intervals" / "{name}_inferred_construct_focal_ancestor_intervals.log",
+        progress_dir / "make_ancestor_intervals" / "{name}_inferred_make_ancestor_intervals.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        haplotypes.construct_focal_ancestor_intervals(
+        haplotypes.make_ancestor_intervals(
             pathlib.Path(input.samples),
             pathlib.Path(input.ancestors),
             pathlib.Path(input.focal),

@@ -265,7 +265,7 @@ Read sample probabilities from the native TOML's
 `_match_one` are not exposed through a simple default-value API. Avoid source
 parsing or callable introspection: mirror the verified defaults in YAML's
 `hmm` setting and write them explicitly to native match-source configuration
-using `utils.write_inference_config`. Apply these configured values to both
+using `utils.make_inference_config`. Apply these configured values to both
 the ancestor and sample source settings. Their initial values reproduce
 current matching, while later edits keep matching and scoring consistent.
 The evaluator requires explicit probabilities in its matching TOML and does
@@ -320,7 +320,7 @@ functions and two small dataclasses:
 | Function or dataclass | Inputs | Output and responsibility |
 | --- | --- | --- |
 | `utils.add_singleton_mask` | Existing input/output paths and ancestral-state mapping | Existing masked copy plus the exact derived-count annotation |
-| `utils.write_inference_config` | Existing paths and ancestral-state mapping, plus `hmm: dict` | Native TOML with explicit scalar matching probabilities |
+| `utils.make_inference_config` | Existing paths and ancestral-state mapping, plus `hmm: dict` | Native TOML with explicit scalar matching probabilities |
 | `ancestors.extract_true_ancestors` | Existing arguments | Existing panel and site-level CSV, with added integer `derived_ac` |
 | `matching._inferred_focal_dataframe` | `ancestors_path: pathlib.Path`, `samples_path: pathlib.Path` | In-memory relation dataframe including frequency, count, and time |
 | `matching.find_focal_ancestors` | Existing arguments | Existing candidate NPZ with inferred-only panel-aligned `derived_ac` |
@@ -413,7 +413,7 @@ probabilities, and extended inferred NPZ. Because library code is intentionally
 not a Snakemake input, regenerate from source with:
 
 ```sh
-uv run snakemake --cores all --forcerun mask_singletons write_inference_config find_focal_ancestors compute_focal_ancestor_stats
+uv run snakemake --cores all --forcerun mask_singletons make_inference_config find_focal_ancestors compute_focal_ancestor_stats
 ```
 
 The changed masked/config inputs may also rebuild inferred descendants through

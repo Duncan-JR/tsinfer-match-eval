@@ -9,9 +9,9 @@ paying attention to what is needed to ensure the correct sequence_length is
 used.
 
 - Add match_ancestors step that constructs ancestor TS from collected ancestors.
-  write_inference_config should do everything you need to run the command for
+  make_inference_config should do everything you need to run the command for
   inferred ancestors, you just need to be sure to configure it correctly. I
-  think you'll have to make an optional write_true_ancestors_config step to make
+  think you'll have to make an optional make_true_ancestors_config step to make
   the toml for running ancestor matching on the true ancestor zarr (optional
   because there might not be any simulated data). Use default HMM parameters for
   now - I know they aren't necessarily correct for recombination maps and such

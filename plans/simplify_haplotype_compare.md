@@ -123,7 +123,7 @@ cutoff changes eligibility, not the bounds of a retained association.
 ## Simplify `lib/haplotypes.py`
 
 Replace the public dataframe-producing function with
-`construct_focal_ancestor_intervals`. Give it an output path alongside the
+`make_ancestor_intervals`. Give it an output path alongside the
 current sample-store, ancestor-store, focal-NPZ, ancestral-state, maximum-AC,
 maximum-budget, thread-allocation, and sample-selection arguments. It prepares
 numeric inputs, computes bounds, and writes the archive once after successful
@@ -174,7 +174,7 @@ clarify genuinely multiple-valued internal results.
 
 ## Workflow and documentation
 
-Rename the rule to `construct_focal_ancestor_intervals`, replace its output
+Rename the rule to `make_ancestor_intervals`, replace its output
 with the NPZ path above, and replace the chunk-CSV target in `rule all`.
 Pass the output path directly to the library function. Remove this rule's
 population enrichment, metadata input/parameters, dataframe label insertion,

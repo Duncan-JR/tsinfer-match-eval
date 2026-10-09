@@ -68,7 +68,7 @@ def annotate_derived_counts(
     )
 
 
-def write_inference_config(
+def make_inference_config(
     samples: pathlib.Path,
     ancestors: pathlib.Path,
     output: pathlib.Path,

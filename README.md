@@ -19,7 +19,7 @@ uv run snakemake --cores all
 After this focal refactor, regenerate candidates and intervals:
 
 ```sh
-uv run snakemake --cores all --forcerun find_focal_ancestors construct_focal_ancestor_intervals
+uv run snakemake --cores all --forcerun find_focal_ancestors make_ancestor_intervals
 ```
 
 Existing generated products are not migrated or automatically deleted. The new
@@ -29,7 +29,7 @@ previous focal archives must be updated separately.
 
 Library files are intentionally not Snakemake inputs. After changing focal
 lookup, force `find_focal_ancestors`; its consumers regenerate too. After changing
-interval comparisons, force `construct_focal_ancestor_intervals`. Rebuild native
+interval comparisons, force `make_ancestor_intervals`. Rebuild native
 configurations and downstream ancestors and matches after changing HMM settings.
 To refresh the dormant true CSV, explicitly target it and force
 `extract_true_ancestors`.
@@ -137,7 +137,7 @@ when reading an archive.
 
 ## Direct focal-ancestor intervals
 
-`lib.haplotypes.construct_focal_ancestor_intervals` compares selected sample
+`lib.haplotypes.make_ancestor_intervals` compares selected sample
 haplotypes directly with inferred ancestors eligible at the maximum AC. To run
 only this branch, explicitly target an interval archive:
 

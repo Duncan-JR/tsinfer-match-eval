@@ -88,7 +88,7 @@ is inferred, and its ancestral allele comes from the panel.
 Use this interface for interval generation:
 
 ```python
-construct_focal_ancestor_intervals(
+make_ancestor_intervals(
     samples_path: pathlib.Path,
     ancestors_path: pathlib.Path,
     focal_ancestors_path: pathlib.Path,
@@ -274,7 +274,7 @@ Remove the Snakefile helpers `metadata_input`, `metadata_params`, and
 only for this branch. Remove unused pandas and tskit imports from `utils.py`.
 
 Keep shared utilities that remaining rules use, including `setup_log`,
-`annotate_derived_counts`, and `write_inference_config`. Keep derived AF
+`annotate_derived_counts`, and `make_inference_config`. Keep derived AF
 annotation: dormant true-panel extraction still consumes it. Keep pandas as
 a project dependency because `lib/ancestors.py` still uses it.
 

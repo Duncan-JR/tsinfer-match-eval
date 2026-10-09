@@ -492,7 +492,7 @@ following the repository's existing convention that library files are not
 Snakemake inputs.
 
 For fixed upstream stores, HMM settings cannot affect the chunk dataframe.
-There is one existing dependency caveat: `write_inference_config` combines
+There is one existing dependency caveat: `make_inference_config` combines
 ancestor-inference and HMM settings in one TOML and tracks `params.hmm`. An HMM
 configuration edit can therefore invalidate that TOML and trigger upstream
 ancestor regeneration, followed by rebuilding dependent chunk outputs. The new

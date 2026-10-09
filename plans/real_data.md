@@ -110,7 +110,7 @@ incorrect chromosome metadata.
 
 ### Native TOML and shared source
 
-Extend `utils.write_inference_config` with the dataset's optional native
+Extend `utils.make_inference_config` with the dataset's optional native
 filter settings. Copy non-null `include`, `exclude`, and `samples` strings
 directly into `[[source]]`, preserving them exactly. Use the same writer for
 inferred and optional true-panel configurations.

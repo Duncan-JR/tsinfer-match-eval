@@ -80,7 +80,7 @@ def find_focal_ancestors(
     Choose the smallest focal position for ``left`` and largest for ``right``.
     Other focal calls do not affect membership. Save all candidates, without AC
     filtering, in sorted panel-column order for each haplotype, including empty
-    rows. :func:`construct_focal_ancestor_intervals` reuses these saved seeds.
+    rows. :func:`make_ancestor_intervals` reuses these saved seeds.
     Direct callers supply a valid choice; the Snakefile validates configuration.
     """
     samples = tsinfer.vcz.open_store(samples_path)
@@ -260,7 +260,7 @@ def _sweep_block(
 ):
     """Advance a directional event sweep through one physical site block.
 
-    Used by :func:`construct_focal_ancestor_intervals`. Bounds are half-open;
+    Used by :func:`make_ancestor_intervals`. Bounds are half-open;
     budgets apply independently to each side. With support [0, 10), focal 4,
     left mismatches 3, 1 and right mismatches 6, 8, budgets 0, 1, 2 retain
     [4, 6), [2, 8), [0, 10). The (k + 1)th mismatch is excluded.
@@ -413,7 +413,7 @@ def _collect_bounds(data, ancestors_path, max_mismatches, threads):
     return IntervalBounds(left, right)
 
 
-def construct_focal_ancestor_intervals(
+def make_ancestor_intervals(
     samples_path: pathlib.Path,
     ancestors_path: pathlib.Path,
     focal_ancestors_path: pathlib.Path,

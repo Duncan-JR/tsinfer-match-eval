@@ -49,7 +49,7 @@ Output paths use `{name}` followed by a suffix under the configured data folder:
    This loads the genotype array into memory; no chunk reader is needed for
    this MVP. Refresh Zarr metadata after adding the arrays. Existing anc-eval singleton
    and frequency annotations can be stale after genotype errors.
-2. `write_inference_config` writes native tsinfer TOML with one sample source,
+2. `make_inference_config` writes native tsinfer TOML with one sample source,
    the configured ancestral state, one inferred ancestor output, and the match
    sections for later use. Its source has
    `exclude = "INFO/match_eval_singleton_mask == 1"`. vcztools resolves this
