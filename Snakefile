@@ -19,13 +19,19 @@ if any(value <= 0 for value in ac_cutoff) or any(
 ):
     raise ValueError("ac_cutoff must contain strictly increasing positive integers")
 max_ac_cutoff = max(ac_cutoff)
-max_mismatches = config["haplotype_compare"]["max_mismatches"]
-if (
-    isinstance(max_mismatches, bool)
-    or not isinstance(max_mismatches, int)
-    or max_mismatches < 0
+max_mismatches = config["max_mismatches"]
+if not isinstance(max_mismatches, list) or len(max_mismatches) == 0:
+    raise ValueError("max_mismatches must be a nonempty list")
+if any(isinstance(value, bool) or not isinstance(value, int) for value in max_mismatches):
+    raise ValueError("max_mismatches values must be integers, not booleans")
+if any(value < 0 for value in max_mismatches) or any(
+    right <= left for left, right in zip(max_mismatches, max_mismatches[1:])
 ):
-    raise ValueError("haplotype_compare.max_mismatches must be an integer >= 0")
+    raise ValueError("max_mismatches must contain strictly increasing nonnegative integers")
+max_mismatch_budget = max(max_mismatches)
+focal_methods = config["focal_methods"]
+if not isinstance(focal_methods, list) or focal_methods != ["hmm"]:
+    raise ValueError("focal_methods must be the list ['hmm']")
 
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
@@ -47,6 +53,9 @@ def panel_config(wildcards):
 
 wildcard_constraints:
     kind="inferred|true",
+    ac="|".join(str(value) for value in ac_cutoff),
+    k="|".join(str(value) for value in max_mismatches),
+    method="|".join(focal_methods),
 
 
 rule all:
@@ -59,6 +68,18 @@ rule all:
         expand(
             data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
             name=names,
+        ),
+        expand(
+            data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_focal_mask.npz",
+            name=names, ac=ac_cutoff, k=max_mismatches,
+        ),
+        expand(
+            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_raw.trees",
+            name=names, ac=ac_cutoff, k=max_mismatches, method=focal_methods,
+        ),
+        expand(
+            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_matches.jsonl",
+            name=names, ac=ac_cutoff, k=max_mismatches, method=focal_methods,
         ),
 
 
@@ -216,7 +237,7 @@ rule make_ancestor_intervals:
     params:
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
         max_ac_cutoff=max_ac_cutoff,
-        max_mismatches=max_mismatches,
+        max_mismatches=max_mismatch_budget,
         focal_choice=focal_choice,
     threads: workflow.cores
     log:
@@ -234,6 +255,64 @@ rule make_ancestor_intervals:
             params.focal_choice,
             params.samples,
         )
+
+
+rule make_focal_mask:
+    input:
+        data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
+    output:
+        data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_focal_mask.npz",
+    params:
+        ac_cutoff=lambda wildcards: int(wildcards.ac),
+        max_mismatches=lambda wildcards: int(wildcards.k),
+    log:
+        progress_dir / "make_focal_mask" / "{name}_inferred_ac{ac}_k{k}_make_focal_mask.log",
+    run:
+        utils.setup_log(pathlib.Path(log[0]))
+        haplotypes.make_focal_mask(
+            pathlib.Path(input[0]), pathlib.Path(output[0]),
+            params.ac_cutoff, params.max_mismatches,
+        )
+
+
+rule match_stitched_samples:
+    input:
+        reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
+        config=data_dir / "configs" / "{name}_ancestor_inference.toml",
+        focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+        masks=expand(
+            data_dir / "focal_masks" / "{{name}}_inferred_ac{{ac}}_k{k}_focal_mask.npz",
+            k=max_mismatches,
+        ),
+    output:
+        trees=expand(
+            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_{{method}}_stitched_samples_raw.trees",
+            k=max_mismatches,
+        ),
+        matches=expand(
+            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_{{method}}_stitched_samples_matches.jsonl",
+            k=max_mismatches,
+        ),
+    params:
+        ac_cutoff=lambda wildcards: int(wildcards.ac),
+        max_mismatches=max_mismatches,
+        cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
+    threads: workflow.cores
+    log:
+        progress_dir / "match_stitched_samples" / "{name}_inferred_ac{ac}_{method}_match_stitched_samples.log",
+    run:
+        utils.setup_log(pathlib.Path(log[0]))
+        matching.match_stitched_samples(
+            pathlib.Path(input.config), pathlib.Path(input.reference),
+            pathlib.Path(input.focal),
+            [pathlib.Path(path) for path in input.masks],
+            [pathlib.Path(path) for path in output.trees],
+            [pathlib.Path(path) for path in output.matches],
+            params.ac_cutoff, params.max_mismatches, wildcards.method,
+            threads, params.cache_size,
+        )
+
 
 rule match_samples:
     input:

@@ -1,4 +1,4 @@
-"""Direct inferred focal-ancestor comparisons, independent of HMM matching."""
+"""Inferred focal candidates, direct intervals, and their coverage masks."""
 
 import dataclasses
 import logging
@@ -461,3 +461,75 @@ def make_ancestor_intervals(
         focal_choice=np.asarray(focal_choice),
     )
     logger.info("Wrote %d associations to %s", len(data.focals), output_path)
+
+
+def make_focal_mask(
+    intervals_path: pathlib.Path,
+    output_path: pathlib.Path,
+    ac_cutoff: int,
+    max_mismatches: int,
+) -> None:
+    """Partition the inference-site axis into focal-covered and all-gap runs.
+
+    Union eligible associations from :func:`make_ancestor_intervals`, merging
+    touching bounds. Keep its complete haplotype roster, including empty slices.
+    The Snakefile supplies an AC cutoff and budget within the generated maxima.
+    """
+    with np.load(intervals_path, allow_pickle=False) as intervals:
+        sample_id = intervals["sample_id"]
+        ploidy_index = intervals["ploidy_index"]
+        association_offsets = intervals["offsets"]
+        focal_ac = intervals["focal_ac"]
+        left = intervals["left_site_index"][:, max_mismatches]
+        right = intervals["right_site_index"][:, max_mismatches]
+        num_sites = int(intervals["num_sites"])
+        focal_choice = intervals["focal_choice"]
+
+    offsets = [0]
+    run_left = []
+    run_right = []
+    is_gap = []
+    for haplotype in range(len(sample_id)):
+        start = association_offsets[haplotype]
+        end = association_offsets[haplotype + 1]
+        eligible = np.flatnonzero(focal_ac[start:end] <= ac_cutoff) + start
+        order = np.argsort(left[eligible], kind="stable")
+        covered = []
+        for association in eligible[order]:
+            interval_left = int(left[association])
+            interval_right = int(right[association])
+            if len(covered) > 0 and interval_left <= covered[-1][1]:
+                covered[-1][1] = max(covered[-1][1], interval_right)
+            else:
+                covered.append([interval_left, interval_right])
+        cursor = 0
+        for interval_left, interval_right in covered:
+            if cursor < interval_left:
+                run_left.append(cursor)
+                run_right.append(interval_left)
+                is_gap.append(True)
+            run_left.append(interval_left)
+            run_right.append(interval_right)
+            is_gap.append(False)
+            cursor = interval_right
+        if cursor < num_sites or len(covered) == 0:
+            run_left.append(cursor)
+            run_right.append(num_sites)
+            is_gap.append(True)
+        offsets.append(len(run_left))
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        sample_id=sample_id,
+        ploidy_index=ploidy_index,
+        offsets=np.asarray(offsets, dtype=np.int64),
+        left_site_index=np.asarray(run_left, dtype=np.int64),
+        right_site_index=np.asarray(run_right, dtype=np.int64),
+        is_gap=np.asarray(is_gap, dtype=bool),
+        num_sites=np.int64(num_sites),
+        ac_cutoff=np.int64(ac_cutoff),
+        max_mismatches=np.int64(max_mismatches),
+        focal_choice=focal_choice,
+    )
+    logger.info("Wrote focal mask for %d haplotypes to %s", len(sample_id), output_path)

@@ -2,7 +2,9 @@
 
 A Snakemake pipeline that builds inferred ancestor panels, matches ancestors and
 samples separately against the full reference, and generates focal candidates
-and direct focal-ancestor intervals. It uses an editable `../tsinfer` checkout
+and direct focal-ancestor intervals. It also matches samples against reduced
+focal references and stitches full-reference gap matches into those paths.
+It uses an editable `../tsinfer` checkout
 and calls functions in `lib` directly. True-panel extraction and matching remain
 available through explicit targets, outside the default workflow.
 
@@ -31,7 +33,9 @@ Library files are intentionally not Snakemake inputs. After changing focal
 lookup, force `find_focal_ancestors`; its consumers regenerate too. After changing
 interval comparisons, force `make_ancestor_intervals`. Rebuild native
 configurations and downstream ancestors and matches after changing HMM settings.
-To refresh the dormant true CSV, explicitly target it and force
+After changing mask unions, force `make_focal_mask`; after changing stitched
+matching, force `match_stitched_samples`. To refresh the dormant true CSV,
+explicitly target it and force
 `extract_true_ancestors`.
 
 Edit `config.yaml` to choose datasets and output folders. Paths are relative to
@@ -47,21 +51,36 @@ these exact strings are accepted, including rejection of null. The Snakefile
 validates it before constructing rules or launching jobs. Direct library callers
 supply a valid choice themselves.
 
-`ac_cutoff` is a nonempty, strictly increasing list of positive integers. Only
-its maximum affects interval generation, inclusively. Changing smaller members
-with the maximum fixed affects neither focal product. Changing the maximum or
-`haplotype_compare.max_mismatches` regenerates intervals only. The latter is a
-nonnegative integer and generates budget columns 0 through that maximum.
+`ac_cutoff` is a nonempty, strictly increasing list of positive integers.
+`max_mismatches` is a nonempty, strictly increasing list of nonnegative integers.
+Both exclude booleans. `focal_methods` currently accepts only `[hmm]`.
+For example:
+
+```yaml
+ac_cutoff: [3, 5, 10]
+max_mismatches: [0, 1]
+focal_methods: [hmm]
+```
+
+Only the numeric maxima affect interval generation: this example uses inclusive
+AC 10 and generates budget columns 0 and 1. Smaller list members select masks
+and stitched outputs without repeating interval comparisons. The mismatch
+budget applies independently in each direction from the seed and controls
+coverage; it is not an HMM mismatch limit. Changes to either maximum regenerate
+intervals and their consumers.
 Changing `focal_choice` regenerates candidates and intervals while leaving
 inferred ancestors and full matches current. `inference_threads` and
 `matching_threads` request workers for those stages; interval generation uses
-its allocated cores, capped by physical ancestor-column blocks.
+its allocated cores, capped by physical ancestor-column blocks. Stitched jobs
+reserve the workflow's available cores and cap workers by haplotype count.
 
 The `hmm.recombination` and `hmm.mismatch` values are scalar per-site
 probabilities written explicitly for both matching stages; both must be strictly
-between zero and one. Focal products do not depend on matching outputs.
+between zero and one. Candidates, intervals, and masks do not depend on
+matching outputs. Stitched matching needs the ancestor reference but has no
+dependency on baseline sample matches.
 
-For every dataset `{name}`, the default workflow requires exactly:
+For every dataset `{name}`, the default workflow requires:
 
 | Product | Path under `{data_dir}` |
 | --- | --- |
@@ -71,6 +90,13 @@ For every dataset `{name}`, the default workflow requires exactly:
 | Full-reference raw sample trees | `matches/{name}_inferred_samples_raw.trees` |
 | Full-reference sample match records | `matches/{name}_inferred_samples_matches.jsonl` |
 | Direct focal intervals | `haplotype_intervals/{name}_inferred_focal_ancestor_intervals.npz` |
+| Focal coverage mask, each AC/k | `focal_masks/{name}_inferred_ac{ac}_k{k}_focal_mask.npz` |
+| Raw stitched samples, each AC/k/method | `matches/{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_raw.trees` |
+| Stitched match records, each AC/k/method | `matches/{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_matches.jsonl` |
+
+The example produces six masks and six stitched TS/JSONL pairs per dataset.
+One stitched Snakemake job per dataset/AC/method produces every requested budget.
+There are no per-haplotype or per-region jobs or intermediate matching files.
 
 Intermediate products include `samples/{name}_samples_masked.zarr/` and
 `configs/{name}_ancestor_inference.toml`. Logs go under `progress_dir`. The
@@ -111,8 +137,8 @@ its selected endpoint seed is derived. Calls at all other focal sites do not
 affect membership. Ancestors with no non-padding focal position have no seed and
 contribute no candidates or intervals. Both chromosome copies are retained,
 including haplotypes with empty candidate sets. These associations describe
-allele sharing, including at recurrent sites. Matching uses the full panel
-independently of focal lookup.
+allele sharing, including at recurrent sites. Baseline matching uses the full
+panel independently of focal lookup; stitched matching uses these candidates.
 
 Load either focal product with `numpy.load(path, allow_pickle=False)`. For H
 haplotypes, A panel ancestors, and P candidate associations, the candidate NPZ
@@ -187,8 +213,63 @@ sample associations. A full-height block serves both directions; multi-height
 stores stream site blocks while retaining sweep state. Spawned workers reuse
 prepared numeric associations and open their own read-only panel. A queued
 multiprocessing Pool assembles results in canonical order. No entire ancestor
-genotype matrix is loaded. Coverage summaries and population labels are outside
-this pipeline.
+genotype matrix is loaded. Coverage summaries are outside this pipeline.
+
+## Focal masks and stitched matching
+
+`lib.haplotypes.make_focal_mask` selects associations with `focal_ac <= ac_cutoff`
+and interval column k. It sorts and unions overlapping or touching bounds,
+then emits covered runs and their complement. Ordered half-open runs partition
+the inference-site axis; `is_gap=True` denotes zero coverage. A haplotype with
+no eligible associations has one all-gap run.
+
+The compressed mask NPZ uses numeric/Unicode arrays and contains:
+
+| Field | Meaning |
+| --- | --- |
+| `sample_id`, `ploidy_index` | Original haplotype roster |
+| `offsets` | Haplotype boundaries in flattened run arrays |
+| `left_site_index`, `right_site_index` | Half-open site bounds |
+| `is_gap` | Boolean gap indicator |
+| `num_sites` | Inference-site axis length |
+| `ac_cutoff`, `max_mismatches`, `focal_choice` | Selected parameters and seed provenance |
+
+`lib.matching.match_stitched_samples` builds native sample jobs and reads each
+haplotype once with tsinfer's scheduled VCZ reader and allele mapper. A queued
+multiprocessing Pool owns one full-reference matcher per worker. Each task
+processes all k values; a single-worker allocation uses the same function
+directly. The dataset's `matching_cache_size` also applies here.
+
+For a haplotype with focal coverage, panel candidate IDs are joined to reference
+nodes through `(source, sample_id, ploidy_index)` metadata for source `ancestors`
+and ploidy 0. Eligible candidates plus roots 0 and 1 are retained by one
+site-preserving simplification. Internal ancestors remain copying states.
+One reduced-reference HMM uses the entire observed inference-site axis,
+including gaps, and its parent IDs are mapped back to the original reference.
+This match is reused across every budget. Haplotypes without focal coverage
+skip the reduced pass.
+
+For each k, the saved mask alone decides which reduced parent/copied-allele
+sites survive. Gap slices are overwritten by independent full-reference HMMs,
+split at inference-interval boundaries from reference metadata. Missing calls
+are neutral observations. There is no padding or boundary conditioning. The
+output domain runs from the first called site through the last called site,
+or over the entire axis for an all-missing haplotype, as in baseline matching.
+
+Adjacent equal parents merge into native path segments, including across
+seams. Internal boundaries use site positions; outer bounds are BP 0 and the
+sequence length when the domain reaches the axis endpoints. Mutations are
+derived from called observations differing from the final copied alleles.
+They include retained focal mismatches and exclude discarded reduced gap
+mismatches and missing observations.
+
+Each output uses one native `extend_ts` call against the original ancestor
+reference. It remains raw and unsimplified, preserves original reference node
+IDs, and adds one sample node per haplotype with native individual/population
+assignments. JSONL uses the baseline fields below plus `ac_cutoff`,
+`max_mismatches`, and `method`, ordered by native `haplotype_index`.
+Only focal `method="hmm"` is implemented. Greedy matching, boundary
+conditioning, engine optimisation, and analysis remain later work.
 
 ## Full-reference matching and dormant true panels
 
@@ -230,14 +311,15 @@ Historical extraction and matching details are in
 [plans/matching_setup.md](plans/matching_setup.md). The selected-seed contracts
 and verification requirements are in
 [plans/refactor_focal_ancestors.md](plans/refactor_focal_ancestors.md), which
-supersedes earlier focal-selection and statistics instructions.
+supersedes earlier focal-selection and statistics instructions. Stitched
+matching follows [plans/stitched_matching.md](plans/stitched_matching.md).
 
 Code checks are `uv run ruff check lib` and `uv run ruff format --check lib`.
-Manual verification uses temporary products and independent membership and
-interval scans, including both endpoint choices, reversed allele order, missing
-barriers, support boundaries, empty slices, worker agreement, and configuration
-dependencies. No test suite is included. Existing analyses are not changed by
-this refactor.
+Manual verification uses small temporary products: direct interval unions,
+all-gap equivalence to native HMM matching, reduced-pass reuse across budgets,
+overlapping focal parent agreement, TS/JSONL path and called-allele agreement,
+and the coarse Snakemake DAG. No test suite is included; full-cohort runs and
+analysis are not part of automatic verification.
 
 The refactor verification checked both choices on the existing
 `out_of_africa_n100_1mbp`, `out_of_africa_n300_1mbp`, and
@@ -250,3 +332,17 @@ identical bounds, and four physical site-block heights. Temporary workflow
 execution and dry-runs checked the six default outputs, interval independence
 from matching, configuration rejection before DAG construction, omitted choice
 equivalence to `left`, and choice/AC/K parameter invalidation.
+
+Stitched verification used temporary inputs with 12 inference sites, two
+diploid samples, and three ancestors, including a retained internal ancestor.
+Six masks agreed with direct unions, including touching/overlapping bounds and
+all-gap rows; interval maxima were AC 10 and k 1. All-gap paths and mutations
+agreed with native full-HMM matching for trimmed and all-missing domains.
+Covered haplotypes made one reduced call across both budgets, and parents
+agreed on overlapping focal coverage. Saved TS/JSONL agreed on paths and
+mutations, reproduced called alleles, and included real seam switches and
+retained focal mutations. One- and two-worker outputs agreed; gap calls split
+at metadata interval boundaries. Actual Snakemake execution produced six masks
+and six TS/JSONL pairs in three stitched jobs. Dry runs confirmed the coarse
+DAG and absence of a baseline sample-match dependency; configuration validation
+also passed. No full cohort or performance benchmark was run.
