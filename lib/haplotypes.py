@@ -13,8 +13,117 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
+class SampleHaplotypes:
+    """Panel-aligned canonical calls and identities in sample-major order."""
+
+    calls: np.ndarray
+    sample_id: np.ndarray
+    ploidy_index: np.ndarray
+    sample_rows: np.ndarray
+
+
+def _load_sample_haplotypes(samples, panel, sample_selection):
+    """Polarise sample allele strings using the inferred panel's ancestry.
+
+    Shared by :func:`find_focal_ancestors` and interval :func:`_prepare`.
+    Check the cross-store position mapping at this loading boundary.
+    """
+    positions = panel["variant_position"][:]
+    sample_positions = samples["variant_position"][:]
+    rows = np.searchsorted(sample_positions, positions)
+    present = rows < len(sample_positions)
+    present[present] = sample_positions[rows[present]] == positions[present]
+    if not np.all(present):
+        absent = positions[np.flatnonzero(~present)[0]]
+        raise ValueError(f"Panel position {absent} is absent from the sample store")
+    columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
+    genotypes = samples["call_genotype"].oindex[rows, columns, :]
+    alleles = samples["variant_allele"].oindex[rows, :]
+    ancestral = panel["variant_allele"][:, 0]
+    called = genotypes >= 0
+    allele_indices = np.maximum(genotypes, 0)
+    called_alleles = np.take_along_axis(alleles[:, None, :], allele_indices, axis=2)
+    derived = called_alleles != ancestral[:, None, None]
+    calls = np.where(called, derived, -1).astype(np.int8)
+    ploidy = genotypes.shape[2]
+    num_haplotypes = genotypes.shape[1] * ploidy
+    calls = calls.reshape(len(positions), num_haplotypes)
+    ids = np.asarray(samples["sample_id"].oindex[columns].tolist(), dtype=str)
+    sample_id = np.repeat(ids, ploidy)
+    ploidy_index = np.tile(np.arange(ploidy, dtype=np.int64), len(ids))
+    return SampleHaplotypes(calls, sample_id, ploidy_index, rows)
+
+
+def _select_focal_sites(panel, focal_choice):
+    """Select one endpoint seed per ancestor for :func:`find_focal_ancestors`."""
+    positions = panel["variant_position"][:]
+    focal_positions = panel["sample_focal_positions"][:]
+    sites = np.full(len(focal_positions), -1, dtype=np.int64)
+    for ancestor, values in enumerate(focal_positions):
+        values = values[values >= 0]
+        if len(values) == 0:
+            continue
+        position = np.min(values) if focal_choice == "left" else np.max(values)
+        sites[ancestor] = np.searchsorted(positions, position)
+    return sites
+
+
+def find_focal_ancestors(
+    samples_path: pathlib.Path,
+    ancestors_path: pathlib.Path,
+    output_path: pathlib.Path,
+    focal_choice: str = "left",
+    sample_selection: str | None = None,
+) -> None:
+    """Write inferred candidates defined by a derived call at one endpoint seed.
+
+    Choose the smallest focal position for ``left`` and largest for ``right``.
+    Other focal calls do not affect membership. Save all candidates, without AC
+    filtering, in sorted panel-column order for each haplotype, including empty
+    rows. :func:`construct_focal_ancestor_intervals` reuses these saved seeds.
+    Direct callers supply a valid choice; the Snakefile validates configuration.
+    """
+    samples = tsinfer.vcz.open_store(samples_path)
+    panel = tsinfer.vcz.open_store(ancestors_path)
+    haplotypes = _load_sample_haplotypes(samples, panel, sample_selection)
+    focal_sites = _select_focal_sites(panel, focal_choice)
+    ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
+    anchored = np.flatnonzero(focal_sites >= 0)
+    seed_rows = haplotypes.sample_rows[focal_sites[anchored]]
+    derived_ac = np.zeros(len(ancestor_ids), dtype=np.int64)
+    derived_ac[anchored] = samples["variant_match_eval_derived_ac"].oindex[seed_rows]
+    offsets = [0]
+    candidate_rows = []
+    for haplotype in range(len(haplotypes.sample_id)):
+        seed_calls = haplotypes.calls[focal_sites[anchored], haplotype]
+        candidates = anchored[seed_calls == 1]
+        candidate_rows.append(candidates)
+        offsets.append(offsets[-1] + len(candidates))
+    ancestor_index = np.empty(0, dtype=np.int64)
+    if len(candidate_rows) > 0:
+        ancestor_index = np.concatenate(candidate_rows)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    np.savez_compressed(
+        output_path,
+        sample_id=haplotypes.sample_id,
+        ploidy_index=haplotypes.ploidy_index,
+        ancestor_id=ancestor_ids,
+        offsets=np.asarray(offsets, dtype=np.int64),
+        ancestor_index=ancestor_index,
+        derived_ac=derived_ac,
+        focal_site_index=focal_sites,
+        focal_choice=np.asarray(focal_choice),
+    )
+    logger.info(
+        "Wrote focal candidates for %d haplotypes to %s",
+        len(haplotypes.sample_id),
+        output_path,
+    )
+
+
+@dataclasses.dataclass
 class ComparisonData:
-    """Validated site axis, resident sample calls, and canonical association order."""
+    """Panel axis, resident sample calls, and canonical association order."""
 
     panel: object
     num_sites: int
@@ -55,54 +164,22 @@ def _prepare(
     samples_path,
     ancestors_path,
     focal_path,
-    ancestral_state,
     max_ac_cutoff,
     sample_selection,
 ):
-    """Prepare leftmost associations for :func:`construct_focal_ancestor_intervals`."""
+    """Load and filter saved seed associations for interval comparison."""
     samples = tsinfer.vcz.open_store(samples_path)
     panel = tsinfer.vcz.open_store(ancestors_path)
+    loaded = _load_sample_haplotypes(samples, panel, sample_selection)
     positions = panel["variant_position"][:]
-    sample_positions = samples["variant_position"][:]
-    rows = np.searchsorted(sample_positions, positions)
-    present = rows < len(sample_positions)
-    present[present] = sample_positions[rows[present]] == positions[present]
-    if not np.all(present):
-        absent = positions[np.flatnonzero(~present)[0]]
-        raise ValueError(f"Panel position {absent} is absent from the sample store")
-    alleles = samples["variant_allele"].oindex[rows, :]
-    ancestral = alleles[:, 0]
-    if not ancestral_state.get("is_reference", False):
-        ancestral = samples[ancestral_state["field"]].oindex[rows]
-    reference_ancestral = ancestral == alleles[:, 0]
-    alternate_ancestral = ancestral == alleles[:, 1]
-    if not np.all(reference_ancestral | alternate_ancestral):
-        raise ValueError("Ancestral state must be one of the two sample alleles")
-    canonical_alleles = alleles[:, :2].copy()
-    canonical_alleles[~reference_ancestral] = alleles[~reference_ancestral, :2][:, ::-1]
-    if not np.array_equal(panel["variant_allele"][:], canonical_alleles):
-        raise ValueError("Panel allele order disagrees with sample ancestral polarity")
-    columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
-    calls = samples["call_genotype"].oindex[rows, columns, :]
-    if np.any((calls < -1) | (calls > 1)):
-        raise ValueError("Sample calls must be biallelic codes 0, 1, or missing -1")
-    swapped = ~reference_ancestral[:, None, None] & (calls >= 0)
-    calls[swapped] = 1 - calls[swapped]
-    ploidy = calls.shape[2]
-    calls = calls.reshape(len(positions), -1)
-    ids = np.asarray(samples["sample_id"].oindex[columns].tolist(), dtype=str)
-    sample_ids = np.repeat(ids, ploidy)
-    ploidy_indices = np.tile(np.arange(ploidy), len(ids))
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
-    counts = samples["variant_match_eval_derived_ac"].oindex[rows]
     starts = panel["sample_start_position"][:]
     ends = panel["sample_end_position"][:]
     intervals = panel["sequence_intervals"][:]
-    focal_positions = panel["sample_focal_positions"][:]
     with np.load(focal_path, allow_pickle=False) as candidates:
         for name, expected in (
-            ("sample_id", sample_ids),
-            ("ploidy_index", ploidy_indices),
+            ("sample_id", loaded.sample_id),
+            ("ploidy_index", loaded.ploidy_index),
             ("ancestor_id", ancestor_ids),
         ):
             if not np.array_equal(candidates[name], expected):
@@ -110,67 +187,31 @@ def _prepare(
         offsets = candidates["offsets"]
         columns = candidates["ancestor_index"]
         derived_ac = candidates["derived_ac"]
-        if derived_ac.shape != ancestor_ids.shape:
-            raise ValueError("Focal NPZ counts are not panel-aligned")
-        if (
-            len(offsets) != len(sample_ids) + 1
-            or offsets[0] != 0
-            or offsets[-1] != len(columns)
-            or np.any(np.diff(offsets) < 0)
-            or np.any((columns < 0) | (columns >= len(ancestor_ids)))
-        ):
-            raise ValueError("Invalid focal NPZ ragged candidate indices")
-        ancestor_focals = np.full(len(ancestor_ids), -1, dtype=np.int64)
-        for ancestor, values in enumerate(focal_positions):
-            values = values[values >= 0]
-            if len(values) == 0:
-                continue
-            position = np.min(values)
-            index = np.searchsorted(positions, position)
-            if index >= len(positions) or positions[index] != position:
-                raise ValueError("Ancestor focal position is absent from panel")
-            ancestor_focals[ancestor] = index
-        haplotypes = []
-        ancestors = []
-        focals = []
+        ancestor_focals = candidates["focal_site_index"]
+        haplotype_rows = []
+        ancestor_rows = []
         output_offsets = [0]
-        for haplotype in range(len(sample_ids)):
+        for haplotype in range(len(loaded.sample_id)):
             selected = columns[offsets[haplotype] : offsets[haplotype + 1]]
-            if np.any(np.diff(selected) <= 0):
-                raise ValueError("Candidate columns must be sorted and distinct")
             selected = selected[derived_ac[selected] <= max_ac_cutoff]
-            for ancestor in selected:
-                index = ancestor_focals[ancestor]
-                if index == -1:
-                    continue
-                if counts[index] != derived_ac[ancestor]:
-                    raise ValueError("Focal NPZ counts disagree with sample annotations")
-                if calls[index, haplotype] != 1:
-                    raise ValueError(
-                        "Selected leftmost focal sample call is not derived"
-                    )
-                haplotypes.append(haplotype)
-                ancestors.append(ancestor)
-                focals.append(index)
-            output_offsets.append(len(focals))
-        focal_ac = derived_ac[ancestors].astype(np.int64)
-    haplotypes = np.asarray(haplotypes, dtype=np.int64)
-    ancestors = np.asarray(ancestors, dtype=np.int64)
-    focals = np.asarray(focals, dtype=np.int64)
+            haplotype_rows.append(np.full(len(selected), haplotype, dtype=np.int64))
+            ancestor_rows.append(selected)
+            output_offsets.append(output_offsets[-1] + len(selected))
+        haplotypes = np.empty(0, dtype=np.int64)
+        ancestors = np.empty(0, dtype=np.int64)
+        if len(ancestor_rows) > 0:
+            haplotypes = np.concatenate(haplotype_rows)
+            ancestors = np.concatenate(ancestor_rows)
+        focals = ancestor_focals[ancestors]
+        focal_ac = derived_ac[ancestors]
     # Each seed is confined to the inference interval containing its focal site.
     interval_indices = np.searchsorted(intervals[:, 0], positions[focals], side="right")
     interval_indices -= 1
-    if np.any(interval_indices < 0):
-        raise ValueError("Focal site lies outside inference intervals")
     containing = intervals[interval_indices]
-    if np.any(positions[focals] >= containing[:, 1]):
-        raise ValueError("Focal site lies in an inference interval gap")
     bp_left = np.maximum(starts[ancestors], containing[:, 0]).astype(np.int64)
     bp_right = np.minimum(ends[ancestors], containing[:, 1]).astype(np.int64)
     left = np.searchsorted(positions, bp_left)
     right = np.searchsorted(positions, bp_right)
-    if np.any((left > focals) | (right <= focals)):
-        raise ValueError("Focal site lies outside ancestor support")
     column_width = panel["call_genotype"].chunks[1]
     site_height = panel["call_genotype"].chunks[0]
     block_ids = ancestors // column_width
@@ -185,9 +226,9 @@ def _prepare(
         panel=panel,
         num_sites=len(positions),
         num_ancestors=len(ancestor_ids),
-        calls=calls,
-        sample_ids=sample_ids,
-        ploidy_indices=ploidy_indices.astype(np.int64),
+        calls=loaded.calls,
+        sample_ids=loaded.sample_id,
+        ploidy_indices=loaded.ploidy_index,
         offsets=np.asarray(output_offsets, dtype=np.int64),
         focal_ac=focal_ac,
         haplotypes=haplotypes,
@@ -241,9 +282,6 @@ def _sweep_block(
             site = next_site
         while cursor < len(events) and focals[events[cursor]] == site:
             seed = events[cursor]
-            local_site = site - site_start
-            if genotypes[local_site, columns[seed]] != 1:
-                raise ValueError("Selected focal ancestor call is not derived")
             active[active_length] = seed
             active_length += 1
             cursor += 1
@@ -335,10 +373,11 @@ def _block_bounds(data, block, max_mismatches):
     return BlockBounds(seeds, left, right)
 
 
-def _initialise_worker(arguments, max_mismatches):
-    """Give each spawned process its own read-only stores and numeric inputs."""
+def _initialise_worker(data, ancestors_path, max_mismatches):
+    """Reuse prepared associations and open a read-only panel in each worker."""
     global _worker_data, _worker_max_mismatches
-    _worker_data = _prepare(*arguments)
+    panel = tsinfer.vcz.open_store(ancestors_path)
+    _worker_data = dataclasses.replace(data, panel=panel)
     _worker_max_mismatches = max_mismatches
 
 
@@ -346,8 +385,10 @@ def _worker_block(block):
     return _block_bounds(_worker_data, block, _worker_max_mismatches)
 
 
-def _collect_bounds(data, arguments, max_mismatches, threads):
+def _collect_bounds(data, ancestors_path, max_mismatches, threads):
     """Assemble block results in canonical association order; propagate failures."""
+    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
+        raise ValueError("threads must be an integer >= 1")
     shape = (len(data.focals), max_mismatches + 1)
     left = np.empty(shape, dtype=np.int64)
     right = np.empty(shape, dtype=np.int64)
@@ -359,10 +400,11 @@ def _collect_bounds(data, arguments, max_mismatches, threads):
             right[result.seeds] = result.right
     else:
         context = multiprocessing.get_context("spawn")
+        worker_data = dataclasses.replace(data, panel=None)
         with context.Pool(
             workers,
             initializer=_initialise_worker,
-            initargs=(arguments, max_mismatches),
+            initargs=(worker_data, ancestors_path, max_mismatches),
         ) as pool:
             results = pool.imap_unordered(_worker_block, data.block_seeds, chunksize=1)
             for result in results:
@@ -376,13 +418,13 @@ def construct_focal_ancestor_intervals(
     ancestors_path: pathlib.Path,
     focal_ancestors_path: pathlib.Path,
     output_path: pathlib.Path,
-    ancestral_state: dict,
     max_ac_cutoff: int,
     max_mismatches: int,
     threads: int,
+    focal_choice: str = "left",
     sample_selection: str | None = None,
 ) -> None:
-    """Write compressed raw intervals anchored at each ancestor's leftmost focal.
+    """Write compressed raw intervals anchored at the saved selected focal seed.
 
     One association per eligible ancestor is retained in focal-NPZ haplotype
     order, then increasing ancestor column. Exact AC uses an inclusive maximum.
@@ -391,35 +433,19 @@ def construct_focal_ancestor_intervals(
     Bounds are half-open on the inferred panel axis and confined to ancestor
     support and the containing inference interval. See :func:`_sweep_block` for
     a worked example. No HMM or coverage statistics enter this comparison.
+    Seeds come from :func:`find_focal_ancestors`; ``focal_choice`` records
+    provenance only. Direct callers supply valid AC, budget, and choice values.
     """
-    for name, value, minimum in (
-        ("max_ac_cutoff", max_ac_cutoff, 1),
-        ("max_mismatches", max_mismatches, 0),
-        ("threads", threads, 1),
-    ):
-        if isinstance(value, bool) or not isinstance(value, int) or value < minimum:
-            raise ValueError(f"{name} must be an integer >= {minimum}")
-    arguments = (
+    data = _prepare(
         samples_path,
         ancestors_path,
         focal_ancestors_path,
-        ancestral_state,
         max_ac_cutoff,
         sample_selection,
     )
-    data = _prepare(*arguments)
     workers = min(threads, len(data.block_seeds))
     logger.info("Comparing %d associations with %d workers", len(data.focals), workers)
-    bounds = _collect_bounds(data, arguments, max_mismatches, threads)
-    if np.any(
-        (bounds.left < 0)
-        | (bounds.left > data.focals[:, None])
-        | (bounds.right <= data.focals[:, None])
-        | (bounds.right > data.num_sites)
-    ):
-        raise ValueError(
-            "Interval bounds must contain the chosen focal on the panel axis"
-        )
+    bounds = _collect_bounds(data, ancestors_path, max_mismatches, threads)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -432,5 +458,6 @@ def construct_focal_ancestor_intervals(
         num_sites=np.int64(data.num_sites),
         max_ac_cutoff=np.int64(max_ac_cutoff),
         max_mismatches=np.int64(max_mismatches),
+        focal_choice=np.asarray(focal_choice),
     )
     logger.info("Wrote %d associations to %s", len(data.focals), output_path)

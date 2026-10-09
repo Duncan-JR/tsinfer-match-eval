@@ -1,5 +1,6 @@
 data_dir: data/match_eval
 progress_dir: .progress
+focal_choice: left
 ac_cutoff: [3, 5, 10, 100, 600]
 haplotype_compare:
   max_mismatches: 2
@@ -22,13 +23,7 @@ datasets:
     # Native include and exclude are alternatives; null omits either key.
     include: 'POS >= 1000000 & POS < 11000000'
     matching_cache_size: 1024
-    sample_list: sample_lists/tgp_chr20_n100.csv
-    # Omit metadata_source to disable enrichment; ts uses the original ts_path.
-    metadata_source: csv
-    csv_path: ~/work/dphil-analysis/data/misc/tgp_3202_pedigree.csv
-    zarr_id_field: sample_id
-    csv_id_field: sample_id
-    pop_field: superpopulation
+    sample_list: data/sample_lists/tgp_chr20_n100.csv
 
 ancestor_chunk_size: 5000
 inference_threads: 1

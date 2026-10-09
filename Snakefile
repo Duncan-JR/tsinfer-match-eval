@@ -1,10 +1,31 @@
 import csv
 import pathlib
 
-from lib import ancestors, evaluation, haplotypes, matching, utils
+from lib import ancestors, haplotypes, matching, utils
 
 
 configfile: "config.yaml"
+
+focal_choice = config.get("focal_choice", "left")
+if focal_choice not in ("left", "right"):
+    raise ValueError("focal_choice must be exactly 'left' or 'right'")
+ac_cutoff = config["ac_cutoff"]
+if not isinstance(ac_cutoff, list) or len(ac_cutoff) == 0:
+    raise ValueError("ac_cutoff must be a nonempty list")
+if any(isinstance(value, bool) or not isinstance(value, int) for value in ac_cutoff):
+    raise ValueError("ac_cutoff values must be integers, not booleans")
+if any(value <= 0 for value in ac_cutoff) or any(
+    right <= left for left, right in zip(ac_cutoff, ac_cutoff[1:])
+):
+    raise ValueError("ac_cutoff must contain strictly increasing positive integers")
+max_ac_cutoff = max(ac_cutoff)
+max_mismatches = config["haplotype_compare"]["max_mismatches"]
+if (
+    isinstance(max_mismatches, bool)
+    or not isinstance(max_mismatches, int)
+    or max_mismatches < 0
+):
+    raise ValueError("haplotype_compare.max_mismatches must be an integer >= 0")
 
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
@@ -17,53 +38,11 @@ for dataset in datasets.values():
             sample_ids = [sample_id for row in csv.reader(sample_file) for sample_id in row]
         dataset["samples"] = ",".join(sample_ids)
 names = list(datasets)
-panels = [{"name": name, "kind": "inferred"} for name in names]
 
 
 def panel_config(wildcards):
     suffix = "ancestor_inference" if wildcards.kind == "inferred" else "true_ancestors"
     return data_dir / "configs" / f"{wildcards.name}_{suffix}.toml"
-
-
-def focal_dataframe(wildcards):
-    if wildcards.kind == "inferred":
-        return []
-    return [data_dir / "dataframes" / f"{wildcards.name}_true_ancestors.csv"]
-
-
-def metadata_input(wildcards):
-    dataset = datasets[wildcards.name]
-    source = dataset.get("metadata_source")
-    if source is None:
-        return []
-    if source == "ts":
-        field = "ts_path"
-    elif source == "csv":
-        field = "csv_path"
-    else:
-        raise ValueError(f"Unknown metadata_source: {source}")
-    if dataset.get(field) is None:
-        raise ValueError(f"metadata_source: {source} requires {field}")
-    return [pathlib.Path(dataset[field]).expanduser()]
-
-
-def metadata_params(wildcards):
-    dataset = datasets[wildcards.name]
-    fields = (
-        "metadata_source", "ts_path", "csv_path",
-        "zarr_id_field", "csv_id_field", "pop_field", "samples",
-    )
-    return {field: dataset.get(field) for field in fields}
-
-
-def enrich_populations(dataframe, samples_path, dataset):
-    metadata = utils.read_population_metadata(samples_path, dataset)
-    if metadata is None:
-        return dataframe
-    return dataframe.merge(
-        metadata, on=["source", "sample_id", "ploidy_index"],
-        how="left", validate="many_to_one", sort=False,
-    )
 
 
 wildcard_constraints:
@@ -73,26 +52,10 @@ wildcard_constraints:
 rule all:
     input:
         expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=names),
-        [
-            data_dir / "ancestors" / "{name}_{kind}_ancestors.trees".format(**panel)
-            for panel in panels
-        ],
-        [
-            data_dir / "focal_ancestors" / "{name}_{kind}_focal_ancestors.npz".format(**panel)
-            for panel in panels
-        ],
-        [
-            data_dir / "matches" / "{name}_{kind}_samples_raw.trees".format(**panel)
-            for panel in panels
-        ],
-        [
-            data_dir / "matches" / "{name}_{kind}_samples_matches.jsonl".format(**panel)
-            for panel in panels
-        ],
-        expand(
-            data_dir / "dataframes" / "{name}_inferred_focal_ancestor_stats.csv",
-            name=names,
-        ),
+        expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=names),
+        expand(data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz", name=names),
+        expand(data_dir / "matches" / "{name}_inferred_samples_raw.trees", name=names),
+        expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names),
         expand(
             data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
             name=names,
@@ -224,25 +187,21 @@ rule match_ancestors:
 rule find_focal_ancestors:
     input:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
-        ancestors=data_dir / "ancestors" / "{name}_{kind}_ancestors.zarr",
-        dataframe=focal_dataframe,
+        ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
     output:
-        data_dir / "focal_ancestors" / "{name}_{kind}_focal_ancestors.npz",
+        data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
     log:
-        progress_dir / "find_focal_ancestors" / "{name}_{kind}_find_focal_ancestors.log",
+        progress_dir / "find_focal_ancestors" / "{name}_inferred_find_focal_ancestors.log",
     params:
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
+        focal_choice=focal_choice,
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        dataframe_path = None
-        if wildcards.kind == "true":
-            dataframe_path = pathlib.Path(input.dataframe[0])
-        matching.find_focal_ancestors(
+        haplotypes.find_focal_ancestors(
             pathlib.Path(input.samples),
             pathlib.Path(input.ancestors),
             pathlib.Path(output[0]),
-            datasets[wildcards.name]["ancestral_state"],
-            dataframe_path,
+            params.focal_choice,
             params.samples,
         )
 
@@ -256,9 +215,9 @@ rule construct_focal_ancestor_intervals:
         data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
     params:
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
-        max_ac_cutoff=max(config["ac_cutoff"]),
-        max_mismatches=config["haplotype_compare"]["max_mismatches"],
-        ancestral_state=lambda wildcards: datasets[wildcards.name]["ancestral_state"],
+        max_ac_cutoff=max_ac_cutoff,
+        max_mismatches=max_mismatches,
+        focal_choice=focal_choice,
     threads: workflow.cores
     log:
         progress_dir / "construct_focal_ancestor_intervals" / "{name}_inferred_construct_focal_ancestor_intervals.log",
@@ -269,10 +228,10 @@ rule construct_focal_ancestor_intervals:
             pathlib.Path(input.ancestors),
             pathlib.Path(input.focal),
             pathlib.Path(output[0]),
-            params.ancestral_state,
             params.max_ac_cutoff,
             params.max_mismatches,
             threads,
+            params.focal_choice,
             params.samples,
         )
 
@@ -300,36 +259,3 @@ rule match_samples:
             threads,
             params.cache_size,
         )
-
-
-rule compute_focal_ancestor_stats:
-    input:
-        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
-        metadata=metadata_input,
-        focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
-        reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
-        matches=data_dir / "matches" / "{name}_inferred_samples_matches.jsonl",
-        config=data_dir / "configs" / "{name}_ancestor_inference.toml",
-    output:
-        data_dir / "dataframes" / "{name}_inferred_focal_ancestor_stats.csv",
-    params:
-        metadata=metadata_params,
-        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
-        ac_cutoff=config["ac_cutoff"],
-    log:
-        progress_dir / "compute_focal_ancestor_stats" / "{name}_inferred_compute_focal_ancestor_stats.log",
-    run:
-        utils.setup_log(pathlib.Path(log[0]))
-        dataframe = evaluation.compute_focal_ancestor_stats(
-            pathlib.Path(input.focal),
-            pathlib.Path(input.reference),
-            pathlib.Path(input.matches),
-            pathlib.Path(input.config),
-            params.ac_cutoff,
-        )
-        dataframe.insert(0, "panel_kind", "inferred")
-        dataframe.insert(0, "dataset", wildcards.name)
-        dataframe = enrich_populations(
-            dataframe, pathlib.Path(input.samples), datasets[wildcards.name]
-        )
-        dataframe.to_csv(output[0], index=False)

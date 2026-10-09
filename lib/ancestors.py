@@ -61,8 +61,8 @@ def extract_true_ancestors(
     describes the selected terminal origin, including at recurrent sites.
 
     true_node_id refers to the original truth TS. Haplotypes retain final states,
-    missing calls, and original node times. :func:`lib.matching.find_focal_ancestors`
-    uses only rows with an eligible ancestor association.
+    missing calls, and original node times. This extraction is available only
+    through explicit true-panel targets, outside inferred focal generation.
     """
     inferred = tsinfer.vcz.open_store(inferred_path)
     samples = tsinfer.vcz.open_store(samples_path)
