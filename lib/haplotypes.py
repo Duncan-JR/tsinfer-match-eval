@@ -1,8 +1,9 @@
 """Inferred focal candidates, direct intervals, and their coverage masks."""
 
+import concurrent.futures as cf
 import dataclasses
+import itertools
 import logging
-import multiprocessing
 import pathlib
 
 import numba
@@ -22,13 +23,16 @@ class SampleHaplotypes:
     sample_rows: np.ndarray
 
 
-def _load_sample_haplotypes(samples, panel, sample_selection):
+def _load_sample_haplotypes(samples, panel, sample_selection, site_indices=None):
     """Polarise sample allele strings using the inferred panel's ancestry.
 
     Shared by :func:`find_focal_ancestors` and interval :func:`_prepare`.
-    Check the cross-store position mapping at this loading boundary.
+    Check the cross-store position mapping at this loading boundary. Optional
+    ``site_indices`` restrict calls and polarisation to selected panel sites.
     """
     positions = panel["variant_position"][:]
+    if site_indices is not None:
+        positions = positions[site_indices]
     sample_positions = samples["variant_position"][:]
     rows = np.searchsorted(sample_positions, positions)
     present = rows < len(sample_positions)
@@ -39,7 +43,10 @@ def _load_sample_haplotypes(samples, panel, sample_selection):
     columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
     genotypes = samples["call_genotype"].oindex[rows, columns, :]
     alleles = samples["variant_allele"].oindex[rows, :]
-    ancestral = panel["variant_allele"][:, 0]
+    if site_indices is None:
+        ancestral = panel["variant_allele"][:, 0]
+    else:
+        ancestral = panel["variant_allele"].oindex[site_indices, 0]
     called = genotypes >= 0
     allele_indices = np.maximum(genotypes, 0)
     called_alleles = np.take_along_axis(alleles[:, None, :], allele_indices, axis=2)
@@ -85,17 +92,20 @@ def find_focal_ancestors(
     """
     samples = tsinfer.vcz.open_store(samples_path)
     panel = tsinfer.vcz.open_store(ancestors_path)
-    haplotypes = _load_sample_haplotypes(samples, panel, sample_selection)
     focal_sites = _select_focal_sites(panel, focal_choice)
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
     anchored = np.flatnonzero(focal_sites >= 0)
-    seed_rows = haplotypes.sample_rows[focal_sites[anchored]]
+    seed_sites, seed_indices = np.unique(focal_sites[anchored], return_inverse=True)
+    haplotypes = _load_sample_haplotypes(
+        samples, panel, sample_selection, site_indices=seed_sites
+    )
+    seed_rows = haplotypes.sample_rows[seed_indices]
     derived_ac = np.zeros(len(ancestor_ids), dtype=np.int64)
     derived_ac[anchored] = samples["variant_match_eval_derived_ac"].oindex[seed_rows]
     offsets = [0]
     candidate_rows = []
     for haplotype in range(len(haplotypes.sample_id)):
-        seed_calls = haplotypes.calls[focal_sites[anchored], haplotype]
+        seed_calls = haplotypes.calls[seed_indices, haplotype]
         candidates = anchored[seed_calls == 1]
         candidate_rows.append(candidates)
         offsets.append(offsets[-1] + len(candidates))
@@ -242,7 +252,7 @@ def _prepare(
     )
 
 
-@numba.njit
+@numba.njit(nogil=True)
 def _sweep_block(
     genotypes,
     site_start,
@@ -373,20 +383,12 @@ def _block_bounds(data, block, max_mismatches):
     return BlockBounds(seeds, left, right)
 
 
-def _initialise_worker(data, ancestors_path, max_mismatches):
-    """Reuse prepared associations and open a read-only panel in each worker."""
-    global _worker_data, _worker_max_mismatches
-    panel = tsinfer.vcz.open_store(ancestors_path)
-    _worker_data = dataclasses.replace(data, panel=panel)
-    _worker_max_mismatches = max_mismatches
+def _collect_bounds(data, max_mismatches, threads):
+    """Run independent block sweeps with shared read-only calls and associations.
 
-
-def _worker_block(block):
-    return _block_bounds(_worker_data, block, _worker_max_mismatches)
-
-
-def _collect_bounds(data, ancestors_path, max_mismatches, threads):
-    """Assemble block results in canonical association order; propagate failures."""
+    The Numba sweep releases the GIL. Each block owns its state and outputs;
+    assemble results in canonical association order and propagate failures.
+    """
     if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
         raise ValueError("threads must be an integer >= 1")
     shape = (len(data.focals), max_mismatches + 1)
@@ -399,17 +401,16 @@ def _collect_bounds(data, ancestors_path, max_mismatches, threads):
             left[result.seeds] = result.left
             right[result.seeds] = result.right
     else:
-        context = multiprocessing.get_context("spawn")
-        worker_data = dataclasses.replace(data, panel=None)
-        with context.Pool(
-            workers,
-            initializer=_initialise_worker,
-            initargs=(worker_data, ancestors_path, max_mismatches),
-        ) as pool:
-            results = pool.imap_unordered(_worker_block, data.block_seeds, chunksize=1)
-            for result in results:
+        with cf.ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = {
+                executor.submit(_block_bounds, data, block, max_mismatches): block
+                for block in data.block_seeds
+            }
+            for future in cf.as_completed(futures):
+                result = future.result()
                 left[result.seeds] = result.left
                 right[result.seeds] = result.right
+                del futures[future]
     return IntervalBounds(left, right)
 
 
@@ -445,7 +446,7 @@ def make_ancestor_intervals(
     )
     workers = min(threads, len(data.block_seeds))
     logger.info("Comparing %d associations with %d workers", len(data.focals), workers)
-    bounds = _collect_bounds(data, ancestors_path, max_mismatches, threads)
+    bounds = _collect_bounds(data, max_mismatches, threads)
     output_path.parent.mkdir(parents=True, exist_ok=True)
     np.savez_compressed(
         output_path,
@@ -469,21 +470,43 @@ def make_focal_mask(
     ac_cutoff: int,
     max_mismatches: int,
 ) -> None:
+    """Write one coverage mask; see :func:`make_focal_masks` for batch generation."""
+    make_focal_masks(intervals_path, [output_path], [ac_cutoff], [max_mismatches])
+
+
+def make_focal_masks(
+    intervals_path: pathlib.Path,
+    output_paths: list[pathlib.Path],
+    ac_cutoffs: list[int],
+    max_mismatches: list[int],
+) -> None:
+    """Load intervals once and write every requested cutoff/budget mask.
+
+    ``output_paths`` follows cutoff-major, then budget order, matching the
+    Snakefile's expansion. Each output keeps :func:`make_focal_mask`'s format.
+    """
+    with np.load(intervals_path, allow_pickle=False) as archive:
+        intervals = {name: archive[name] for name in archive.files}
+    selections = itertools.product(ac_cutoffs, max_mismatches)
+    for output_path, (cutoff, budget) in zip(output_paths, selections, strict=True):
+        _write_focal_mask(intervals, output_path, cutoff, budget)
+
+
+def _write_focal_mask(intervals, output_path, ac_cutoff, max_mismatches):
     """Partition the inference-site axis into focal-covered and all-gap runs.
 
     Union eligible associations from :func:`make_ancestor_intervals`, merging
     touching bounds. Keep its complete haplotype roster, including empty slices.
     The Snakefile supplies an AC cutoff and budget within the generated maxima.
     """
-    with np.load(intervals_path, allow_pickle=False) as intervals:
-        sample_id = intervals["sample_id"]
-        ploidy_index = intervals["ploidy_index"]
-        association_offsets = intervals["offsets"]
-        focal_ac = intervals["focal_ac"]
-        left = intervals["left_site_index"][:, max_mismatches]
-        right = intervals["right_site_index"][:, max_mismatches]
-        num_sites = int(intervals["num_sites"])
-        focal_choice = intervals["focal_choice"]
+    sample_id = intervals["sample_id"]
+    ploidy_index = intervals["ploidy_index"]
+    association_offsets = intervals["offsets"]
+    focal_ac = intervals["focal_ac"]
+    left = intervals["left_site_index"][:, max_mismatches]
+    right = intervals["right_site_index"][:, max_mismatches]
+    num_sites = int(intervals["num_sites"])
+    focal_choice = intervals["focal_choice"]
 
     offsets = [0]
     run_left = []

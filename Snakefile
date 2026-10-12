@@ -261,16 +261,19 @@ rule make_focal_mask:
     input:
         data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
     output:
-        data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_focal_mask.npz",
+        expand(
+            data_dir / "focal_masks" / "{{name}}_inferred_ac{ac}_k{k}_focal_mask.npz",
+            ac=ac_cutoff, k=max_mismatches,
+        ),
     params:
-        ac_cutoff=lambda wildcards: int(wildcards.ac),
-        max_mismatches=lambda wildcards: int(wildcards.k),
+        ac_cutoff=ac_cutoff,
+        max_mismatches=max_mismatches,
     log:
-        progress_dir / "make_focal_mask" / "{name}_inferred_ac{ac}_k{k}_make_focal_mask.log",
+        progress_dir / "make_focal_mask" / "{name}_inferred_make_focal_mask.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        haplotypes.make_focal_mask(
-            pathlib.Path(input[0]), pathlib.Path(output[0]),
+        haplotypes.make_focal_masks(
+            pathlib.Path(input[0]), [pathlib.Path(path) for path in output],
             params.ac_cutoff, params.max_mismatches,
         )
 

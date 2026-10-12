@@ -1,5 +1,9 @@
 # Stitched matching from focal coverage masks
 
+The whole-genome reduced pass and process orchestration below are superseded by
+[fast_stitched_matching.md](fast_stitched_matching.md). The pipeline now matches
+focal and gap components independently and shares inputs across threads.
+
 ## Approach
 
 For each haplotype and AC cutoff, simplify the ancestor reference to its focal

@@ -1,10 +1,11 @@
 """Full-reference and focal-mask stitched sample matching."""
 
+import concurrent.futures as cf
 import dataclasses
 import json
 import logging
-import multiprocessing
 import pathlib
+import threading
 
 import numpy as np
 import tsinfer
@@ -102,7 +103,7 @@ def simplify_ancestors_ts(
     """Retain roots and eligible panel candidates for one haplotype.
 
     ``ancestor_nodes`` joins panel IDs to reference node metadata once per
-    worker. Candidate columns are resolved through this join, never used as
+    dataset. Candidate columns are resolved through this join, never used as
     node IDs. Retained internal ancestors remain available copying states.
     """
     start = focal["offsets"][haplotype_index]
@@ -146,8 +147,8 @@ def merge_paths(
     """Encode the finished stitched domain as native paths and mutations.
 
     Adjacent equal parents merge across seams. Only called observations that
-    disagree with the final copied alleles create mutations; discarded reduced
-    gap mismatches therefore never enter the output.
+    disagree with the final copied alleles create mutations. Missing
+    observations never create mutations.
     """
     domain_parents = parents[start:end]
     switches = np.flatnonzero(domain_parents[1:] != domain_parents[:-1]) + start + 1
@@ -176,8 +177,8 @@ def merge_paths(
 
 
 @dataclasses.dataclass
-class StitchedWorker:
-    """Read-only inputs and mutable full-reference HMM owned by one worker."""
+class StitchedInputs:
+    """Reference, indexes, and read-only inputs shared by matching threads."""
 
     ancestors_ts: tskit.TreeSequence
     positions: np.ndarray
@@ -188,17 +189,16 @@ class StitchedWorker:
     num_alleles: np.ndarray
     recombination: np.ndarray
     mismatch: np.ndarray
-    full_matcher: tsinfer.matching.AncestorMatcher
+    full_indexes: tsinfer.matching.MatcherIndexes
     ac_cutoff: int
-    method: str
 
 
 @dataclasses.dataclass
-class ObservedHaplotype:
-    """One native job and its single reader observation, queued to a worker."""
+class StitchedWorker:
+    """Shared inputs and a reusable full-reference HMM owned by one thread."""
 
-    job: tsinfer.config.MatchJob
-    haplotype: np.ndarray
+    inputs: StitchedInputs
+    full_matcher: tsinfer.matching.AncestorMatcher
 
 
 @dataclasses.dataclass
@@ -209,19 +209,16 @@ class StitchedResults:
     results: dict[int, tsinfer.matching.MatchResult]
 
 
-def _initialise_stitched_worker(
-    ancestors_ts_path,
+def _prepare_stitched_inputs(
+    ancestors_ts,
+    positions,
     focal_path,
     mask_paths,
     ac_cutoff,
-    method,
     num_alleles,
     source_config,
 ):
-    """Load reference and masks and create full-reference indexes once."""
-    global _stitched_worker
-    ancestors_ts = tskit.load(ancestors_ts_path)
-    positions = ancestors_ts.sites_position.astype(np.int32)
+    """Load focal archives and masks and create shared indexes once."""
     with np.load(focal_path, allow_pickle=False) as archive:
         focal = {name: archive[name] for name in archive.files}
     masks = {}
@@ -241,8 +238,7 @@ def _initialise_stitched_worker(
     indexes = tsinfer.matching.MatcherIndexes(
         ancestors_ts, vestigial_root=False, num_alleles=num_alleles
     )
-    full_matcher = tsinfer.matching.AncestorMatcher(indexes, recombination, mismatch)
-    _stitched_worker = StitchedWorker(
+    return StitchedInputs(
         ancestors_ts=ancestors_ts,
         positions=positions,
         focal=focal,
@@ -252,22 +248,24 @@ def _initialise_stitched_worker(
         num_alleles=num_alleles,
         recombination=recombination,
         mismatch=mismatch,
-        full_matcher=full_matcher,
+        full_indexes=indexes,
         ac_cutoff=ac_cutoff,
-        method=method,
     )
 
 
 def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
-    """Reuse one whole-genome focal HMM, then fill each budget's mask gaps.
+    """Match each focal and gap run independently for every mask budget.
 
     Coverage is determined solely by :func:`lib.haplotypes.make_focal_mask`.
-    Gap HMMs start independently at inference-interval boundaries, using the
-    full observed array with absolute site indices and neutral missing calls.
+    Both kinds of run split at inference-interval boundaries and use absolute
+    site indices with neutral missing calls. One reduced reference and matcher
+    are reused across budgets; paths are recomputed for each component because
+    its endpoints determine the independent HMM optimisation.
     """
     if method != "hmm":
         raise ValueError("Only focal method 'hmm' is supported")
-    num_sites = len(worker.positions)
+    inputs = worker.inputs
+    num_sites = len(inputs.positions)
     called_sites = np.flatnonzero(haplotype >= 0)
     start, end = 0, num_sites
     if len(called_sites) > 0:
@@ -275,41 +273,36 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
         end = int(called_sites[-1]) + 1
     mask_slices = {}
     has_coverage = False
-    for budget, mask in worker.masks.items():
+    for budget, mask in inputs.masks.items():
         run_start = mask["offsets"][job.haplotype_index]
         run_end = mask["offsets"][job.haplotype_index + 1]
         mask_slices[budget] = slice(run_start, run_end)
-        has_coverage |= bool(np.any(~mask["is_gap"][run_start:run_end]))
+        covered = ~mask["is_gap"][run_start:run_end]
+        overlaps = mask["left_site_index"][run_start:run_end] < end
+        overlaps &= mask["right_site_index"][run_start:run_end] > start
+        has_coverage |= bool(np.any(covered & overlaps))
 
     match_out = np.empty(num_sites, dtype=np.int8)
-    focal_match = None
+    focal_matcher = None
     if has_coverage:
         reduced = simplify_ancestors_ts(
-            worker.ancestors_ts,
-            worker.focal,
-            worker.ancestor_nodes,
+            inputs.ancestors_ts,
+            inputs.focal,
+            inputs.ancestor_nodes,
             job.haplotype_index,
-            worker.ac_cutoff,
+            inputs.ac_cutoff,
         )
         indexes = tsinfer.matching.MatcherIndexes(
-            reduced.ts, vestigial_root=False, num_alleles=worker.num_alleles
+            reduced.ts, vestigial_root=False, num_alleles=inputs.num_alleles
         )
-        matcher = tsinfer.matching.AncestorMatcher(
-            indexes, worker.recombination, worker.mismatch
+        focal_matcher = tsinfer.matching.AncestorMatcher(
+            indexes, inputs.recombination, inputs.mismatch
         )
-        focal_match = _match_region(
-            matcher, haplotype, 0, num_sites, worker.positions, match_out
-        )
-        focal_match.parents = reduced.original_nodes[focal_match.parents]
 
     results = {}
-    for budget, mask in worker.masks.items():
-        if focal_match is None:
-            parents = np.empty(num_sites, dtype=np.int32)
-            copied_alleles = np.empty(num_sites, dtype=np.int8)
-        else:
-            parents = focal_match.parents.copy()
-            copied_alleles = focal_match.copied_alleles.copy()
+    for budget, mask in inputs.masks.items():
+        parents = np.empty(num_sites, dtype=np.int32)
+        copied_alleles = np.empty(num_sites, dtype=np.int8)
         run_slice = mask_slices[budget]
         runs = zip(
             mask["left_site_index"][run_slice],
@@ -320,44 +313,49 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
         for left, right, is_gap in runs:
             left = max(start, int(left))
             right = min(end, int(right))
-            if not is_gap or left >= right:
+            if left >= right:
                 continue
-            boundaries = worker.interval_boundaries
+            boundaries = inputs.interval_boundaries
             internal = boundaries[(boundaries > left) & (boundaries < right)]
-            gap_bounds = [left, *internal, right]
-            for gap_start, gap_end in zip(gap_bounds[:-1], gap_bounds[1:], strict=True):
-                gap_match = _match_region(
-                    worker.full_matcher,
+            run_bounds = [left, *internal, right]
+            matcher = worker.full_matcher if is_gap else focal_matcher
+            for run_start, run_end in zip(run_bounds[:-1], run_bounds[1:], strict=True):
+                region = _match_region(
+                    matcher,
                     haplotype,
-                    gap_start,
-                    gap_end,
-                    worker.positions,
+                    run_start,
+                    run_end,
+                    inputs.positions,
                     match_out,
                 )
-                parents[gap_start:gap_end] = gap_match.parents
-                copied_alleles[gap_start:gap_end] = gap_match.copied_alleles
+                region_parents = region.parents
+                if not is_gap:
+                    region_parents = reduced.original_nodes[region_parents]
+                parents[run_start:run_end] = region_parents
+                copied_alleles[run_start:run_end] = region.copied_alleles
         results[budget] = merge_paths(
             parents,
             copied_alleles,
             haplotype,
-            worker.positions,
-            worker.ancestors_ts.sequence_length,
+            inputs.positions,
+            inputs.ancestors_ts.sequence_length,
             start,
             end,
         )
     return StitchedResults(job, results)
 
 
-def _worker_stitched_haplotype(task):
-    return match_stitched_haplotype(
-        task.job, task.haplotype, _stitched_worker, method=_stitched_worker.method
-    )
-
-
-def _observed_haplotypes(jobs, reader):
-    for job in jobs:
-        haplotype = np.asarray(reader.read_haplotype(job), dtype=np.int8)
-        yield ObservedHaplotype(job, haplotype)
+def _worker_stitched_haplotype(job, reader, inputs, thread_state, method):
+    """Read one haplotype in its task and reuse the thread's full matcher."""
+    worker = getattr(thread_state, "worker", None)
+    if worker is None:
+        matcher = tsinfer.matching.AncestorMatcher(
+            inputs.full_indexes, inputs.recombination, inputs.mismatch
+        )
+        worker = StitchedWorker(inputs, matcher)
+        thread_state.worker = worker
+    haplotype = np.asarray(reader.read_haplotype(job), dtype=np.int8)
+    return match_stitched_haplotype(job, haplotype, worker, method=method)
 
 
 def _write_stitched_matches(path, paired_results, ac_cutoff, max_mismatches, method):
@@ -397,9 +395,11 @@ def match_stitched_samples(
 ) -> None:
     """Match one dataset/cutoff/method across all budgets and assemble raw TSs.
 
-    Each native haplotype is read once. Queued worker tasks reuse their full
-    matcher and transient reduced reference across budgets. Native
-    ``extend_ts`` preserves original reference node IDs and adds one node per
+    Each native haplotype is read once inside its task. Threads share the
+    reference, indexes and reader, reusing one full matcher per thread and one
+    transient reduced matcher per haplotype across budgets. Simplification
+    holds the GIL; threads parallelise HMM calls, not reference preparation.
+    Native ``extend_ts`` preserves original reference node IDs and adds one node per
     haplotype, along with individual/population assignments and mutations.
     """
     if method != "hmm":
@@ -423,28 +423,39 @@ def match_stitched_samples(
         num_threads=workers,
     )
     try:
-        initargs = (
-            ancestors_ts_path,
+        inputs = _prepare_stitched_inputs(
+            ancestors_ts,
+            positions,
             focal_path,
             mask_paths,
             ac_cutoff,
-            method,
             reader.get_num_alleles(),
             cfg.match.sources["samples"],
         )
-        tasks = _observed_haplotypes(jobs, reader)
-        logger.info("Stitching %d haplotypes with %d workers", len(jobs), workers)
+        thread_state = threading.local()
+        logger.info("Stitching %d haplotypes with %d threads", len(jobs), workers)
         if workers == 1:
-            _initialise_stitched_worker(*initargs)
-            results = [_worker_stitched_haplotype(task) for task in tasks]
+            results = [
+                _worker_stitched_haplotype(job, reader, inputs, thread_state, method)
+                for job in jobs
+            ]
         else:
-            context = multiprocessing.get_context("spawn")
-            with context.Pool(
-                workers, initializer=_initialise_stitched_worker, initargs=initargs
-            ) as pool:
-                results = list(
-                    pool.imap_unordered(_worker_stitched_haplotype, tasks, chunksize=1)
-                )
+            with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
+                futures = {
+                    executor.submit(
+                        _worker_stitched_haplotype,
+                        job,
+                        reader,
+                        inputs,
+                        thread_state,
+                        method,
+                    ): job
+                    for job in jobs
+                }
+                results = []
+                for future in cf.as_completed(futures):
+                    results.append(future.result())
+                    del futures[future]
         results.sort(key=lambda result: result.job.haplotype_index)
         outputs = zip(max_mismatches, output_paths, match_file_paths, strict=True)
         for budget, output_path, match_file_path in outputs:
