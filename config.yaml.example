@@ -4,6 +4,8 @@ focal_choice: left
 ac_cutoff: [3, 5, 10]
 max_mismatches: [0, 1]
 focal_methods: [hmm]
+# To compare exact greedy covers with the reduced HMM, use
+# max_mismatches: [0] and focal_methods: [hmm, greedy].
 hmm:
   recombination: 0.01
   mismatch: 1.0e-20

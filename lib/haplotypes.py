@@ -141,6 +141,7 @@ class ComparisonData:
     calls: np.ndarray
     sample_ids: np.ndarray
     ploidy_indices: np.ndarray
+    ancestor_ids: np.ndarray
     offsets: np.ndarray
     focal_ac: np.ndarray
     haplotypes: np.ndarray
@@ -239,6 +240,7 @@ def _prepare(
         calls=loaded.calls,
         sample_ids=loaded.sample_id,
         ploidy_indices=loaded.ploidy_index,
+        ancestor_ids=ancestor_ids,
         offsets=np.asarray(output_offsets, dtype=np.int64),
         focal_ac=focal_ac,
         haplotypes=haplotypes,
@@ -429,6 +431,8 @@ def make_ancestor_intervals(
 
     One association per eligible ancestor is retained in focal-NPZ haplotype
     order, then increasing ancestor column. Exact AC uses an inclusive maximum.
+    ``ancestor_id`` stores panel IDs once; ``ancestor_index`` maps each
+    association to that dictionary, independently of the candidate archive.
     Budget column k tolerates k called mismatches on each side; the matching
     derived focal consumes neither budget. Missing calls terminate extension.
     Bounds are half-open on the inferred panel axis and confined to ancestor
@@ -453,6 +457,8 @@ def make_ancestor_intervals(
         sample_id=data.sample_ids,
         ploidy_index=data.ploidy_indices,
         offsets=data.offsets,
+        ancestor_id=data.ancestor_ids,
+        ancestor_index=data.ancestors,
         focal_ac=data.focal_ac,
         left_site_index=bounds.left,
         right_site_index=bounds.right,

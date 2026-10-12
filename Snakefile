@@ -30,8 +30,14 @@ if any(value < 0 for value in max_mismatches) or any(
     raise ValueError("max_mismatches must contain strictly increasing nonnegative integers")
 max_mismatch_budget = max(max_mismatches)
 focal_methods = config["focal_methods"]
-if not isinstance(focal_methods, list) or focal_methods != ["hmm"]:
-    raise ValueError("focal_methods must be the list ['hmm']")
+if not isinstance(focal_methods, list) or len(focal_methods) == 0:
+    raise ValueError("focal_methods must be a nonempty list")
+if any(method not in ("hmm", "greedy") for method in focal_methods):
+    raise ValueError("focal_methods may contain only 'hmm' and 'greedy'")
+if len(set(focal_methods)) != len(focal_methods):
+    raise ValueError("focal_methods must not contain duplicates")
+if "greedy" in focal_methods and max_mismatches != [0]:
+    raise ValueError("Greedy focal matching requires max_mismatches: [0]")
 
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
@@ -283,7 +289,14 @@ rule match_stitched_samples:
         reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",
-        focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+        focal=lambda wildcards: (
+            [data_dir / "focal_ancestors" / f"{wildcards.name}_inferred_focal_ancestors.npz"]
+            if wildcards.method == "hmm" else []
+        ),
+        intervals=lambda wildcards: (
+            [data_dir / "haplotype_intervals" / f"{wildcards.name}_inferred_focal_ancestor_intervals.npz"]
+            if wildcards.method == "greedy" else []
+        ),
         masks=expand(
             data_dir / "focal_masks" / "{{name}}_inferred_ac{{ac}}_k{k}_focal_mask.npz",
             k=max_mismatches,
@@ -308,12 +321,15 @@ rule match_stitched_samples:
         utils.setup_log(pathlib.Path(log[0]))
         matching.match_stitched_samples(
             pathlib.Path(input.config), pathlib.Path(input.reference),
-            pathlib.Path(input.focal),
+            pathlib.Path(input.focal[0]) if len(input.focal) > 0 else None,
             [pathlib.Path(path) for path in input.masks],
             [pathlib.Path(path) for path in output.trees],
             [pathlib.Path(path) for path in output.matches],
             params.ac_cutoff, params.max_mismatches, wildcards.method,
             threads, params.cache_size,
+            intervals_path=(
+                pathlib.Path(input.intervals[0]) if len(input.intervals) > 0 else None
+            ),
         )
 
 

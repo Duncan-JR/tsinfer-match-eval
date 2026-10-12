@@ -2,8 +2,9 @@
 
 A Snakemake pipeline that builds inferred ancestor panels, matches ancestors and
 samples separately against the full reference, and generates focal candidates
-and direct focal-ancestor intervals. It also matches samples against reduced
-focal references and stitches full-reference gap matches into those paths.
+and direct focal-ancestor intervals. It constructs focal paths using either a
+reduced-reference HMM or an exact greedy interval cover, then stitches
+full-reference gap matches into those paths.
 It uses an editable `../tsinfer` checkout
 and calls functions in `lib` directly. True-panel extraction and matching remain
 available through explicit targets, outside the default workflow.
@@ -53,7 +54,8 @@ supply a valid choice themselves.
 
 `ac_cutoff` is a nonempty, strictly increasing list of positive integers.
 `max_mismatches` is a nonempty, strictly increasing list of nonnegative integers.
-Both exclude booleans. `focal_methods` currently accepts only `[hmm]`.
+Both exclude booleans. `focal_methods` accepts `hmm`, `greedy`, or both, without
+duplicates. The greedy method requires `max_mismatches: [0]`.
 For example:
 
 ```yaml
@@ -61,6 +63,11 @@ ac_cutoff: [3, 5, 10]
 max_mismatches: [0, 1]
 focal_methods: [hmm]
 ```
+
+To compare the exact greedy cover with the reduced HMM, use
+`max_mismatches: [0]` and `focal_methods: [hmm, greedy]`. Regenerate interval
+archives with `--forcerun make_ancestor_intervals` to save ancestor identities
+before using greedy matching. Existing archives are not migrated.
 
 Only the numeric maxima affect interval generation: this example uses inclusive
 AC 10 and generates budget columns 0 and 1. Smaller list members select masks
@@ -185,7 +192,8 @@ identity and order once, filters candidates by `derived_ac <= max_ac_cutoff`,
 and reuses their saved seeds. No seed is selected again. Neither endpoint is
 assumed to produce the same tract or candidate set as the other.
 
-For H haplotypes, P eligible associations, and B = max_mismatches + 1, the
+For H haplotypes, A panel ancestors, P eligible associations, and
+B = max_mismatches + 1, the
 interval NPZ contains:
 
 | Field | Shape | Meaning |
@@ -193,6 +201,8 @@ interval NPZ contains:
 | `sample_id` | `(H,)` | Unicode IDs in candidate haplotype order |
 | `ploidy_index` | `(H,)` | int64 chromosome index within each sample |
 | `offsets` | `(H + 1,)` | int64 association boundaries |
+| `ancestor_id` | `(A,)` | Unicode panel IDs, stored once per ancestor |
+| `ancestor_index` | `(P,)` | int64 panel column for each association |
 | `focal_ac` | `(P,)` | int64 exact selected-seed AC per association |
 | `left_site_index` | `(P, B)` | int64 inclusive left bounds, column k for budget k |
 | `right_site_index` | `(P, B)` | int64 exclusive right bounds, column k for budget k |
@@ -204,8 +214,10 @@ interval NPZ contains:
 Associations follow haplotype order then increasing ancestor column. Distinct
 ancestors with identical bounds remain separate. Empty slices and both ploidy
 copies remain in the roster; an entirely empty result has bounds `(0, B)`.
-Ancestor IDs and seeds are available in the candidate archive rather than
-repeated in the interval archive. Lower cutoffs select `focal_ac <= cutoff`
+Association i has identity `ancestor_id[ancestor_index[i]]`; these indices are
+panel columns, never TS node IDs. This dictionary avoids repeating strings for
+every association. Seeds remain in the candidate archive.
+Lower cutoffs select `focal_ac <= cutoff`
 without repeating comparisons.
 
 Budget k permits k mismatches independently on each side of the matching seed;
@@ -262,7 +274,7 @@ One transient reduced matcher is reused across every budget, and copied parent
 IDs are mapped back to the original reference. Haplotypes without focal coverage
 in the called-site domain skip reduction.
 
-For each k, each maximal focal run receives an independent reduced-reference
+For `method="hmm"`, each maximal focal run receives an independent reduced-reference
 HMM match and each gap an independent full-reference match. Both kinds of run
 are clipped to the called-site domain and split at inference-interval boundaries
 from reference metadata. Paths are recomputed for each budget's components:
@@ -283,8 +295,34 @@ reference. It remains raw and unsimplified, preserves original reference node
 IDs, and adds one sample node per haplotype with native individual/population
 assignments. JSONL uses the baseline fields below plus `ac_cutoff`,
 `max_mismatches`, and `method`, ordered by native `haplotype_index`.
-Only focal `method="hmm"` is implemented. Greedy matching, boundary
-conditioning, sparse node resets, cross-sample reference caching, and finer
+For `method="greedy"`, ancestor identities and bounds come directly from the
+interval archive; the candidate archive and reduced reference are not loaded.
+For each focal component, start at its first uncovered site and choose an
+eligible interval containing that site with the furthest exclusive right bound.
+Copy until that bound and repeat, accepting touching intervals. Equal reaches
+keep the first interval in stable left-bound order. The sweep visits each
+eligible interval once after sorting, costs O(M log M + N) per haplotype, and
+uses O(M + N) working memory for M intervals and N inference sites. Numba
+releases the GIL. The first call also incurs compilation overhead.
+
+This is an optimal minimum-switch cover of the **saved exact intervals**.
+With uniform initial state probabilities and constant recombination
+probabilities, all exact paths have the same emission likelihood and each
+additional switch multiplies the likelihood by
+`(rho / n) / (1 - rho + rho / n)`, so minimising switches maximises likelihood
+within that restricted state space. The reduced HMM can also copy retained
+internal nodes and matching tracts outside the saved focal intervals; its
+minimum can therefore be smaller. Positive HMM mismatch probability can favour
+a mismatch over sufficiently many switches even when an exact cover exists.
+Different parents or switch positions can also be equally optimal.
+
+Greedy matches stop at each focal component's end; full-reference HMM calls
+still resolve gaps, and native assembly merges equal parents across seams.
+Inference boundaries are respected because saved intervals cannot cross them.
+There is no endpoint conditioning, so minimising focal switches does not
+minimise total switches across gap seams. Mismatch-tolerant intervals require
+emission costs and are rejected by this first greedy implementation.
+Boundary conditioning, sparse node resets, cross-sample reference caching, and finer
 region scheduling remain later work. Regional matching relies on the tsinfer
 changes in the fast stitched plan; endpoint edge scans and genome-sized native
 allocation sizes remain explicit limitations.

@@ -7,6 +7,7 @@ import logging
 import pathlib
 import threading
 
+import numba
 import numpy as np
 import tsinfer
 import tskit
@@ -182,7 +183,7 @@ class StitchedInputs:
 
     ancestors_ts: tskit.TreeSequence
     positions: np.ndarray
-    focal: dict
+    focal: dict | None
     masks: dict
     ancestor_nodes: dict
     interval_boundaries: np.ndarray
@@ -191,6 +192,8 @@ class StitchedInputs:
     mismatch: np.ndarray
     full_indexes: tsinfer.matching.MatcherIndexes
     ac_cutoff: int
+    intervals: dict | None = None
+    interval_nodes: np.ndarray | None = None
 
 
 @dataclasses.dataclass
@@ -217,10 +220,13 @@ def _prepare_stitched_inputs(
     ac_cutoff,
     num_alleles,
     source_config,
+    intervals_path=None,
 ):
     """Load focal archives and masks and create shared indexes once."""
-    with np.load(focal_path, allow_pickle=False) as archive:
-        focal = {name: archive[name] for name in archive.files}
+    focal = None
+    if focal_path is not None:
+        with np.load(focal_path, allow_pickle=False) as archive:
+            focal = {name: archive[name] for name in archive.files}
     masks = {}
     for mask_path in mask_paths:
         with np.load(mask_path, allow_pickle=False) as archive:
@@ -231,6 +237,26 @@ def _prepare_stitched_inputs(
         metadata = node.metadata
         if metadata.get("source") == "ancestors" and metadata["ploidy_index"] == 0:
             ancestor_nodes[metadata["sample_id"]] = node.id
+    ancestor_intervals = None
+    interval_nodes = None
+    if intervals_path is not None:
+        with np.load(intervals_path, allow_pickle=False) as archive:
+            ancestor_intervals = {name: archive[name] for name in archive.files}
+        if int(ancestor_intervals["num_sites"]) != len(positions):
+            raise ValueError("Ancestor intervals disagree with the reference site axis")
+        if ac_cutoff > int(ancestor_intervals["max_ac_cutoff"]):
+            raise ValueError("AC cutoff exceeds the ancestor interval maximum")
+        for mask in masks.values():
+            for name in ("sample_id", "ploidy_index", "num_sites", "focal_choice"):
+                if not np.array_equal(mask[name], ancestor_intervals[name]):
+                    raise ValueError(f"Focal mask {name} disagrees with intervals")
+            if int(mask["ac_cutoff"]) != ac_cutoff:
+                raise ValueError("Focal mask disagrees with the requested AC cutoff")
+        panel_nodes = np.asarray(
+            [ancestor_nodes[name] for name in ancestor_intervals["ancestor_id"]],
+            dtype=np.int32,
+        )
+        interval_nodes = panel_nodes[ancestor_intervals["ancestor_index"]]
     intervals = np.asarray(ancestors_ts.metadata["sequence_intervals"])
     interval_boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
     recombination = np.full(len(positions), source_config.recombination)
@@ -250,6 +276,76 @@ def _prepare_stitched_inputs(
         mismatch=mismatch,
         full_indexes=indexes,
         ac_cutoff=ac_cutoff,
+        intervals=ancestor_intervals,
+        interval_nodes=interval_nodes,
+    )
+
+
+@numba.njit(nogil=True)
+def _greedy_cover(left, right, nodes, run_left, run_right, num_sites):
+    """Sweep sorted intervals once over ordered, disjoint coverage components.
+
+    At the first uncovered site choose the containing interval with maximum
+    exclusive right bound. Discard scanned alternatives: none extends further
+    than the choice. Touching intervals can continue at that exclusive bound.
+    Distinct components have no interval spanning between them, as guaranteed
+    by :func:`lib.haplotypes.make_focal_mask`. Equal reaches keep the first
+    interval in stable left-bound order. Uncovered sites retain parent -1.
+    """
+    parents = np.full(num_sites, -1, dtype=np.int32)
+    scan = 0
+    for region in range(len(run_left)):
+        cursor = run_left[region]
+        end = run_right[region]
+        while cursor < end:
+            reach = cursor
+            chosen = -1
+            while scan < len(left) and left[scan] <= cursor:
+                if right[scan] > reach:
+                    reach = right[scan]
+                    chosen = nodes[scan]
+                scan += 1
+            if chosen == -1:
+                raise ValueError("Ancestor intervals do not cover the focal mask")
+            reach = min(reach, end)
+            parents[cursor:reach] = chosen
+            cursor = reach
+    return parents
+
+
+def greedy_focal_parents(inputs, haplotype_index, mask, start, end):
+    """Return a minimum-switch exact cover of the requested mask's focal runs.
+
+    This replaces the reduced HMM only for budget zero. Saved ancestor IDs are
+    joined to original reference nodes during :func:`_prepare_stitched_inputs`.
+    Sorting costs O(M log M); initialisation and the sweep cost O(M + N), for M
+    eligible intervals and N inference sites. Inference boundaries need no splitting:
+    every saved interval is confined to one inference interval.
+    """
+    if int(mask["max_mismatches"]) != 0:
+        raise ValueError("Greedy focal matching requires max_mismatches=0")
+    intervals = inputs.intervals
+    if intervals is None:
+        raise ValueError("Greedy focal matching requires ancestor intervals")
+    first, last = intervals["offsets"][haplotype_index : haplotype_index + 2]
+    eligible = np.flatnonzero(intervals["focal_ac"][first:last] <= inputs.ac_cutoff)
+    eligible += first
+    left = intervals["left_site_index"][eligible, 0]
+    order = np.argsort(left, kind="stable")
+    rows = eligible[order]
+    run_start, run_end = mask["offsets"][haplotype_index : haplotype_index + 2]
+    run_slice = slice(run_start, run_end)
+    run_left = np.maximum(mask["left_site_index"][run_slice], start)
+    run_right = np.minimum(mask["right_site_index"][run_slice], end)
+    covered = ~mask["is_gap"][run_slice]
+    covered &= run_left < run_right
+    return _greedy_cover(
+        intervals["left_site_index"][rows, 0],
+        intervals["right_site_index"][rows, 0],
+        inputs.interval_nodes[rows],
+        run_left[covered],
+        run_right[covered],
+        len(inputs.positions),
     )
 
 
@@ -257,13 +353,13 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
     """Match each focal and gap run independently for every mask budget.
 
     Coverage is determined solely by :func:`lib.haplotypes.make_focal_mask`.
-    Both kinds of run split at inference-interval boundaries and use absolute
-    site indices with neutral missing calls. One reduced reference and matcher
-    are reused across budgets; paths are recomputed for each component because
-    its endpoints determine the independent HMM optimisation.
+    HMM runs split at inference-interval boundaries and use absolute site
+    indices with neutral missing calls. The ``hmm`` method prepares one reduced
+    matcher across budgets. The ``greedy`` method covers saved exact intervals
+    without a reduced reference; gaps use the full HMM with either method.
     """
-    if method != "hmm":
-        raise ValueError("Only focal method 'hmm' is supported")
+    if method not in ("hmm", "greedy"):
+        raise ValueError("Focal method must be 'hmm' or 'greedy'")
     inputs = worker.inputs
     num_sites = len(inputs.positions)
     called_sites = np.flatnonzero(haplotype >= 0)
@@ -284,7 +380,7 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
 
     match_out = np.empty(num_sites, dtype=np.int8)
     focal_matcher = None
-    if has_coverage:
+    if has_coverage and method == "hmm":
         reduced = simplify_ancestors_ts(
             inputs.ancestors_ts,
             inputs.focal,
@@ -301,9 +397,12 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
 
     results = {}
     for budget, mask in inputs.masks.items():
-        parents = np.empty(num_sites, dtype=np.int32)
         copied_alleles = np.empty(num_sites, dtype=np.int8)
         run_slice = mask_slices[budget]
+        if method == "greedy":
+            parents = greedy_focal_parents(inputs, job.haplotype_index, mask, start, end)
+        else:
+            parents = np.empty(num_sites, dtype=np.int32)
         runs = zip(
             mask["left_site_index"][run_slice],
             mask["right_site_index"][run_slice],
@@ -314,6 +413,10 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
             left = max(start, int(left))
             right = min(end, int(right))
             if left >= right:
+                continue
+            if not is_gap and method == "greedy":
+                # Budget-zero intervals match the reconstructed reference calls.
+                copied_alleles[left:right] = haplotype[left:right]
                 continue
             boundaries = inputs.interval_boundaries
             internal = boundaries[(boundaries > left) & (boundaries < right)]
@@ -383,7 +486,7 @@ def _write_stitched_matches(path, paired_results, ac_cutoff, max_mismatches, met
 def match_stitched_samples(
     config_path: pathlib.Path,
     ancestors_ts_path: pathlib.Path,
-    focal_path: pathlib.Path,
+    focal_path: pathlib.Path | None,
     mask_paths: list[pathlib.Path],
     output_paths: list[pathlib.Path],
     match_file_paths: list[pathlib.Path],
@@ -392,18 +495,26 @@ def match_stitched_samples(
     method: str,
     threads: int,
     cache_size: int | None = None,
+    intervals_path: pathlib.Path | None = None,
 ) -> None:
     """Match one dataset/cutoff/method across all budgets and assemble raw TSs.
 
     Each native haplotype is read once inside its task. Threads share the
     reference, indexes and reader, reusing one full matcher per thread and one
-    transient reduced matcher per haplotype across budgets. Simplification
-    holds the GIL; threads parallelise HMM calls, not reference preparation.
+    transient reduced matcher per haplotype across budgets for method ``hmm``.
+    Method ``greedy`` requires ``intervals_path`` and budget zero, and uses no
+    reduced matcher. Numba and native HMM calls release the GIL. Simplification
+    holds the GIL, so its preparation does not scale with matching threads.
     Native ``extend_ts`` preserves original reference node IDs and adds one node per
     haplotype, along with individual/population assignments and mutations.
     """
-    if method != "hmm":
-        raise ValueError("Only focal method 'hmm' is supported")
+    if method not in ("hmm", "greedy"):
+        raise ValueError("Focal method must be 'hmm' or 'greedy'")
+    if method == "greedy":
+        if max_mismatches != [0]:
+            raise ValueError("Greedy focal matching requires max_mismatches=[0]")
+        if intervals_path is None:
+            raise ValueError("Greedy focal matching requires ancestor intervals")
     cfg = _sample_config(config_path, ancestors_ts_path, output_paths[0])
     ancestors_ts = tskit.load(ancestors_ts_path)
     positions = ancestors_ts.sites_position.astype(np.int32)
@@ -431,6 +542,7 @@ def match_stitched_samples(
             ac_cutoff,
             reader.get_num_alleles(),
             cfg.match.sources["samples"],
+            intervals_path=intervals_path,
         )
         thread_state = threading.local()
         logger.info("Stitching %d haplotypes with %d threads", len(jobs), workers)
