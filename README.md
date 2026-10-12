@@ -107,13 +107,17 @@ from the selected cohort in genotype chunks. Missing calls enter neither the
 derived count nor the called-genome denominator. Derived AF remains available
 for dormant true-panel extraction.
 
-Optional dataset `include` and `exclude` strings pass unchanged into native
-TOML. Omitted or null values are omitted; native validation treats them as
-alternatives. For example, `include: 'POS >= 1000000 & POS < 2000000'` and
-`exclude: 'POS < 1000000 | POS >= 2000000'` select the same interval. Coordinates
-remain absolute. `sample_list` is a headerless CSV of sample IDs, for example
-`data/sample_lists/tgp_chr20_n100.csv`. The pipeline joins the IDs into tsinfer's
-native `samples` string; omission or null selects all samples. Count annotation,
+Generated native TOML excludes selected-cohort singletons using
+`INFO/match_eval_derived_ac == 1`. Dataset `include` expressions are combined
+with the non-singleton condition using `&`; `exclude` expressions are combined
+with the singleton condition using `|`. Without either dataset filter, only
+singleton exclusion is added. Native validation treats `include` and `exclude`
+as alternatives. For example, `include: 'POS >= 1000000 & POS < 2000000'` and
+`exclude: 'POS < 1000000 | POS >= 2000000'` select the same interval, excluding
+singletons. Original sample calls remain available in the copied store.
+Coordinates remain absolute. `sample_list` is a headerless CSV of sample IDs,
+for example `data/sample_lists/tgp_chr20_n100.csv`. The pipeline joins these IDs
+into the native `samples` string; omission or null selects all samples. Count annotation,
 native stages, and focal readers use the same cohort. Generated ancestors do
 not receive the participant string.
 

@@ -80,9 +80,17 @@ def make_inference_config(
 ) -> None:
     """Write native inference/matching TOML for the selected ancestor panel.
 
+    Exclude selected-cohort singletons using the annotated derived counts.
     Both sources stay in match.sources so ancestor matching obtains the full
     sample contig length. A true-panel configuration is for matching only.
     """
+    if include is not None:
+        include = f"({include}) & (INFO/match_eval_derived_ac != 1)"
+    elif exclude is not None:
+        exclude = f"({exclude}) | (INFO/match_eval_derived_ac == 1)"
+    else:
+        exclude = "INFO/match_eval_derived_ac == 1"
+
     source = {
         "name": "samples",
         "path": str(samples.resolve()),
