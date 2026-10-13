@@ -266,6 +266,13 @@ directly. The dataset's `matching_cache_size` also applies here. Simplification
 holds the GIL, so reduced-reference preparation does not scale with matching
 threads; native HMM calls release the GIL and can run concurrently.
 
+`haplotype_batch_size` is a required positive integer (configured as 64). Set it
+at least as high as the allocated stitched worker count to keep workers occupied
+when enough haplotypes are available. It bounds the contiguous canonical jobs
+submitted and their Python results. One executor, thread-local full matchers,
+reader schedule, cache, indexes and input archives survive across batches.
+The parameter does not change candidate generation or reference construction.
+
 For a haplotype with focal coverage, panel candidate IDs are joined to reference
 nodes through `(source, sample_id, ploidy_index)` metadata for source `ancestors`
 and ploidy 0. Eligible candidates plus roots 0 and 1 are retained by one
@@ -293,15 +300,28 @@ boundary conditioning. The
 output domain runs from the first called site through the last called site,
 or over the entire axis for an all-missing haplotype, as in baseline matching.
 
+Regional HMM paths are collected as numeric `CopyingRuns` on the inference-site
+axis. Called mismatches become owned mutations immediately, before the thread's
+matched-allele scratch is reused. Greedy focal runs are computed once per
+haplotype. The ordered blocks are concatenated once and coalesced in a linear
+pass, then converted to native BP path segments without a per-site parent or
+copied-allele array.
+
 Adjacent equal parents merge into native path segments, including across
 seams. Internal boundaries use site positions; outer bounds are BP 0 and the
 sequence length when the domain reaches the axis endpoints. Mutations are
 derived from called observations differing from the final copied alleles.
 They include focal and gap mismatches and exclude missing observations.
 
-Each output uses one native `extend_ts` call against the original ancestor
-reference. It remains raw and unsimplified, preserves original reference node
-IDs, and adds one sample node per haplotype with native individual/population
+Each budget starts with one table collection dumped from the original ancestor
+reference. After matching, each batch is sorted by native `haplotype_index`,
+appended with native `append_match_results`, and written to its already-open
+JSONL file. The batch's futures and results are released before admitting the
+next batch. Each budget's tables are finalised once with `finalise_match_tables`
+and dumped, then released before finalising the next budget. Every match still
+uses the original immutable reference. Output remains raw and unsimplified,
+preserves original reference node IDs, and adds one sample node per haplotype
+with native individual/population
 assignments. JSONL uses the baseline fields below plus `ac_cutoff`,
 `max_mismatches`, and `method`, ordered by native `haplotype_index`.
 For `method="greedy"`, ancestor identities and bounds come directly from the
@@ -310,9 +330,15 @@ For each focal component, start at its first uncovered site and choose an
 eligible interval containing that site with the furthest exclusive right bound.
 Copy until that bound and repeat, accepting touching intervals. Equal reaches
 keep the first interval in stable left-bound order. The sweep visits each
-eligible interval once after sorting, costs O(M log M + N) per haplotype, and
-uses O(M + N) working memory for M intervals and N inference sites. Numba
+eligible interval once after sorting, costs O(M log M + R) per haplotype, and
+uses O(M + R) working memory for M intervals and R selected runs. Numeric output
+capacity is bounded by eligible intervals; only compact owned runs survive. Numba
 releases the GIL. The first call also incurs compilation overhead.
+
+Working Python match results scale with batch size. Final tables necessarily
+scale with cohort output and budget count. Input masks/associations, the canonical
+job list and schedule, and retained reader chunks remain cohort/reference-sized;
+batching does not bound total preparation memory.
 
 This is an optimal minimum-switch cover of the **saved exact intervals**.
 With uniform initial state probabilities and constant recombination
@@ -401,6 +427,68 @@ after inference-boundary splitting, including leading/trailing gaps, alternating
 coverage, empty focal coverage, trimmed calls, and all-missing haplotypes.
 Consecutive haplotypes on one worker and both HMM budgets exercised traversal
 resets; the worker and full matcher remained allocated across tasks.
+
+Run and batch verification repeated these saved comparisons with one batch and
+batches of two, using one and two workers. Synthetic batches of one and three
+also checked a partial final batch. Scientific tables and JSONL remained exact;
+called-allele reconstruction, original node IDs, metadata and individual/population
+assignments were checked on all three workloads. Manual seam checks covered
+touching equal parents, changed parents, outer BP endpoints and single-site
+regions, plus greedy equal-reach ties and regional scratch ownership. Weak
+references confirmed that four batches of four on a 16-haplotype workload
+released every batch's results and futures before the next batch, while reusing
+worker, matcher and scratch identities. Invalid batch sizes were rejected and
+worker failures propagated with reader shutdown. Forced two-worker Snakemake
+stitched jobs with batch size two reproduced the saved HMM k 0/1 and greedy k 0
+outputs from prepared synthetic inputs. Diagnostics and saved products stayed
+outside production source; no test framework was added.
+
+A complete-run diagnostic on 13 October 2026 used a fixed 12,000-site, 16-haplotype
+synthetic reference with 1,200 short mask runs per haplotype and changing trees.
+The saved implementation and current runners used identical inputs, AC cutoff 3,
+inference intervals, reduced-node selection, HMM parameters, worker allocations,
+and a 64 MiB reader cache, against tsinfer revision `59a078b`. The current batch
+size was four. Each cell below is the median of three isolated process runs;
+RSS is the median process high-water mark measured with macOS `getrusage`, not
+the matcher's incomplete `total_memory` estimate. Elapsed time includes reference
+and archive loading, reader/job setup, simplification, matching, final table
+assembly, JSONL and TS writing. Interpreter imports and greedy sweep compilation
+were excluded from elapsed time; process RSS includes them. Native job-grouping
+compilation remains included in setup for both implementations.
+
+| Method / budgets | Workers | Saved seconds | Current seconds | Saved peak RSS MiB | Current peak RSS MiB |
+| --- | --- | --- | --- | --- | --- |
+| Reduced HMM / 0 | 1 | 4.747 | 4.370 | 249.1 | 254.7 |
+| Reduced HMM / 0 | 2 | 4.407 | 4.545 | 258.3 | 263.2 |
+| Greedy / 0 | 1 | 1.860 | 1.651 | 253.5 | 251.3 |
+| Greedy / 0 | 2 | 1.692 | 1.759 | 253.7 | 251.9 |
+| Reduced HMM / 0, 1 | 1 | 5.461 | 4.467 | 249.2 | 255.6 |
+| Reduced HMM / 0, 1 | 2 | 4.860 | 4.896 | 258.3 | 263.4 |
+
+The unchanged full-HMM runner, with reuse disabled on the same reference and
+cache budget, took 1.515/1.512 s and 243.9/244.0 MiB with one/two workers.
+Scientific tables and canonical records were checked exactly across repeats;
+full-HMM records were sorted for comparison because their existing threaded
+writer emits completion order.
+
+Separate one-worker profiles of HMM k 0/1 recorded 38,400 regional calls in both
+implementations. Regional wrapper time fell from 1.519 to 0.637 s, including
+native `find_path` time falling from 1.102 to 0.051 s. Simplification still took
+2.356/2.503 s in the saved/current profiles; table finalisation took 0.015 s in
+each. Greedy's 9,600 regional calls fell from 0.404 to 0.155 s, while output
+coalescing rose from 0.020 to 0.074 s and current batch assembly/JSONL took
+0.099 s. These instrumented timings are diagnostic, separate from the medians.
+Native control-flow inspection and the existing cursor assertions establish
+forward-only event consumption after each cold start and scratch-parent
+traceback without prefix replay or suffix reconstruction. The Python profile
+measures the resulting call cost, not individual C edge events.
+
+This small workload shows serial improvements, slight two-worker regressions,
+and no general reduction in total RSS. Simplification, dense node resets/copies,
+Python run collection/coalescing, shared input preparation and reference/output
+tables remain costs. Bounded result lifetimes do not imply bounded total RSS or
+good thread scaling, and these synthetic measurements do not establish
+whole-cohort performance on biological data.
 
 The refactor verification checked both choices on the existing
 `out_of_africa_n100_1mbp`, `out_of_africa_n300_1mbp`, and

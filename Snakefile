@@ -313,6 +313,7 @@ rule match_stitched_samples:
     params:
         ac_cutoff=lambda wildcards: int(wildcards.ac),
         max_mismatches=max_mismatches,
+        haplotype_batch_size=config["haplotype_batch_size"],
         cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
     threads: workflow.cores
     log:
@@ -330,6 +331,7 @@ rule match_stitched_samples:
             intervals_path=(
                 pathlib.Path(input.intervals[0]) if len(input.intervals) > 0 else None
             ),
+            haplotype_batch_size=params.haplotype_batch_size,
         )
 
 

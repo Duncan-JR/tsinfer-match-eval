@@ -1,6 +1,7 @@
 """Full-reference and focal-mask stitched sample matching."""
 
 import concurrent.futures as cf
+import contextlib
 import dataclasses
 import json
 import logging
@@ -524,26 +525,58 @@ def _worker_stitched_haplotype(job, reader, inputs, thread_state, method):
     return match_stitched_haplotype(job, haplotype, worker, method=method)
 
 
-def _write_stitched_matches(path, paired_results, ac_cutoff, max_mismatches, method):
-    """Write native-shaped JSONL in haplotype order, with selected parameters."""
-    with path.open("w") as match_file:
-        for job, result in paired_results:
-            record = {
-                "group": job.group,
-                "haplotype_index": job.haplotype_index,
-                "source": job.source,
-                "sample_id": job.sample_id,
-                "ploidy_index": job.ploidy_index,
-                "time": job.time,
-                "path": [dataclasses.asdict(segment) for segment in result.path],
-                "mutations": [
-                    dataclasses.asdict(mutation) for mutation in result.mutations
-                ],
-                "ac_cutoff": ac_cutoff,
-                "max_mismatches": max_mismatches,
-                "method": method,
-            }
-            match_file.write(json.dumps(record) + "\n")
+def _write_stitched_matches(
+    match_file, paired_results, ac_cutoff, max_mismatches, method
+):
+    """Append native-shaped JSONL records to an open file in haplotype order."""
+    for job, result in paired_results:
+        record = {
+            "group": job.group,
+            "haplotype_index": job.haplotype_index,
+            "source": job.source,
+            "sample_id": job.sample_id,
+            "ploidy_index": job.ploidy_index,
+            "time": job.time,
+            "path": [dataclasses.asdict(segment) for segment in result.path],
+            "mutations": [dataclasses.asdict(mutation) for mutation in result.mutations],
+            "ac_cutoff": ac_cutoff,
+            "max_mismatches": max_mismatches,
+            "method": method,
+        }
+        match_file.write(json.dumps(record) + "\n")
+
+
+def _collect_stitched_batch(jobs, reader, inputs, thread_state, method, executor):
+    """Match one contiguous batch, releasing its futures before returning."""
+    if executor is None:
+        results = [
+            _worker_stitched_haplotype(job, reader, inputs, thread_state, method)
+            for job in jobs
+        ]
+    else:
+        futures = [
+            executor.submit(
+                _worker_stitched_haplotype, job, reader, inputs, thread_state, method
+            )
+            for job in jobs
+        ]
+        results = [future.result() for future in cf.as_completed(futures)]
+    results.sort(key=lambda result: result.job.haplotype_index)
+    return results
+
+
+def _append_stitched_batch(
+    results, tables, match_files, allele_mapper, ac_cutoff, method
+):
+    """Append a canonical batch to each budget, retaining no Python results."""
+    for budget, budget_tables in tables.items():
+        paired_results = [(result.job, result.results[budget]) for result in results]
+        tsinfer.matching.append_match_results(
+            budget_tables, paired_results, allele_mapper
+        )
+        _write_stitched_matches(
+            match_files[budget], paired_results, ac_cutoff, budget, method
+        )
 
 
 def match_stitched_samples(
@@ -559,6 +592,8 @@ def match_stitched_samples(
     threads: int,
     cache_size: int | None = None,
     intervals_path: pathlib.Path | None = None,
+    *,
+    haplotype_batch_size: int,
 ) -> None:
     """Match one dataset/cutoff/method across all budgets and assemble raw TSs.
 
@@ -568,9 +603,18 @@ def match_stitched_samples(
     Method ``greedy`` requires ``intervals_path`` and budget zero, and uses no
     reduced matcher. Numba and native HMM calls release the GIL. Simplification
     holds the GIL, so its preparation does not scale with matching threads.
-    Native ``extend_ts`` preserves original reference node IDs and adds one node per
-    haplotype, along with individual/population assignments and mutations.
+    Contiguous canonical batches bound pending tasks and Python results. Each
+    budget's tables start from the immutable reference and are finalised once.
+    Native appending preserves original parent IDs, metadata and assignments.
+    Final tables, input archives and reader chunks still scale with the output
+    or cohort; ``haplotype_batch_size`` bounds only matching tasks/results.
     """
+    if (
+        isinstance(haplotype_batch_size, bool)
+        or not isinstance(haplotype_batch_size, int)
+        or haplotype_batch_size <= 0
+    ):
+        raise ValueError("haplotype_batch_size must be a positive integer")
     if method not in ("hmm", "greedy"):
         raise ValueError("Focal method must be 'hmm' or 'greedy'")
     if method == "greedy":
@@ -608,46 +652,48 @@ def match_stitched_samples(
             intervals_path=intervals_path,
         )
         thread_state = threading.local()
-        logger.info("Stitching %d haplotypes with %d threads", len(jobs), workers)
-        if workers == 1:
-            results = [
-                _worker_stitched_haplotype(job, reader, inputs, thread_state, method)
-                for job in jobs
-            ]
-        else:
-            with cf.ThreadPoolExecutor(max_workers=max(1, workers)) as executor:
-                futures = {
-                    executor.submit(
-                        _worker_stitched_haplotype,
-                        job,
-                        reader,
-                        inputs,
-                        thread_state,
+        logger.info(
+            "Stitching %d haplotypes with %d threads in batches of %d",
+            len(jobs),
+            workers,
+            haplotype_batch_size,
+        )
+        outputs = list(zip(max_mismatches, output_paths, match_file_paths, strict=True))
+        tables = {budget: ancestors_ts.dump_tables() for budget in max_mismatches}
+        with contextlib.ExitStack() as file_stack:
+            match_files = {}
+            for budget, output_path, match_file_path in outputs:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                match_file_path.parent.mkdir(parents=True, exist_ok=True)
+                match_files[budget] = file_stack.enter_context(match_file_path.open("w"))
+            with contextlib.ExitStack() as executor_stack:
+                executor = None
+                if workers > 1:
+                    executor = executor_stack.enter_context(
+                        cf.ThreadPoolExecutor(max_workers=workers)
+                    )
+                for first in range(0, len(jobs), haplotype_batch_size):
+                    batch_jobs = jobs[first : first + haplotype_batch_size]
+                    results = _collect_stitched_batch(
+                        batch_jobs, reader, inputs, thread_state, method, executor
+                    )
+                    _append_stitched_batch(
+                        results,
+                        tables,
+                        match_files,
+                        reader.allele_mapper,
+                        ac_cutoff,
                         method,
-                    ): job
-                    for job in jobs
-                }
-                results = []
-                for future in cf.as_completed(futures):
-                    results.append(future.result())
-                    del futures[future]
-        results.sort(key=lambda result: result.job.haplotype_index)
-        outputs = zip(max_mismatches, output_paths, match_file_paths, strict=True)
-        for budget, output_path, match_file_path in outputs:
-            paired_results = [(result.job, result.results[budget]) for result in results]
-            ts = tsinfer.matching.extend_ts(
-                ancestors_ts,
-                paired_results=paired_results,
-                allele_mapper=reader.allele_mapper,
-            )
-            output_path.parent.mkdir(parents=True, exist_ok=True)
-            match_file_path.parent.mkdir(parents=True, exist_ok=True)
-            ts.dump(output_path)
-            _write_stitched_matches(
-                match_file_path, paired_results, ac_cutoff, budget, method
-            )
-            logger.info(
-                "Wrote stitched samples to %s and %s", output_path, match_file_path
-            )
+                    )
+                    del results
+            # Each budget's final tables/TS are released before the next one.
+            for budget, output_path, match_file_path in outputs:
+                budget_tables = tables.pop(budget)
+                ts = tsinfer.matching.finalise_match_tables(budget_tables)
+                ts.dump(output_path)
+                del ts, budget_tables
+                logger.info(
+                    "Wrote stitched samples to %s and %s", output_path, match_file_path
+                )
     finally:
         reader.shutdown()

@@ -30,3 +30,5 @@ datasets:
 ancestor_chunk_size: 5000
 inference_threads: 1
 matching_threads: 1
+# Keep at least as many haplotypes in a batch as stitched matching workers.
+haplotype_batch_size: 64
