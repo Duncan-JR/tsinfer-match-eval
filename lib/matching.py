@@ -123,57 +123,89 @@ def simplify_ancestors_ts(
 
 
 @dataclasses.dataclass
-class SiteMatch:
-    """Materialised parents and copied alleles for one requested site slice."""
+class CopyingRuns:
+    """Numeric copying runs with half-open bounds on the inference-site axis."""
 
-    parents: np.ndarray
-    copied_alleles: np.ndarray
-
-
-def _match_region(matcher, haplotype, start, end, positions, match_out):
-    """Run an independent HMM and copy its output before matcher reuse."""
-    left, right, parents = matcher.find_path(haplotype, start, end, match_out)
-    site_parents = np.empty(end - start, dtype=np.int32)
-    for path_left, path_right, parent in zip(left, right, parents, strict=True):
-        site_left = max(start, int(np.searchsorted(positions, path_left)))
-        site_right = min(end, int(np.searchsorted(positions, path_right)))
-        site_parents[site_left - start : site_right - start] = parent
-    copied_alleles = match_out[start:end].copy()
-    return SiteMatch(site_parents, copied_alleles)
+    left_site: np.ndarray
+    right_site: np.ndarray
+    parent: np.ndarray
 
 
-def merge_paths(
-    parents, copied_alleles, haplotype, positions, sequence_length, start, end
+@dataclasses.dataclass
+class RegionMatch:
+    """Compact copying runs and owned mutations from one independent HMM."""
+
+    runs: CopyingRuns
+    mutations: list[tsinfer.matching.Mutation]
+
+
+def _match_region(
+    matcher, haplotype, start, end, positions, match_out, original_nodes=None
 ):
-    """Encode the finished stitched domain as native paths and mutations.
+    """Collect ordered runs and mutations before matched-allele scratch is reused.
 
-    Adjacent equal parents merge across seams. Only called observations that
-    disagree with the final copied alleles create mutations. Missing
-    observations never create mutations.
+    Reduced parents are mapped back to the original reference here. Returned
+    arrays and mutations never refer to ``match_out``; only its requested slice
+    is read. See :func:`_assemble_stitched_match` for output seam merging.
     """
-    domain_parents = parents[start:end]
-    switches = np.flatnonzero(domain_parents[1:] != domain_parents[:-1]) + start + 1
-    boundaries = [start, *switches, end]
+    left, right, parents = matcher.find_path(haplotype, start, end, match_out)
+    left_site = np.searchsorted(positions, left[::-1])
+    right_site = np.searchsorted(positions, right[::-1])
+    left_site = np.maximum(left_site, start)
+    right_site = np.minimum(right_site, end)
+    parents = parents[::-1].copy()
+    if original_nodes is not None:
+        parents = original_nodes[parents]
+    runs = CopyingRuns(left_site, right_site, parents)
+
+    observed = haplotype[start:end]
+    copied = match_out[start:end]
+    mismatch_sites = np.flatnonzero((observed >= 0) & (observed != copied))
+    mismatch_sites += start
+    mutations = [
+        tsinfer.matching.Mutation(
+            position=float(positions[site]), derived_state=int(haplotype[site])
+        )
+        for site in mismatch_sites
+    ]
+    return RegionMatch(runs, mutations)
+
+
+def _assemble_stitched_match(run_blocks, mutations, positions, sequence_length):
+    """Coalesce ordered runs once and convert to native BP path segments.
+
+    Touching equal parents merge across output seams. Regional HMM calls remain
+    independent even when their output runs merge. Mutations arrive in site
+    order from :func:`_match_region`; exact greedy focal runs add none.
+    """
+    left_site = np.concatenate([runs.left_site for runs in run_blocks])
+    right_site = np.concatenate([runs.right_site for runs in run_blocks])
+    parents = np.concatenate([runs.parent for runs in run_blocks])
+    last = 0
+    for current in range(1, len(parents)):
+        touches = left_site[current] == right_site[last]
+        same_parent = parents[current] == parents[last]
+        if touches and same_parent:
+            right_site[last] = right_site[current]
+        else:
+            last += 1
+            left_site[last] = left_site[current]
+            right_site[last] = right_site[current]
+            parents[last] = parents[current]
+
     path = []
-    for left, right in zip(boundaries[:-1], boundaries[1:], strict=True):
+    for run in range(last + 1):
+        left = left_site[run]
+        right = right_site[run]
         bp_left = 0 if left == 0 else float(positions[left])
         bp_right = (
             sequence_length if right == len(positions) else float(positions[right])
         )
         path.append(
             tsinfer.matching.PathSegment(
-                left=bp_left, right=bp_right, parent=int(parents[left])
+                left=bp_left, right=bp_right, parent=int(parents[run])
             )
         )
-    observed = haplotype[start:end]
-    copied = copied_alleles[start:end]
-    mutation_sites = np.flatnonzero((observed >= 0) & (observed != copied)) + start
-    mutations = [
-        tsinfer.matching.Mutation(
-            position=float(positions[site]), derived_state=int(haplotype[site])
-        )
-        for site in mutation_sites
-    ]
     return tsinfer.matching.MatchResult(path=path, mutations=mutations)
 
 
@@ -283,7 +315,9 @@ def _prepare_stitched_inputs(
 
 
 @numba.njit(nogil=True)
-def _greedy_cover(left, right, nodes, run_left, run_right, num_sites):
+def _greedy_cover(
+    left, right, nodes, run_left, run_right, out_left, out_right, out_parent
+):
     """Sweep sorted intervals once over ordered, disjoint coverage components.
 
     At the first uncovered site choose the containing interval with maximum
@@ -291,9 +325,9 @@ def _greedy_cover(left, right, nodes, run_left, run_right, num_sites):
     than the choice. Touching intervals can continue at that exclusive bound.
     Distinct components have no interval spanning between them, as guaranteed
     by :func:`lib.haplotypes.make_focal_mask`. Equal reaches keep the first
-    interval in stable left-bound order. Uncovered sites retain parent -1.
+    interval in stable left-bound order. Each choice emits one copying run.
     """
-    parents = np.full(num_sites, -1, dtype=np.int32)
+    written = 0
     scan = 0
     for region in range(len(run_left)):
         cursor = run_left[region]
@@ -309,18 +343,21 @@ def _greedy_cover(left, right, nodes, run_left, run_right, num_sites):
             if chosen == -1:
                 raise ValueError("Ancestor intervals do not cover the focal mask")
             reach = min(reach, end)
-            parents[cursor:reach] = chosen
+            out_left[written] = cursor
+            out_right[written] = reach
+            out_parent[written] = chosen
+            written += 1
             cursor = reach
-    return parents
+    return written
 
 
-def greedy_focal_parents(inputs, haplotype_index, mask, start, end):
+def greedy_focal_runs(inputs, haplotype_index, mask, start, end):
     """Return a minimum-switch exact cover of the requested mask's focal runs.
 
     This replaces the reduced HMM only for budget zero. Saved ancestor IDs are
     joined to original reference nodes during :func:`_prepare_stitched_inputs`.
-    Sorting costs O(M log M); initialisation and the sweep cost O(M + N), for M
-    eligible intervals and N inference sites. Inference boundaries need no splitting:
+    Sorting costs O(M log M); the sweep and output capacity cost O(M), for M
+    eligible intervals. Inference boundaries need no splitting:
     every saved interval is confined to one inference interval.
     """
     if int(mask["max_mismatches"]) != 0:
@@ -340,13 +377,23 @@ def greedy_focal_parents(inputs, haplotype_index, mask, start, end):
     run_right = np.minimum(mask["right_site_index"][run_slice], end)
     covered = ~mask["is_gap"][run_slice]
     covered &= run_left < run_right
-    return _greedy_cover(
+    left_site = np.empty(len(rows), dtype=np.int64)
+    right_site = np.empty(len(rows), dtype=np.int64)
+    parents = np.empty(len(rows), dtype=np.int32)
+    written = _greedy_cover(
         intervals["left_site_index"][rows, 0],
         intervals["right_site_index"][rows, 0],
         inputs.interval_nodes[rows],
         run_left[covered],
         run_right[covered],
-        len(inputs.positions),
+        left_site,
+        right_site,
+        parents,
+    )
+    return CopyingRuns(
+        left_site[:written].copy(),
+        right_site[:written].copy(),
+        parents[:written].copy(),
     )
 
 
@@ -395,17 +442,21 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
             indexes, inputs.recombination, inputs.mismatch, reuse_topology=True
         )
 
+    greedy_runs = None
+    if method == "greedy":
+        greedy_runs = greedy_focal_runs(
+            inputs, job.haplotype_index, inputs.masks[0], start, end
+        )
+
     results = {}
     for budget, mask in inputs.masks.items():
         worker.full_matcher.reset_topology()
         if focal_matcher is not None:
             focal_matcher.reset_topology()
-        copied_alleles = np.empty(num_sites, dtype=np.int8)
+        run_blocks = []
+        mutations = []
+        focal_cursor = 0
         run_slice = mask_slices[budget]
-        if method == "greedy":
-            parents = greedy_focal_parents(inputs, job.haplotype_index, mask, start, end)
-        else:
-            parents = np.empty(num_sites, dtype=np.int32)
         runs = zip(
             mask["left_site_index"][run_slice],
             mask["right_site_index"][run_slice],
@@ -418,13 +469,26 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
             if left >= right:
                 continue
             if not is_gap and method == "greedy":
-                # Budget-zero intervals match the reconstructed reference calls.
-                copied_alleles[left:right] = haplotype[left:right]
+                first = focal_cursor
+                while (
+                    focal_cursor < len(greedy_runs.left_site)
+                    and greedy_runs.left_site[focal_cursor] < right
+                ):
+                    focal_cursor += 1
+                focal_slice = slice(first, focal_cursor)
+                run_blocks.append(
+                    CopyingRuns(
+                        greedy_runs.left_site[focal_slice],
+                        greedy_runs.right_site[focal_slice],
+                        greedy_runs.parent[focal_slice],
+                    )
+                )
                 continue
             boundaries = inputs.interval_boundaries
             internal = boundaries[(boundaries > left) & (boundaries < right)]
             run_bounds = [left, *internal, right]
             matcher = worker.full_matcher if is_gap else focal_matcher
+            original_nodes = None if is_gap else reduced.original_nodes
             for run_start, run_end in zip(run_bounds[:-1], run_bounds[1:], strict=True):
                 region = _match_region(
                     matcher,
@@ -433,20 +497,12 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
                     run_end,
                     inputs.positions,
                     worker.match_out,
+                    original_nodes=original_nodes,
                 )
-                region_parents = region.parents
-                if not is_gap:
-                    region_parents = reduced.original_nodes[region_parents]
-                parents[run_start:run_end] = region_parents
-                copied_alleles[run_start:run_end] = region.copied_alleles
-        results[budget] = merge_paths(
-            parents,
-            copied_alleles,
-            haplotype,
-            inputs.positions,
-            inputs.ancestors_ts.sequence_length,
-            start,
-            end,
+                run_blocks.append(region.runs)
+                mutations.extend(region.mutations)
+        results[budget] = _assemble_stitched_match(
+            run_blocks, mutations, inputs.positions, inputs.ancestors_ts.sequence_length
         )
     return StitchedResults(job, results)
 
