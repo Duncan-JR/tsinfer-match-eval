@@ -274,6 +274,15 @@ One transient reduced matcher is reused across every budget, and copied parent
 IDs are mapped back to the original reference. Haplotypes without focal coverage
 in the called-site domain skip reduction.
 
+The full and reduced matchers retain two independent reference traversals.
+Ordered regional calls advance the selected matcher's topology through skipped
+spans without running an HMM there, then initialise fresh likelihoods and
+traceback for the requested region. Traceback preserves the retained endpoint
+tree. Both traversals reset at every haplotype/budget boundary without
+reallocating the matchers. Each thread also reuses one full-site matched-allele
+scratch array; only the requested slice is read after a call. Greedy focal spans
+need no native call: the full matcher advances through them before its next gap.
+
 For `method="hmm"`, each maximal focal run receives an independent reduced-reference
 HMM match and each gap an independent full-reference match. Both kinds of run
 are clipped to the called-site domain and split at inference-interval boundaries
@@ -324,8 +333,11 @@ minimise total switches across gap seams. Mismatch-tolerant intervals require
 emission costs and are rejected by this first greedy implementation.
 Boundary conditioning, sparse node resets, cross-sample reference caching, and finer
 region scheduling remain later work. Regional matching relies on the tsinfer
-changes in the fast stitched plan; endpoint edge scans and genome-sized native
-allocation sizes remain explicit limitations.
+changes in the efficient stitched plan in the local tsinfer checkout. Later
+ordered calls avoid replaying edge prefixes and rebuilding traceback endpoints
+from reference suffixes. Edge updates through skipped spans, dense probability
+resets, and a node-sized traceback parent copy remain; simplification still
+holds the GIL. Native path buffers are sized to the requested region.
 
 ## Full-reference matching and dormant true panels
 
@@ -379,6 +391,16 @@ independent focal controls, serial/threaded agreement, regional observation
 independence, TS/JSONL path and called-allele agreement, and the coarse Snakemake
 DAG. No test suite is included; full-cohort runs and
 analysis are not part of automatic verification.
+
+Retained-traversal verification compared saved independent matches exactly for
+both methods with one and two workers: HMM at k 0/1 and greedy at k 0. It used
+changing-tree synthetic regions, the 12-site synthetic VCZ workload, and four
+haplotypes from each existing 10 Mbp simulation and TGP panel. Scientific tables
+and canonical JSONL agreed. Regional call counts matched clipped mask runs
+after inference-boundary splitting, including leading/trailing gaps, alternating
+coverage, empty focal coverage, trimmed calls, and all-missing haplotypes.
+Consecutive haplotypes on one worker and both HMM budgets exercised traversal
+resets; the worker and full matcher remained allocated across tasks.
 
 The refactor verification checked both choices on the existing
 `out_of_africa_n100_1mbp`, `out_of_africa_n300_1mbp`, and

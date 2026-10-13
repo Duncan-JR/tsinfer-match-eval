@@ -202,6 +202,7 @@ class StitchedWorker:
 
     inputs: StitchedInputs
     full_matcher: tsinfer.matching.AncestorMatcher
+    match_out: np.ndarray
 
 
 @dataclasses.dataclass
@@ -378,7 +379,6 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
         overlaps &= mask["right_site_index"][run_start:run_end] > start
         has_coverage |= bool(np.any(covered & overlaps))
 
-    match_out = np.empty(num_sites, dtype=np.int8)
     focal_matcher = None
     if has_coverage and method == "hmm":
         reduced = simplify_ancestors_ts(
@@ -392,11 +392,14 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
             reduced.ts, vestigial_root=False, num_alleles=inputs.num_alleles
         )
         focal_matcher = tsinfer.matching.AncestorMatcher(
-            indexes, inputs.recombination, inputs.mismatch
+            indexes, inputs.recombination, inputs.mismatch, reuse_topology=True
         )
 
     results = {}
     for budget, mask in inputs.masks.items():
+        worker.full_matcher.reset_topology()
+        if focal_matcher is not None:
+            focal_matcher.reset_topology()
         copied_alleles = np.empty(num_sites, dtype=np.int8)
         run_slice = mask_slices[budget]
         if method == "greedy":
@@ -429,7 +432,7 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
                     run_start,
                     run_end,
                     inputs.positions,
-                    match_out,
+                    worker.match_out,
                 )
                 region_parents = region.parents
                 if not is_gap:
@@ -453,9 +456,13 @@ def _worker_stitched_haplotype(job, reader, inputs, thread_state, method):
     worker = getattr(thread_state, "worker", None)
     if worker is None:
         matcher = tsinfer.matching.AncestorMatcher(
-            inputs.full_indexes, inputs.recombination, inputs.mismatch
+            inputs.full_indexes,
+            inputs.recombination,
+            inputs.mismatch,
+            reuse_topology=True,
         )
-        worker = StitchedWorker(inputs, matcher)
+        match_out = np.empty(len(inputs.positions), dtype=np.int8)
+        worker = StitchedWorker(inputs, matcher, match_out)
         thread_state.worker = worker
     haplotype = np.asarray(reader.read_haplotype(job), dtype=np.int8)
     return match_stitched_haplotype(job, haplotype, worker, method=method)
