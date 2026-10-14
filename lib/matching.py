@@ -13,6 +13,8 @@ import numpy as np
 import tsinfer
 import tskit
 
+from . import performance
+
 logger = logging.getLogger(__name__)
 
 
@@ -69,6 +71,7 @@ def match_samples(
     match_file_path: pathlib.Path,
     threads: int,
     cache_size: int | None = None,
+    read_workers: int | None = None,
 ) -> None:
     """Match samples against the unmodified reference from :func:`match_ancestors`.
 
@@ -84,6 +87,7 @@ def match_samples(
         num_threads=threads,
         match_file=match_file_path,
         cache_size=cache_size,
+        read_workers=read_workers,
     )
     ts.dump(output_path)
     logger.info(
@@ -244,6 +248,7 @@ class StitchedResults:
 
     job: tsinfer.config.MatchJob
     results: dict[int, tsinfer.matching.MatchResult]
+    measurements: performance.Collector | None = None
 
 
 def _prepare_stitched_inputs(
@@ -398,7 +403,7 @@ def greedy_focal_runs(inputs, haplotype_index, mask, start, end):
     )
 
 
-def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
+def match_stitched_haplotype(job, haplotype, worker, method="hmm", collector=None):
     """Match each focal and gap run independently for every mask budget.
 
     Coverage is determined solely by :func:`lib.haplotypes.make_focal_mask`.
@@ -416,6 +421,10 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
     if len(called_sites) > 0:
         start = int(called_sites[0])
         end = int(called_sites[-1]) + 1
+    focal_sites = 0
+    gap_sites = 0
+    focal_calls = 0
+    gap_calls = 0
     mask_slices = {}
     has_coverage = False
     for budget, mask in inputs.masks.items():
@@ -429,25 +438,35 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
 
     focal_matcher = None
     if has_coverage and method == "hmm":
-        reduced = simplify_ancestors_ts(
-            inputs.ancestors_ts,
-            inputs.focal,
-            inputs.ancestor_nodes,
-            job.haplotype_index,
-            inputs.ac_cutoff,
-        )
-        indexes = tsinfer.matching.MatcherIndexes(
-            reduced.ts, vestigial_root=False, num_alleles=inputs.num_alleles
-        )
-        focal_matcher = tsinfer.matching.AncestorMatcher(
-            indexes, inputs.recombination, inputs.mismatch, reuse_topology=True
-        )
+        with performance.measure(collector, "simplify", "worker"):
+            reduced = simplify_ancestors_ts(
+                inputs.ancestors_ts,
+                inputs.focal,
+                inputs.ancestor_nodes,
+                job.haplotype_index,
+                inputs.ac_cutoff,
+            )
+        if collector is not None:
+            collector.count(
+                reductions=1,
+                reduced_nodes=reduced.ts.num_nodes,
+                reduced_edges=reduced.ts.num_edges,
+            )
+        with performance.measure(collector, "reduced_setup", "worker"):
+            indexes = tsinfer.matching.MatcherIndexes(
+                reduced.ts, vestigial_root=False, num_alleles=inputs.num_alleles
+            )
+            focal_matcher = tsinfer.matching.AncestorMatcher(
+                indexes, inputs.recombination, inputs.mismatch, reuse_topology=True
+            )
 
     greedy_runs = None
     if method == "greedy":
-        greedy_runs = greedy_focal_runs(
-            inputs, job.haplotype_index, inputs.masks[0], start, end
-        )
+        with performance.measure(collector, "focal_match", "worker"):
+            greedy_runs = greedy_focal_runs(
+                inputs, job.haplotype_index, inputs.masks[0], start, end
+            )
+        focal_calls = 1
 
     results = {}
     for budget, mask in inputs.masks.items():
@@ -455,7 +474,7 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
         if focal_matcher is not None:
             focal_matcher.reset_topology()
         run_blocks = []
-        mutations = []
+        mutation_blocks = []
         focal_cursor = 0
         run_slice = mask_slices[budget]
         runs = zip(
@@ -469,6 +488,11 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
             right = min(end, int(right))
             if left >= right:
                 continue
+            if collector is not None:
+                if is_gap:
+                    gap_sites += right - left
+                else:
+                    focal_sites += right - left
             if not is_gap and method == "greedy":
                 first = focal_cursor
                 while (
@@ -490,25 +514,46 @@ def match_stitched_haplotype(job, haplotype, worker, method="hmm"):
             run_bounds = [left, *internal, right]
             matcher = worker.full_matcher if is_gap else focal_matcher
             original_nodes = None if is_gap else reduced.original_nodes
+            if collector is not None:
+                if is_gap:
+                    gap_calls += len(run_bounds) - 1
+                else:
+                    focal_calls += len(run_bounds) - 1
             for run_start, run_end in zip(run_bounds[:-1], run_bounds[1:], strict=True):
-                region = _match_region(
-                    matcher,
-                    haplotype,
-                    run_start,
-                    run_end,
-                    inputs.positions,
-                    worker.match_out,
-                    original_nodes=original_nodes,
-                )
+                stage = "gap_match" if is_gap else "focal_match"
+                with performance.measure(collector, stage, "worker"):
+                    region = _match_region(
+                        matcher,
+                        haplotype,
+                        run_start,
+                        run_end,
+                        inputs.positions,
+                        worker.match_out,
+                        original_nodes=original_nodes,
+                    )
                 run_blocks.append(region.runs)
-                mutations.extend(region.mutations)
-        results[budget] = _assemble_stitched_match(
-            run_blocks, mutations, inputs.positions, inputs.ancestors_ts.sequence_length
+                mutation_blocks.append(region.mutations)
+        with performance.measure(collector, "stitch", "worker"):
+            mutations = [mutation for block in mutation_blocks for mutation in block]
+            results[budget] = _assemble_stitched_match(
+                run_blocks,
+                mutations,
+                inputs.positions,
+                inputs.ancestors_ts.sequence_length,
+            )
+    if collector is not None:
+        collector.count(
+            matched_haplotypes=1,
+            domain_sites=end - start,
+            focal_sites=focal_sites,
+            gap_sites=gap_sites,
+            focal_calls=focal_calls,
+            gap_calls=gap_calls,
         )
-    return StitchedResults(job, results)
+    return StitchedResults(job, results, collector)
 
 
-def _worker_stitched_haplotype(job, reader, inputs, thread_state, method):
+def _worker_stitched_haplotype(job, reader, inputs, thread_state, method, stages=None):
     """Read one haplotype in its task and reuse the thread's full matcher."""
     worker = getattr(thread_state, "worker", None)
     if worker is None:
@@ -522,7 +567,10 @@ def _worker_stitched_haplotype(job, reader, inputs, thread_state, method):
         worker = StitchedWorker(inputs, matcher, match_out)
         thread_state.worker = worker
     haplotype = np.asarray(reader.read_haplotype(job), dtype=np.int8)
-    return match_stitched_haplotype(job, haplotype, worker, method=method)
+    collector = None if stages is None else performance.Collector(stages=stages)
+    return match_stitched_haplotype(
+        job, haplotype, worker, method=method, collector=collector
+    )
 
 
 def _write_stitched_matches(
@@ -546,23 +594,110 @@ def _write_stitched_matches(
         match_file.write(json.dumps(record) + "\n")
 
 
-def _collect_stitched_batch(jobs, reader, inputs, thread_state, method, executor):
+def _collect_stitched_batch(
+    jobs, reader, inputs, thread_state, method, executor, stages
+):
     """Match one contiguous batch, releasing its futures before returning."""
     if executor is None:
         results = [
-            _worker_stitched_haplotype(job, reader, inputs, thread_state, method)
+            _worker_stitched_haplotype(job, reader, inputs, thread_state, method, stages)
             for job in jobs
         ]
     else:
         futures = [
             executor.submit(
-                _worker_stitched_haplotype, job, reader, inputs, thread_state, method
+                _worker_stitched_haplotype,
+                job,
+                reader,
+                inputs,
+                thread_state,
+                method,
+                stages,
             )
             for job in jobs
         ]
         results = [future.result() for future in cf.as_completed(futures)]
     results.sort(key=lambda result: result.job.haplotype_index)
     return results
+
+
+def iter_stitched_batches(
+    jobs, reader, inputs, method, threads, haplotype_batch_size, collector=None
+):
+    """Yield canonical batches with one executor and persistent worker state.
+
+    Only batch execution/collection and executor lifetime operations enter the
+    process ``matching`` aggregate. The consumer may assemble and release each
+    batch while matching tasks are quiescent. Close this iterator on failures.
+    Task-local diagnostics are merged and released before yielding each batch.
+    """
+    workers = min(threads, len(jobs), haplotype_batch_size)
+    thread_state = threading.local()
+    stages = None if collector is None else collector.stages
+    executor = None
+    with performance.measure(collector, "matching"):
+        if workers > 1:
+            executor = cf.ThreadPoolExecutor(max_workers=workers)
+    try:
+        for first in range(0, len(jobs), haplotype_batch_size):
+            batch_jobs = jobs[first : first + haplotype_batch_size]
+            with performance.measure(collector, "matching"):
+                results = _collect_stitched_batch(
+                    batch_jobs, reader, inputs, thread_state, method, executor, stages
+                )
+                if collector is not None:
+                    for result in results:
+                        collector.merge(result.measurements)
+                        result.measurements = None
+                    del result
+            yield results
+            del results
+    finally:
+        with performance.measure(collector, "matching"):
+            if executor is not None:
+                executor.shutdown(wait=True)
+
+
+def assemble_stitched_batches(
+    batches,
+    ancestors_ts,
+    allele_mapper,
+    max_mismatches,
+    output_paths,
+    match_file_paths,
+    ac_cutoff,
+    method,
+    collector=None,
+):
+    """Consume/release batches and finalise once per budget for both runners."""
+    outputs = list(zip(max_mismatches, output_paths, match_file_paths, strict=True))
+    file_stack = contextlib.ExitStack()
+    try:
+        with performance.measure(collector, "assembly_output"):
+            tables = {budget: ancestors_ts.dump_tables() for budget in max_mismatches}
+            match_files = {}
+            for budget, output_path, match_file_path in outputs:
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                match_file_path.parent.mkdir(parents=True, exist_ok=True)
+                match_files[budget] = file_stack.enter_context(match_file_path.open("w"))
+        for results in batches:
+            with performance.measure(collector, "assembly_output"):
+                _append_stitched_batch(
+                    results, tables, match_files, allele_mapper, ac_cutoff, method
+                )
+            del results
+        with performance.measure(collector, "assembly_output"):
+            for budget, output_path, match_file_path in outputs:
+                budget_tables = tables.pop(budget)
+                ts = tsinfer.matching.finalise_match_tables(budget_tables)
+                ts.dump(output_path)
+                del ts, budget_tables
+                logger.info(
+                    "Wrote stitched samples to %s and %s", output_path, match_file_path
+                )
+    finally:
+        with performance.measure(collector, "assembly_output"):
+            file_stack.close()
 
 
 def _append_stitched_batch(
@@ -594,6 +729,8 @@ def match_stitched_samples(
     intervals_path: pathlib.Path | None = None,
     *,
     haplotype_batch_size: int,
+    read_workers: int | None = None,
+    collector: performance.Collector | None = None,
 ) -> None:
     """Match one dataset/cutoff/method across all budgets and assemble raw TSs.
 
@@ -630,7 +767,7 @@ def match_stitched_samples(
     )
     jobs, _, _ = tsinfer.pipeline._build_jobs_with_metadata(cfg, positions)
     jobs.sort(key=lambda job: job.haplotype_index)
-    workers = min(threads, len(jobs))
+    workers = min(threads, len(jobs), haplotype_batch_size)
     schedule = [(job.source, job.sample_id, job.ploidy_index) for job in jobs]
     reader = tsinfer.vcz.HaplotypeReader(
         cfg.sources,
@@ -639,6 +776,7 @@ def match_stitched_samples(
         cache_size_mb=cache_size,
         schedule=schedule,
         num_threads=workers,
+        read_workers=read_workers,
     )
     try:
         inputs = _prepare_stitched_inputs(
@@ -651,49 +789,26 @@ def match_stitched_samples(
             cfg.match.sources["samples"],
             intervals_path=intervals_path,
         )
-        thread_state = threading.local()
         logger.info(
             "Stitching %d haplotypes with %d threads in batches of %d",
             len(jobs),
             workers,
             haplotype_batch_size,
         )
-        outputs = list(zip(max_mismatches, output_paths, match_file_paths, strict=True))
-        tables = {budget: ancestors_ts.dump_tables() for budget in max_mismatches}
-        with contextlib.ExitStack() as file_stack:
-            match_files = {}
-            for budget, output_path, match_file_path in outputs:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                match_file_path.parent.mkdir(parents=True, exist_ok=True)
-                match_files[budget] = file_stack.enter_context(match_file_path.open("w"))
-            with contextlib.ExitStack() as executor_stack:
-                executor = None
-                if workers > 1:
-                    executor = executor_stack.enter_context(
-                        cf.ThreadPoolExecutor(max_workers=workers)
-                    )
-                for first in range(0, len(jobs), haplotype_batch_size):
-                    batch_jobs = jobs[first : first + haplotype_batch_size]
-                    results = _collect_stitched_batch(
-                        batch_jobs, reader, inputs, thread_state, method, executor
-                    )
-                    _append_stitched_batch(
-                        results,
-                        tables,
-                        match_files,
-                        reader.allele_mapper,
-                        ac_cutoff,
-                        method,
-                    )
-                    del results
-            # Each budget's final tables/TS are released before the next one.
-            for budget, output_path, match_file_path in outputs:
-                budget_tables = tables.pop(budget)
-                ts = tsinfer.matching.finalise_match_tables(budget_tables)
-                ts.dump(output_path)
-                del ts, budget_tables
-                logger.info(
-                    "Wrote stitched samples to %s and %s", output_path, match_file_path
-                )
+        batches = iter_stitched_batches(
+            jobs, reader, inputs, method, threads, haplotype_batch_size, collector
+        )
+        with contextlib.closing(batches):
+            assemble_stitched_batches(
+                batches,
+                ancestors_ts,
+                reader.allele_mapper,
+                max_mismatches,
+                output_paths,
+                match_file_paths,
+                ac_cutoff,
+                method,
+                collector,
+            )
     finally:
         reader.shutdown()

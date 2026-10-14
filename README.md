@@ -530,3 +530,157 @@ including setup and output took 3.97 s with one thread and 3.80 s with four;
 outputs agreed, with peak RSS of 341 and 376 MiB respectively. RSS showed no
 accumulation across 200 repeated reduced-reference/index/matcher preparations.
 These are small-workload measurements, not a full-cohort scaling benchmark.
+
+## Opt-in sample-matching performance experiments
+
+`uv run snakemake performance --cores 9` runs the experiment configured in the
+`performance` section of `config.yaml.example`. Copy that section into your
+configuration, select dataset names, and use `ac_cutoff: [10]`,
+`max_mismatches: [0]`, and `focal_methods: [hmm, greedy]` for the initial
+comparison. The benchmark supports one cutoff and budget zero, with one
+nonempty present-day native sample group. `reduced_hmm` selects the existing
+`method="hmm"` implementation. Ordinary `rule all` and its output paths are
+unchanged. An alternate configuration can be passed with `--configfile`.
+
+The target prepares the common annotated sample store, inferred ancestor panel
+and reference. Resident stitched trials also depend on prepared focal archives
+and masks. It then launches exactly one trial process at a time, using the
+active `uv run` Python environment. Within each repeat, method/worker pairs are
+shuffled deterministically using the configured seed. Each trial has its own
+output directory, native log and stdout/stderr log. Exceptions, memory-limit
+failures and timeouts remain failed rows with empty timing fields. Use a new
+`experiment_id` for every experiment; an existing experiment is never replaced.
+
+Two windows answer different questions:
+
+* `resident_match` loads canonical contiguous `int8` haplotypes through the
+  native scheduled reader, releases that reader and its caches, builds shared
+  indexes and warms only the greedy run-emitting Numba signature before timing.
+  It measures complete matching and collection, including worker construction,
+  reductions, gaps and stitching. It retains all completed compact results in
+  canonical batches until timing ends, then uses the same production append and
+  finalise helpers to assemble/write outputs. Full HMM keeps its native matcher
+  and assembly helpers with the default `reuse_topology=False` policy.
+* `from_reference` times the deployed leaves from the existing reference to
+  closed TS/JSONL outputs, including loading, first-use compilation and, for
+  either stitched method, newly generated candidates, intervals and masks.
+  Stitched matching interleaves bounded matching batches with assembly and
+  retains its reader, executor and worker state across batches. Preparation is
+  charged once per trial. Ancestor inference/matching and count annotation are
+  outside this window.
+
+`haplotype_batch_size` is the existing top-level setting. Keep it fixed across
+stitched comparisons and at least as large as the requested matching worker
+count when possible. Actual matching concurrency is capped by both the cohort
+and, for stitched methods, batch size. `read_workers` stays fixed independently
+of matching workers. The suite requests the largest matching count plus reader
+threads, a Blosc reserve, the Zarr helper pool, and extra BLAS/Numba helpers.
+The codec reserve includes extra threads for matching tasks that load
+synchronously on cache misses. With the example's one-thread helper limits,
+`[1, 6]` needs nine CPUs.
+It refuses a scheduler allocation smaller than that reservation; visible host
+CPU counts never select matching concurrency. Zarr async I/O concurrency is
+also fixed and recorded. The benchmark applies helper limits before child
+imports and reader creation where applicable.
+
+Outputs are under `data/performance/{experiment_id}/`:
+
+* `manifest.json`, the resolved YAML, original configuration files, generated
+  native TOMLs, frozen haplotype rosters/sample lists and `uv.lock` describe the
+  cohort, requested window, actual inference intervals, reference dimensions,
+  both repository revisions/dirty flags, packages, machine, allocation, cache,
+  helper settings, topology reuse, compilation and retention policies.
+* `runs.csv` has one raw row per trial with directly measured wall/process
+  user/system seconds, sampled window and whole-trial peak RSS, requested/actual
+  workers, workload counts, output paths, status and error text. Empty full-HMM
+  batch/focal/reduction fields are inapplicable. `domain_sites` is the total
+  matched inference-site count across haplotypes, including internal missing
+  calls; it is not the reference's contig-wide sequence length.
+  `focal_calls` counts reduced HMM regional calls or whole-haplotype greedy
+  sweeps; `gap_calls` counts full-HMM regional calls. Native full HMM uses
+  `full_calls`, one per haplotype.
+* `stages.csv` contains process aggregates for `focal_preparation`, `matching`,
+  `assembly_output`, or the native full-HMM `full_pipeline`. Stitched diagnostics
+  contain worker service/thread-CPU aggregates for `simplify`, `reduced_setup`,
+  `focal_match`, `gap_match` and `stitch`. Matching batches and assembly windows
+  do not overlap. Worker diagnostics are nested inside matching; their service
+  sums can exceed parallel wall time, and their thread CPU excludes reader and
+  other helper work. They must never be added to the measured total.
+* Each trial retains its specification, result JSON and timestamped launcher
+  `rss_samples.csv`. `quality.json`, when enabled, is calculated after all trial
+  processes exit, outside timing and trial RSS. It checks TS/JSONL paths and
+  mutations, original node IDs, native sample assignments and called-allele
+  reconstruction, and reports switches, mismatches, parent agreement with the
+  corresponding full-HMM trial and log likelihood under one common full
+  reference model. Approximate methods may legitimately choose other parents.
+
+RSS is sampled with `psutil` by the launcher, outside the child's GIL, plus one
+sample at each measured-window boundary. Both maxima are approximate and can
+miss short spikes. The whole-trial peak also includes preparation and output.
+Resident results deliberately scale with the entire cohort: this diagnostic
+mode does not establish production's bounded result memory. Matrix and sampled
+RSS limits reject unsuitable resident workloads; use `from_reference` for scale
+runs. Production's output tables, input archives and reader caches remain
+cohort/reference sized. Fresh trial processes do not imply cold filesystem
+caches.
+
+Start with one pilot, then three repeats at one worker and a sensible parallel
+allocation. For the initial biological workload freeze 300 diploid IDs balanced
+across CEU/CHB/YRI and select `POS >= 1000000 & POS < 31000000`; rebuild counts
+and the reference for that cohort, retaining the existing ancestral-allele field,
+recombination `0.01`, mismatch `1e-20` and disabled path compression. Confirm the
+selected workload fits before choosing a 4096 MiB reader cache. Run resident
+comparisons first, followed by a small from-reference comparison. Extend sequence
+length or cohort size separately, rebuilding each corresponding panel.
+
+Set `collect_stages: false` for total-only repeats if regional timers noticeably
+perturb the pilot; collect the breakdown in a separate experiment with the same
+workload. Keep quality separate from performance. Analysis can compute
+`cpu_s = user_s + system_s`, `effective_cores = cpu_s / wall_s`, medians/spread,
+and full-HMM/method ratios only for identical workloads, modes and allocations.
+See [the implementation plan](plans/performance_testing.md) for timing contracts
+and the manual acceptance checks. No test suite is added.
+
+Verification on 14 October 2026 used saved post-M3 outputs, 48 small
+method/worker/batch/instrumentation combinations, explicit nonempty mutations,
+and a 12,000-site workload with 1,200 alternating regions per haplotype.
+Scientific outputs agreed, including missing calls and inference boundaries;
+weak references confirmed batch/future/task-record release and persistent worker
+scratch. Manual failure checks covered timeouts, exceptions, truncated trial
+results, allocation rejection, and RSS limits including boundary-only samples.
+Ruff lint/format and compilation checks passed; no unit-test suite was added.
+
+The frozen local CEU/CHB/YRI cohort (100 diploid individuals per population,
+chr20 `1000000 <= POS < 31000000`) rebuilt counts and a reference with 214,879
+sites, 127,453 nodes and 922,379 edges. Six diagnostic pilot trials, eighteen
+total-only resident repeats, and three from-reference trials completed. The
+same-method scientific tables and canonical records were identical across all
+27 trials. RSS maxima were independently recomputed from saved samples and
+boundaries, and process-stage aggregates were checked against the direct totals.
+
+| Method | Resident, 1 worker, median of 3 (s) | Resident, 6 workers, median of 3 (s) | From reference, 6 workers, one trial (s) |
+| --- | ---: | ---: | ---: |
+| Full HMM | 169.056 | 28.141 | 57.560 |
+| Reduced HMM | 94.786 | 39.674 | 115.368 |
+| Greedy | 57.823 | 10.766 | 85.570 |
+
+The serial reduced-HMM diagnostic recorded 26.354 s of simplification service,
+8.909 s of focal matching and 57.424 s of gap matching. In the from-reference
+trials, focal preparation took 44.186 s for reduced HMM and 45.572 s for greedy;
+assembly/output took under one second each. The matching aggregates also include
+reader waits in that mode. Resident window peaks were approximately 5–6 GiB;
+from-reference peaks were 15.1–15.3 GiB. These are sampled process RSS values,
+including preparation's retained allocations where applicable.
+
+Quality is recorded separately: all methods had zero called mismatches, with
+201,997 full-HMM switches, 209,901 reduced-HMM switches and 211,357 greedy
+switches. Parent agreement with full HMM was 89.4% for reduced HMM and 87.9% for
+greedy. Common full-reference likelihoods are in each experiment's
+`quality.json`. Four early greedy `focal_calls` metadata values were corrected
+from component counts to actual sweep calls; `runs_recorded.csv`, affected
+`result_recorded.json` files and `workload_corrections.json` preserve the original
+records and correction details. Timing/RSS values and scientific outputs were
+unchanged. Local configurations, the frozen roster, workflow logs and combined
+`summary.json` are under `data/performance/local_20261014/`; experiment products
+are in the corresponding `tgp_n300_30mbp_*_20261014` directories. These generated
+data directories remain ignored by Git.

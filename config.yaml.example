@@ -1,11 +1,9 @@
 data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
-ac_cutoff: [3, 5, 10]
-max_mismatches: [0, 1]
-focal_methods: [hmm]
-# To compare exact greedy covers with the reduced HMM, use
-# max_mismatches: [0] and focal_methods: [hmm, greedy].
+ac_cutoff: [10]
+max_mismatches: [0]
+focal_methods: [hmm, greedy]
 hmm:
   recombination: 0.01
   mismatch: 1.0e-20
@@ -32,3 +30,28 @@ inference_threads: 1
 matching_threads: 1
 # Keep at least as many haplotypes in a batch as stitched matching workers.
 haplotype_batch_size: 64
+
+# Opt-in: uv run snakemake performance --cores 9
+# This experiment reuses the AC/budget/method selection above.
+# Ordinary rule all is unchanged.
+performance:
+  experiment_id: sample_matching_pilot
+  datasets: [tgp_chr20_n100]
+  modes: [resident_match, from_reference]
+  methods: [full_hmm, reduced_hmm, greedy]
+  worker_counts: [1, 6]
+  repeats: 1  # Pilot first; use a new experiment_id and 3 for the main suite.
+  seed: 20261014
+  read_workers: 1
+  rss_sample_interval_s: 0.02
+  trial_timeout_s: 3600
+  collect_stages: true  # false gives total-only trials with workload counters.
+  quality_checks: true  # Separate post-trial scientific checks, never timed.
+  resident_max_matrix_mib: 512
+  resident_max_rss_mib: 8192
+  helper_threads:
+    blosc_threads: 1
+    zarr_async_concurrency: 1
+    zarr_threading_max_workers: 1
+    blas_threads: 1
+    numba_threads: 1

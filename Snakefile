@@ -1,7 +1,7 @@
 import csv
 import pathlib
 
-from lib import ancestors, haplotypes, matching, utils
+from lib import ancestors, benchmark, haplotypes, matching, utils
 
 
 configfile: "config.yaml"
@@ -359,3 +359,65 @@ rule match_samples:
             threads,
             params.cache_size,
         )
+
+
+if "performance" in config:
+    performance_dir = benchmark.output_directory(config)
+    performance_names = config["performance"]["datasets"]
+    performance_resident_focal = (
+        "resident_match" in config["performance"]["modes"]
+        and any(method != "full_hmm" for method in config["performance"]["methods"])
+    )
+
+    rule performance:
+        input:
+            performance_dir / "manifest.json",
+            performance_dir / "runs.csv",
+            performance_dir / "stages.csv",
+
+    rule performance_suite:
+        input:
+            configs=expand(
+                data_dir / "configs" / "{name}_ancestor_inference.toml",
+                name=performance_names,
+            ),
+            samples=expand(
+                data_dir / "samples" / "{name}_samples_masked.zarr",
+                name=performance_names,
+            ),
+            panels=expand(
+                data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
+                name=performance_names,
+            ),
+            references=expand(
+                data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+                name=performance_names,
+            ),
+            focal=(expand(
+                data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+                name=performance_names,
+            ) if performance_resident_focal else []),
+            intervals=(expand(
+                data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
+                name=performance_names,
+            ) if performance_resident_focal else []),
+            masks=(expand(
+                data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_focal_mask.npz",
+                name=performance_names, ac=ac_cutoff, k=max_mismatches,
+            ) if performance_resident_focal else []),
+        output:
+            protected(performance_dir / "manifest.json"),
+            protected(performance_dir / "runs.csv"),
+            protected(performance_dir / "stages.csv"),
+        threads: benchmark.required_allocation(config)
+        log:
+            progress_dir / "performance" / f"{config['performance']['experiment_id']}.log",
+        run:
+            utils.setup_log(pathlib.Path(log[0]))
+            benchmark.run_suite(
+                config, threads, [pathlib.Path(path) for path in workflow.configfiles]
+            )
+else:
+    rule performance:
+        run:
+            raise ValueError("Add the performance section from config.yaml.example")

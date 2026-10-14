@@ -8,6 +8,7 @@ dependencies = [
     "numpy>=2",
     "numcodecs",
     "pandas",
+    "psutil",
     "pyyaml",
     "snakemake>=9",
     "tomli-w",
