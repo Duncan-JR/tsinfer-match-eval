@@ -9,6 +9,11 @@ analysis. As such, the user will often request analysis to be done in
 jupytext-synced notebook where you edit the py. Otherwise, code lives in lib for
 the use of the pipeline.
 
+Do not add reports and detailed feedback about experiments in the Readme. The
+readme should always be updated as necessary to describe in simple terms how the
+pipeline works, provide simple usage examples and explain every config option
+clearly. It should be kept concise and informative.
+
 ## Code Style
 
 - Do not be overly defensive - defend only against circumstances that can
