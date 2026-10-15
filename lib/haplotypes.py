@@ -36,7 +36,7 @@ def _sample_rows(samples, positions):
 
 
 def _load_sample_haplotypes(samples, panel, sample_selection, site_indices=None):
-    """Polarise sample allele strings using the inferred panel's ancestry.
+    """Polarise allele indices using one numeric lookup per panel site.
 
     Shared by :func:`find_focal_ancestors` and interval :func:`_prepare`.
     Check the cross-store position mapping at this loading boundary. Optional
@@ -53,11 +53,11 @@ def _load_sample_haplotypes(samples, panel, sample_selection, site_indices=None)
         ancestral = panel["variant_allele"][:, 0]
     else:
         ancestral = panel["variant_allele"].oindex[site_indices, 0]
-    called = genotypes >= 0
-    allele_indices = np.maximum(genotypes, 0)
-    called_alleles = np.take_along_axis(alleles[:, None, :], allele_indices, axis=2)
-    derived = called_alleles != ancestral[:, None, None]
-    calls = np.where(called, derived, -1).astype(np.int8)
+    allele_codes = (alleles != ancestral[:, None]).astype(np.int8)
+    missing = genotypes < 0
+    genotypes[missing] = 0
+    calls = np.take_along_axis(allele_codes[:, None, :], genotypes, axis=2)
+    calls[missing] = -1
     ploidy = genotypes.shape[2]
     num_haplotypes = genotypes.shape[1] * ploidy
     calls = calls.reshape(len(positions), num_haplotypes)
