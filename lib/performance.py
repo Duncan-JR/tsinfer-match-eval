@@ -42,6 +42,7 @@ class Collector:
     stages: bool = True
     records: dict = dataclasses.field(default_factory=dict)
     workload: dict = dataclasses.field(default_factory=dict)
+    haplotype_times: list[dict] = dataclasses.field(default_factory=list)
 
     def count(self, **counts):
         for name, value in counts.items():

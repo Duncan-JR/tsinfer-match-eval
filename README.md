@@ -260,6 +260,7 @@ of `data_dir`, including single-cutoff invocations. Each folder contains:
 | --- | --- |
 | `manifest.json` and saved configs/rosters/`uv.lock` | Record workload, sample identities, settings, source revisions, packages, machine, and allocation. |
 | `runs.csv` | One row per trial: cutoff, status/error, wall and process CPU times, peak RSS, requested/actual workers, workload counts, and output paths. Failures have empty timing fields; subsequent trials still run. Run IDs and trial metadata include the cutoff. |
+| `{run_id}/per_haplotype_worker_times.csv` | Reduced HMM and Greedy only, when `collect_stages: true`. One row per haplotype: `sample_id`, `ploidy_index`, and `service_s` (summed worker-stage elapsed seconds, including simplification/setup/stitching). Written after the timing window; join to `runs.csv` by the trial folder name for method, mode and repeat. |
 | `stages.csv` | Stage breakdown. Worker service time/thread CPU are nested diagnostics, not additional total time; parallel service sums can exceed wall time. Contains only a header when stage collection is disabled. |
 | `quality.json` | Separate scientific checks, when enabled. Different methods may legitimately choose different parents. |
 | Each trial directory | Tree/JSONL outputs, specification/result JSON, `trial.log`, `native.log`, and `rss_samples.csv`. From-reference stitched trials also retain regenerated focal products. |

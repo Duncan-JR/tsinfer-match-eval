@@ -647,6 +647,19 @@ def iter_stitched_batches(
                 )
                 if collector is not None:
                     for result in results:
+                        if collector.stages:
+                            service_s = sum(
+                                record.service_s
+                                for record in result.measurements.records.values()
+                                if record.scope == "worker"
+                            )
+                            collector.haplotype_times.append(
+                                {
+                                    "sample_id": result.job.sample_id,
+                                    "ploidy_index": result.job.ploidy_index,
+                                    "service_s": service_s,
+                                }
+                            )
                         collector.merge(result.measurements)
                         result.measurements = None
                     del result

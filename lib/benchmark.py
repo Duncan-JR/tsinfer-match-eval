@@ -542,6 +542,15 @@ def trial(spec_path):
                 "reduced_edges",
             ):
                 collector.workload.setdefault(name, 0)
+        if run["method"] != "full_hmm" and collector.stages:
+            timings_path = folder / "per_haplotype_worker_times.csv"
+            with timings_path.open("w", newline="") as timings_file:
+                writer = csv.DictWriter(
+                    timings_file,
+                    fieldnames=["sample_id", "ploidy_index", "service_s"],
+                )
+                writer.writeheader()
+                writer.writerows(collector.haplotype_times)
         result = {
             "status": "ok",
             "window": dataclasses.asdict(measurement.window),
