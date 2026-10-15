@@ -1,7 +1,7 @@
 data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
-ac_cutoff: [10]
+ac_cutoff: [10]  # Distinct positive cutoffs; performance passes run in this order.
 max_mismatches: [0]
 focal_methods: [hmm, greedy]
 hmm:
@@ -32,7 +32,8 @@ matching_threads: 1
 haplotype_batch_size: 64
 
 # Opt-in: uv run snakemake performance --cores 9
-# This experiment reuses the AC/budget/method selection above.
+# Complete all repeats at each AC cutoff above before starting the next.
+# Results: data/performance/{experiment_id}/ac{cutoff}/, even for one cutoff.
 # Ordinary rule all is unchanged.
 performance:
   experiment_id: sample_matching_pilot
@@ -40,7 +41,7 @@ performance:
   modes: [resident_match, from_reference]
   methods: [full_hmm, reduced_hmm, greedy]
   worker_counts: [1, 6]
-  repeats: 1  # Pilot first; use a new experiment_id and 3 for the main suite.
+  repeats: 1  # Per cutoff; pilot first, then use a new experiment_id and 3.
   seed: 20261014
   read_workers: 1
   rss_sample_interval_s: 0.02

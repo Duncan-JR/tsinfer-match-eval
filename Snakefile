@@ -10,14 +10,7 @@ focal_choice = config.get("focal_choice", "left")
 if focal_choice not in ("left", "right"):
     raise ValueError("focal_choice must be exactly 'left' or 'right'")
 ac_cutoff = config["ac_cutoff"]
-if not isinstance(ac_cutoff, list) or len(ac_cutoff) == 0:
-    raise ValueError("ac_cutoff must be a nonempty list")
-if any(isinstance(value, bool) or not isinstance(value, int) for value in ac_cutoff):
-    raise ValueError("ac_cutoff values must be integers, not booleans")
-if any(value <= 0 for value in ac_cutoff) or any(
-    right <= left for left, right in zip(ac_cutoff, ac_cutoff[1:])
-):
-    raise ValueError("ac_cutoff must contain strictly increasing positive integers")
+benchmark.validate_ac_cutoffs(ac_cutoff)
 max_ac_cutoff = max(ac_cutoff)
 max_mismatches = config["max_mismatches"]
 if not isinstance(max_mismatches, list) or len(max_mismatches) == 0:
@@ -373,6 +366,16 @@ rule match_samples:
 
 if "performance" in config:
     performance_dir = benchmark.output_directory(config)
+    performance_products = ["manifest.json", "runs.csv", "stages.csv"]
+    if config["performance"]["quality_checks"]:
+        performance_products.append("quality.json")
+    performance_outputs = [
+        performance_dir / "complete.json",
+        *expand(
+            performance_dir / "ac{ac}" / "{product}",
+            ac=ac_cutoff, product=performance_products,
+        ),
+    ]
     performance_names = config["performance"]["datasets"]
     performance_resident_focal = (
         "resident_match" in config["performance"]["modes"]
@@ -381,9 +384,7 @@ if "performance" in config:
 
     rule performance:
         input:
-            performance_dir / "manifest.json",
-            performance_dir / "runs.csv",
-            performance_dir / "stages.csv",
+            performance_outputs,
 
     rule performance_suite:
         input:
@@ -416,9 +417,7 @@ if "performance" in config:
                 name=performance_names, ac=ac_cutoff, k=max_mismatches,
             ) if performance_resident_focal else []),
         output:
-            protected(performance_dir / "manifest.json"),
-            protected(performance_dir / "runs.csv"),
-            protected(performance_dir / "stages.csv"),
+            protected(performance_outputs),
         threads: benchmark.required_allocation(config)
         log:
             progress_dir / "performance" / f"{config['performance']['experiment_id']}.log",

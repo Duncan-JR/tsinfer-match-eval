@@ -56,6 +56,7 @@ class Run:
 
     run_id: str
     dataset: str
+    ac_cutoff: int
     method: str
     mode: str
     repeat: int
@@ -148,7 +149,18 @@ def required_allocation(config):
     return max(settings["worker_counts"]) + readers + codec_workers + other_helpers
 
 
+def validate_ac_cutoffs(cutoffs):
+    """Require distinct positive integer cutoffs, preserving configured order."""
+    if not isinstance(cutoffs, list) or len(cutoffs) == 0:
+        raise ValueError("ac_cutoff must be a nonempty list")
+    if any(type(value) is not int or value <= 0 for value in cutoffs):
+        raise ValueError("ac_cutoff values must be positive integers, not booleans")
+    if len(set(cutoffs)) != len(cutoffs):
+        raise ValueError("ac_cutoff must not contain duplicates")
+
+
 def validate_config(config, allocation):
+    validate_ac_cutoffs(config["ac_cutoff"])
     settings = config["performance"]
     experiment = settings["experiment_id"]
     if not experiment or any(
@@ -157,8 +169,8 @@ def validate_config(config, allocation):
         raise ValueError(
             "performance.experiment_id must use lowercase underscores/numbers"
         )
-    if len(config["ac_cutoff"]) != 1 or config["max_mismatches"] != [0]:
-        raise ValueError("Performance experiments require one AC cutoff and budget [0]")
+    if config["max_mismatches"] != [0]:
+        raise ValueError("Performance experiments require max_mismatches: [0]")
     if not settings["methods"] or not set(settings["methods"]) <= {
         "full_hmm",
         "reduced_hmm",
@@ -477,6 +489,8 @@ def trial(spec_path):
     try:
         validate_config(config, spec["allocation"])
         run = spec["run"]
+        if len(config["ac_cutoff"]) != 1 or run["ac_cutoff"] != config["ac_cutoff"][0]:
+            raise ValueError("Trial must select its configured single AC cutoff")
         selections = {
             "requested_workers": "worker_counts",
             "method": "methods",
@@ -489,7 +503,7 @@ def trial(spec_path):
         dataset = next(
             item for item in config["datasets"] if item["name"] == spec["run"]["dataset"]
         )
-        paths = prepared_inputs(config, dataset)
+        paths = prepared_inputs(config, dataset, spec["max_ac_cutoff"])
         function = (
             _resident_trial if run["mode"] == "resident_match" else _from_reference_trial
         )
@@ -669,8 +683,8 @@ def _revision(root):
     }
 
 
-def _cohort_manifest(config, dataset, folder):
-    paths = prepared_inputs(config, dataset)
+def _cohort_manifest(config, dataset, folder, max_ac_cutoff):
+    paths = prepared_inputs(config, dataset, max_ac_cutoff)
     reference = tskit.load(paths.reference)
     cfg = matching._sample_config(paths.config, paths.reference, folder / "unused.trees")
     jobs = _sample_jobs(cfg, reference)
@@ -709,7 +723,7 @@ def _cohort_manifest(config, dataset, folder):
     }
 
 
-def _write_manifest(config, allocation, folder, config_paths):
+def _write_manifest(config, allocation, folder, config_paths, max_ac_cutoff):
     versions = {}
     source_hashes = {}
     for path in [pathlib.Path("Snakefile"), *pathlib.Path("lib").glob("*.py")]:
@@ -730,9 +744,12 @@ def _write_manifest(config, allocation, folder, config_paths):
     datasets = {}
     for dataset in config["datasets"]:
         if dataset["name"] in selected:
-            datasets[dataset["name"]] = _cohort_manifest(config, dataset, folder)
+            datasets[dataset["name"]] = _cohort_manifest(
+                config, dataset, folder, max_ac_cutoff
+            )
     manifest = {
         "configuration": config,
+        "resident_input_max_ac_cutoff": max_ac_cutoff,
         "source_sha256": source_hashes,
         "repositories": {
             "tsinfer_match_eval": _revision(pathlib.Path.cwd()),
@@ -801,16 +818,49 @@ def _write_manifest(config, allocation, folder, config_paths):
 
 
 def run_suite(config, allocation, config_paths=None):
-    """Run one subprocess at a time; write raw rows even for timeout/exception."""
+    """Finish a complete suite at each configured cutoff before the next pass.
+
+    Each pass is an ordinary single-cutoff experiment. Resident trials share
+    maximum-cutoff preparation; from-reference trials prepare their own cutoff
+    inside timing. Publish completion only after every trial and check succeeds.
+    """
     validate_config(config, allocation)
     _configure_helpers(config["performance"])
     if config_paths is None:
         config_paths = []
     folder = output_directory(config).resolve()
     folder.mkdir(parents=True, exist_ok=True)
-    if any(folder.iterdir()):
-        raise ValueError("Experiment directory is not empty; choose a new experiment_id")
-    _write_manifest(config, allocation, folder, config_paths)
+    pass_folders = {folder / f"ac{cutoff}" for cutoff in config["ac_cutoff"]}
+    # Snakemake creates output parent directories before entering the rule.
+    for entry in folder.iterdir():
+        if entry not in pass_folders or not entry.is_dir() or any(entry.iterdir()):
+            raise ValueError(
+                "Experiment directory is not empty; choose a new experiment_id"
+            )
+    max_ac_cutoff = max(config["ac_cutoff"])
+    succeeded = []
+    for cutoff in config["ac_cutoff"]:
+        pass_config = {**config, "ac_cutoff": [cutoff]}
+        pass_folder = folder / f"ac{cutoff}"
+        pass_folder.mkdir(exist_ok=True)
+        logger.info("Starting AC %d pass", cutoff)
+        pass_succeeded = _run_cutoff(
+            pass_config, allocation, pass_folder, config_paths, max_ac_cutoff
+        )
+        succeeded.append(pass_succeeded)
+        logger.info("Finished AC %d pass", cutoff)
+    if not all(succeeded):
+        raise RuntimeError("Benchmark trials or quality checks failed; see pass results")
+    completion = {"ac_cutoff": config["ac_cutoff"]}
+    (folder / "complete.json").write_text(json.dumps(completion, indent=2) + "\n")
+    return folder
+
+
+def _run_cutoff(config, allocation, folder, config_paths, max_ac_cutoff):
+    """Run single-cutoff trials sequentially, retaining rows for failed trials."""
+    _write_manifest(config, allocation, folder, config_paths, max_ac_cutoff)
+    cutoff = config["ac_cutoff"][0]
+    succeeded = True
     settings = config["performance"]
     rng = random.Random(settings["seed"])
     run_fields = [field.name for field in dataclasses.fields(Run)]
@@ -826,7 +876,7 @@ def run_suite(config, allocation, config_paths=None):
         runs_writer.writeheader()
         stages_writer.writeheader()
         for repeat in range(settings["repeats"]):
-            # Mode order is explicit: resident first, then from_reference.
+            # Dataset and mode order follow configuration within each repeat.
             for dataset, mode in itertools.product(
                 settings["datasets"], settings["modes"]
             ):
@@ -835,10 +885,15 @@ def run_suite(config, allocation, config_paths=None):
                 )
                 rng.shuffle(combinations)
                 for order, (method, workers) in enumerate(combinations):
-                    run_id = f"{dataset}_{mode}_{method}_w{workers}_r{repeat}_o{order}"
+                    run_id = (
+                        f"{dataset}_ac{cutoff}_{mode}_{method}"
+                        f"_w{workers}_r{repeat}_o{order}"
+                    )
                     trial_folder = folder / run_id
                     trial_folder.mkdir()
-                    run = Run(run_id, dataset, method, mode, repeat, order, workers)
+                    run = Run(
+                        run_id, dataset, cutoff, method, mode, repeat, order, workers
+                    )
                     if method != "full_hmm":
                         run.haplotype_batch_size = config["haplotype_batch_size"]
                     run.output_trees = str(trial_folder / "samples_raw.trees")
@@ -850,6 +905,7 @@ def run_suite(config, allocation, config_paths=None):
                             {
                                 "config": config,
                                 "allocation": allocation,
+                                "max_ac_cutoff": max_ac_cutoff,
                                 "run": dataclasses.asdict(run),
                             },
                             indent=2,
@@ -859,6 +915,8 @@ def run_suite(config, allocation, config_paths=None):
                     logger.info("Starting %s", run_id)
                     result = _launch(spec_path, settings)
                     run.status = result["status"]
+                    if run.status != "ok":
+                        succeeded = False
                     run.error = result.get("error", "")
                     run.trial_peak_rss_bytes = result["trial_peak_rss_bytes"]
                     if run.status == "ok":
@@ -875,11 +933,13 @@ def run_suite(config, allocation, config_paths=None):
                     stages_file.flush()
                     logger.info("Finished %s: %s %s", run_id, run.status, run.error)
     if settings["quality_checks"]:
-        quality_reports(config, folder)
-    return folder
+        reports = quality_reports(config, folder, max_ac_cutoff)
+        if any(report["status"] != "ok" for report in reports):
+            succeeded = False
+    return succeeded
 
 
-def quality_reports(config, folder):
+def quality_reports(config, folder, max_ac_cutoff=None):
     """Implementation is below the launcher so quality is never part of a trial."""
     with (folder / "runs.csv").open(newline="") as source:
         runs = list(csv.DictReader(source))
@@ -888,7 +948,7 @@ def quality_reports(config, folder):
     for run in runs:
         if run["status"] != "ok":
             continue
-        paths = prepared_inputs(config, datasets[run["dataset"]])
+        paths = prepared_inputs(config, datasets[run["dataset"]], max_ac_cutoff)
         baseline = next(
             (
                 candidate
@@ -897,7 +957,9 @@ def quality_reports(config, folder):
                 and candidate["method"] == "full_hmm"
                 and all(
                     candidate[name] == run[name]
-                    for name in ("dataset", "mode", "repeat", "requested_workers")
+                    for name in (
+                        "dataset", "ac_cutoff", "mode", "repeat", "requested_workers"
+                    )
                 )
             ),
             None,
@@ -907,11 +969,13 @@ def quality_reports(config, folder):
         except Exception:
             report = {
                 "run_id": run["run_id"],
+                "ac_cutoff": int(run["ac_cutoff"]),
                 "status": "failed",
                 "error": traceback.format_exc(),
             }
         reports.append(report)
     (folder / "quality.json").write_text(json.dumps(reports, indent=2) + "\n")
+    return reports
 
 
 def _quality(config, paths, run, baseline):
@@ -1066,6 +1130,7 @@ def _quality(config, paths, run, baseline):
                 )
     return {
         "run_id": run["run_id"],
+        "ac_cutoff": int(run["ac_cutoff"]),
         "status": "ok",
         "reconstructed_called_allele_errors": reconstruction_errors,
         "switches": switches,

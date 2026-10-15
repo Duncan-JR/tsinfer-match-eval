@@ -49,7 +49,9 @@ copies along the sequence.
    using the HMM (hidden Markov model).
 4. **Find focal candidates.** Choose one focal site, or **seed**, per ancestor.
    An ancestor is a candidate when the sample haplotype carries the derived allele
-   at that seed. Ancestors without a seed contribute nothing.
+   at that seed. Discard ancestors above the largest requested annotated derived
+   AC before loading seed calls or expanding candidates. Ancestors without a seed
+   contribute nothing.
 5. **Find coverage.** For eligible candidates, extend left and right from the
    seed while comparing sample and ancestor calls. Stop at the mismatch budget,
    missing data, ancestor support, or an inference-interval boundary. Union these
@@ -81,7 +83,7 @@ and the main output/log directories.
 | `data_dir`          | `data/match_eval` | Root directory for ordinary pipeline products. Performance results have a separate fixed root.                                                                                                                                                                                                                                  |
 | `progress_dir`      | `.progress`       | Directory for per-rule logs.                                                                                                                                                                                                                                                                                                    |
 | `focal_choice`      | `left`            | Use each ancestor's leftmost focal site as its seed; `right` uses the rightmost. Defaults to `left` if omitted; `null` is invalid. Changing it can change candidates and coverage.                                                                                                                                              |
-| `ac_cutoff`         | `[10]`            | Keep candidates whose seed's derived AC is **at most** this value. Lower values restrict focal matching to rarer alleles. Supply a nonempty list of strictly increasing positive integers; each gets separate masks and stitched outputs.                                                                                       |
+| `ac_cutoff`         | `[10]`            | Keep candidates whose seed's derived AC is **at most** this value. Lower values restrict focal matching to rarer alleles. Supply a nonempty list of distinct positive integers; each gets separate masks and stitched outputs. Performance passes follow this list's order. |
 | `max_mismatches`    | `[0]`             | Mismatches allowed **on each side of the seed** during interval extension. `0` gives exact intervals; `1` allows one mismatch left and one right, excluding the next mismatch. Supply a nonempty list of strictly increasing nonnegative integers; each gets separate outputs. This controls coverage, not HMM mismatch counts. |
 | `focal_methods`     | `[hmm, greedy]`   | Focal matching methods: `hmm` uses the reduced reference; `greedy` uses exact intervals. Choose either or both without duplicates. Greedy requires `max_mismatches: [0]`. Gaps always use the full HMM.                                                                                                                         |
 | `hmm.recombination` | `0.01`            | Constant HMM recombination probability between successive inference sites. Larger values make switching copying states less costly. This is a probability, not a per-base simulation rate.                                                                                                                                      |
@@ -91,8 +93,10 @@ The `hmm` block supplies both probabilities to ancestor and sample matching,
 including reduced HMM and gap matching. Both must be strictly between 0 and 1.
 Greedy focal copying does not use these probabilities.
 
-Intervals are computed once at the **largest** AC cutoff and mismatch budget;
-smaller values reuse those comparisons. For example, this produces six masks
+Candidates and intervals are prepared once at the **largest** AC cutoff;
+intervals cover the largest mismatch budget, and smaller values reuse those
+comparisons. Both archives record their maximum supported cutoff and reject
+larger requests. For example, this produces six masks
 and six stitched tree/JSONL pairs per dataset:
 
 ```yaml
@@ -144,10 +148,18 @@ The `performance` block enables the `performance` target; benchmark trials are
 not part of the default run. The target prepares dependencies, then runs
 **one fresh trial process at a time**.
 
-It requires exactly one `ac_cutoff`, `max_mismatches: [0]`, and one nonempty
+It requires a nonempty list of distinct positive `ac_cutoff` values,
+`max_mismatches: [0]`, and one nonempty
 present-day sample group per dataset. Enable `hmm` in `focal_methods` to benchmark
 `reduced_hmm`, and `greedy` to benchmark `greedy`. Trials reuse the main dataset
 settings, focal choice, HMM probabilities, reader cache, and batch size.
+
+The complete suite runs once per cutoff, in configured order. With
+`ac_cutoff: [3, 5, 7, 10]` and `performance.repeats: 3`, all datasets, modes,
+methods (including full HMM), worker counts and three repetitions finish at
+AC 3 before AC 5 starts, followed by AC 7 and AC 10. Resident trials share
+maximum-cutoff preparation and filter it downstream. Each from-reference
+stitched trial prepares only its own cutoff inside the measured window.
 
 ### What is measured
 
@@ -181,7 +193,7 @@ Values below are those in `config.yaml.example`.
 | `modes` | `[resident_match, from_reference]` | Timing windows described above. Choose either or both without duplicates; they run in list order. |
 | `methods` | `[full_hmm, reduced_hmm, greedy]` | Algorithms described above. Nonempty, without duplicates. Include `full_hmm` for quality comparisons against the baseline. |
 | `worker_counts` | `[1, 6]` | Matching workers to try for each method: here, one-worker and six-worker trials. Positive integers without duplicates. Actual workers are capped by haplotype count and, for stitched methods, batch size. |
-| `repeats` | `1` | Positive number of trials for every dataset/mode/method/worker combination. Start with one pilot; use e.g. `3` in a new experiment to assess variability. |
+| `repeats` | `1` | Positive number of trials for every dataset/mode/method/worker combination **at each cutoff**. Does not count passes through the cutoff list. Start with one pilot; use e.g. `3` in a new experiment to assess variability. |
 | `seed` | `20261014` | Integer random seed for shuffling method/worker trial order within each dataset, mode, and repeat. Makes ordering reproducible; does not randomise input data. |
 | `read_workers` | `1` | Positive number of background threads loading genotype chunks, fixed while matching workers change. Resident loading happens before timing; from-reference reading is timed. |
 | `rss_sample_interval_s` | `0.02` | Positive interval in seconds between samples of trial-process RAM usage (RSS): about every 20 ms here. Shorter intervals give finer observations with more sampling overhead; brief spikes can still be missed. |
@@ -192,9 +204,10 @@ Values below are those in `config.yaml.example`.
 | `resident_max_rss_mib` | `8192` | Positive limit in MiB on total resident trial-process RAM, including preparation and output. Sampled RSS above it kills the trial; timing-boundary samples are also checked. Separate from the matrix limit. Neither resident limit applies to `from_reference`. |
 | `helper_threads` | See below | Supporting-library concurrency limits, separate from matching/read workers. These also affect CPU reservation. |
 
-MiB means 1,048,576 bytes. Trial count is datasets × modes × methods × worker
-counts × repeats: the example runs **12 trials**. Method/worker pairs are shuffled
-within each dataset/mode/repeat and run sequentially.
+MiB means 1,048,576 bytes. Trial count is cutoffs × datasets × modes × methods ×
+worker counts × repeats: the single-cutoff example runs **12 trials**.
+Method/worker pairs are shuffled within each dataset/mode/repeat and run
+sequentially; the random order restarts from the configured seed for each cutoff.
 
 ### Helper limits
 
@@ -240,16 +253,19 @@ Keep batch size, cache size, and helper settings fixed when comparing workers.
 
 ### Results and interpretation
 
-Results always go under `data/performance/{experiment_id}/`, independently  of
-`data_dir`:
+Each pass writes to `data/performance/{experiment_id}/ac{cutoff}/`, independently
+of `data_dir`, including single-cutoff invocations. Each folder contains:
 
 | Product | Purpose |
 | --- | --- |
 | `manifest.json` and saved configs/rosters/`uv.lock` | Record workload, sample identities, settings, source revisions, packages, machine, and allocation. |
-| `runs.csv` | One row per trial: status/error, wall and process CPU times, peak RSS, requested/actual workers, workload counts, and output paths. Failures remain rows with empty timing fields; the suite continues. |
+| `runs.csv` | One row per trial: cutoff, status/error, wall and process CPU times, peak RSS, requested/actual workers, workload counts, and output paths. Failures have empty timing fields; subsequent trials still run. Run IDs and trial metadata include the cutoff. |
 | `stages.csv` | Stage breakdown. Worker service time/thread CPU are nested diagnostics, not additional total time; parallel service sums can exceed wall time. Contains only a header when stage collection is disabled. |
 | `quality.json` | Separate scientific checks, when enabled. Different methods may legitimately choose different parents. |
 | Each trial directory | Tree/JSONL outputs, specification/result JSON, `trial.log`, `native.log`, and `rss_samples.csv`. From-reference stitched trials also retain regenerated focal products. |
+
+The experiment root receives `complete.json` only after every requested pass's
+trials and enabled quality checks succeed. A failed suite exits with an error.
 
 `window_peak_rss_bytes` covers the measured window; `trial_peak_rss_bytes`
 covers the whole trial, including preparation and output. Both are sampled
@@ -262,7 +278,8 @@ Do not add stage times to the measured total.
 ## Ordinary outputs and rerunning
 
 Paths below are under `data_dir`, for dataset `{name}`. `{ac}`, `{k}`, and
-`{method}` are a configured cutoff, mismatch budget, and focal method.
+`{method}` are a configured cutoff, mismatch budget, and focal method;
+`{max_ac}` is the largest configured cutoff.
 
 | Path | Contents |
 | --- | --- |
@@ -270,8 +287,8 @@ Paths below are under `data_dir`, for dataset `{name}`. `{ac}`, `{k}`, and
 | `configs/{name}_ancestor_inference.toml` | Generated native tsinfer configuration. |
 | `ancestors/{name}_inferred_ancestors.zarr/` | Inferred ancestor panel. |
 | `ancestors/{name}_inferred_ancestors.trees` | Matched ancestor reference. |
-| `focal_ancestors/{name}_inferred_focal_ancestors.npz` | Candidates and saved seeds for each haplotype. |
-| `haplotype_intervals/{name}_inferred_focal_ancestor_intervals.npz` | Candidate identities, seed AC, and interval bounds for each budget. |
+| `focal_ancestors/{name}_inferred_max_ac{max_ac}_focal_ancestors.npz` | AC-filtered candidates and saved seeds for each haplotype, with the maximum supported cutoff. |
+| `haplotype_intervals/{name}_inferred_max_ac{max_ac}_focal_ancestor_intervals.npz` | Candidate identities, seed AC, interval bounds for each budget, and maximum supported cutoff. |
 | `focal_masks/{name}_inferred_ac{ac}_k{k}_focal_mask.npz` | Covered runs and gaps. |
 | `matches/{name}_inferred_samples_raw.trees` and `…_samples_matches.jsonl` | Full-reference baseline outputs. |
 | `matches/{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_raw.trees` and `…_stitched_samples_matches.jsonl` | Stitched outputs for each cutoff/budget/method. |
