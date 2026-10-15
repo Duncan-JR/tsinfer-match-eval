@@ -498,9 +498,16 @@ def make_focal_mask(
     output_path: pathlib.Path,
     ac_cutoff: int,
     max_mismatches: int,
+    min_focal_region_size: int,
 ) -> None:
     """Write one coverage mask; see :func:`make_focal_masks` for batch generation."""
-    make_focal_masks(intervals_path, [output_path], [ac_cutoff], [max_mismatches])
+    make_focal_masks(
+        intervals_path,
+        [output_path],
+        [ac_cutoff],
+        [max_mismatches],
+        [min_focal_region_size],
+    )
 
 
 def make_focal_masks(
@@ -508,24 +515,32 @@ def make_focal_masks(
     output_paths: list[pathlib.Path],
     ac_cutoffs: list[int],
     max_mismatches: list[int],
+    min_focal_region_sizes: list[int],
 ) -> None:
-    """Load intervals once and write every requested cutoff/budget mask.
+    """Load intervals once and write every cutoff/budget/minimum-size mask.
 
-    ``output_paths`` follows cutoff-major, then budget order, matching the
-    Snakefile's expansion. Each output keeps :func:`make_focal_mask`'s format.
+    ``output_paths`` follows cutoff, then budget, then minimum-size order,
+    matching the Snakefile's expansion. Each output keeps
+    :func:`make_focal_mask`'s format; :func:`_write_focal_mask` defines filtering.
     """
     with np.load(intervals_path, allow_pickle=False) as archive:
         intervals = {name: archive[name] for name in archive.files}
-    selections = itertools.product(ac_cutoffs, max_mismatches)
-    for output_path, (cutoff, budget) in zip(output_paths, selections, strict=True):
-        _write_focal_mask(intervals, output_path, cutoff, budget)
+    selections = itertools.product(ac_cutoffs, max_mismatches, min_focal_region_sizes)
+    for output_path, (cutoff, budget, minimum) in zip(
+        output_paths, selections, strict=True
+    ):
+        _write_focal_mask(intervals, output_path, cutoff, budget, minimum)
 
 
-def _write_focal_mask(intervals, output_path, ac_cutoff, max_mismatches):
+def _write_focal_mask(
+    intervals, output_path, ac_cutoff, max_mismatches, min_focal_region_size
+):
     """Partition the inference-site axis into focal-covered and all-gap runs.
 
     Union eligible associations from :func:`make_ancestor_intervals`, merging
-    touching bounds. Keep its complete haplotype roster, including empty slices.
+    touching bounds, then retain unions spanning at least
+    ``min_focal_region_size`` inference sites. Removed unions become gaps.
+    Keep the complete haplotype roster, including empty slices.
     The Snakefile supplies an AC cutoff and budget within the generated maxima.
     """
     check_ac_cutoff(intervals, ac_cutoff)
@@ -555,6 +570,11 @@ def _write_focal_mask(intervals, output_path, ac_cutoff, max_mismatches):
                 covered[-1][1] = max(covered[-1][1], interval_right)
             else:
                 covered.append([interval_left, interval_right])
+        covered = [
+            (interval_left, interval_right)
+            for interval_left, interval_right in covered
+            if interval_right - interval_left >= min_focal_region_size
+        ]
         cursor = 0
         for interval_left, interval_right in covered:
             if cursor < interval_left:
@@ -583,6 +603,7 @@ def _write_focal_mask(intervals, output_path, ac_cutoff, max_mismatches):
         num_sites=np.int64(num_sites),
         ac_cutoff=np.int64(ac_cutoff),
         max_mismatches=np.int64(max_mismatches),
+        min_focal_region_size=np.int64(min_focal_region_size),
         focal_choice=focal_choice,
     )
     logger.info("Wrote focal mask for %d haplotypes to %s", len(sample_id), output_path)

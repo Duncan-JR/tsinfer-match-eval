@@ -2,6 +2,7 @@ data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
 ac_cutoff: [10]  # Distinct positive cutoffs; performance passes run in this order.
+min_focal_region_size: [1]  # Inference sites in a merged focal region; 1 keeps all.
 max_mismatches: [0]
 focal_methods: [hmm, greedy]
 hmm:
@@ -32,16 +33,16 @@ matching_threads: 1
 haplotype_batch_size: 64
 
 # Opt-in: uv run snakemake performance --cores 9
-# Complete all repeats at each AC cutoff above before starting the next.
-# Results: data/performance/{experiment_id}/ac{cutoff}/, even for one cutoff.
-# Ordinary rule all is unchanged.
+# Complete all repeats per AC/minimum pair, AC first, in configured order.
+# Results: data/performance/{experiment_id}/ac{cutoff}_min{min_size}/.
+# Performance trials are separate from the ordinary rule all.
 performance:
   experiment_id: sample_matching_pilot
   datasets: [tgp_chr20_n100]
   modes: [resident_match, from_reference]
   methods: [full_hmm, reduced_hmm, greedy]
   worker_counts: [1, 6]
-  repeats: 1  # Per cutoff; pilot first, then use a new experiment_id and 3.
+  repeats: 1  # Per AC/minimum pair; pilot first, then use a new experiment_id and 3.
   seed: 20261014
   read_workers: 1
   rss_sample_interval_s: 0.02

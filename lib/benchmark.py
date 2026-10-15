@@ -57,6 +57,7 @@ class Run:
     run_id: str
     dataset: str
     ac_cutoff: int
+    min_focal_region_size: int
     method: str
     mode: str
     repeat: int
@@ -113,16 +114,21 @@ def prepared_inputs(config, dataset, max_ac_cutoff=None):
     if max_ac_cutoff is None:
         max_ac_cutoff = max(config["ac_cutoff"])
     budget = config["max_mismatches"][0]
+    minimum = config["min_focal_region_size"][0]
     return Inputs(
         root / "configs" / f"{name}_ancestor_inference.toml",
         root / "ancestors" / f"{name}_inferred_ancestors.trees",
         root / "samples" / f"{name}_samples_masked.zarr",
         root / "ancestors" / f"{name}_inferred_ancestors.zarr",
-        root / "focal_ancestors"
+        root
+        / "focal_ancestors"
         / f"{name}_inferred_max_ac{max_ac_cutoff}_focal_ancestors.npz",
-        root / "haplotype_intervals"
+        root
+        / "haplotype_intervals"
         / f"{name}_inferred_max_ac{max_ac_cutoff}_focal_ancestor_intervals.npz",
-        root / "focal_masks" / f"{name}_inferred_ac{cutoff}_k{budget}_focal_mask.npz",
+        root
+        / "focal_masks"
+        / f"{name}_inferred_ac{cutoff}_k{budget}_min{minimum}_focal_mask.npz",
     )
 
 
@@ -394,9 +400,10 @@ def _focal_preparation(config, cfg, paths, folder, workers):
     choice = config.get("focal_choice", "left")
     cutoff = config["ac_cutoff"][0]
     budget = config["max_mismatches"][0]
+    minimum = config["min_focal_region_size"][0]
     focal = folder / f"max_ac{cutoff}_focal_ancestors.npz"
     intervals = folder / f"max_ac{cutoff}_ancestor_intervals.npz"
-    mask = folder / f"ac{cutoff}_focal_mask.npz"
+    mask = folder / f"ac{cutoff}_min{minimum}_focal_mask.npz"
     haplotypes.find_focal_ancestors(
         paths.samples, paths.ancestors, focal, choice, selection, max_ac_cutoff=cutoff
     )
@@ -411,7 +418,7 @@ def _focal_preparation(config, cfg, paths, folder, workers):
         choice,
         selection,
     )
-    haplotypes.make_focal_mask(intervals, mask, cutoff, budget)
+    haplotypes.make_focal_mask(intervals, mask, cutoff, budget, minimum)
     return dataclasses.replace(paths, focal=focal, intervals=intervals, mask=mask)
 
 
@@ -489,8 +496,9 @@ def trial(spec_path):
     try:
         validate_config(config, spec["allocation"])
         run = spec["run"]
-        if len(config["ac_cutoff"]) != 1 or run["ac_cutoff"] != config["ac_cutoff"][0]:
-            raise ValueError("Trial must select its configured single AC cutoff")
+        for name in ("ac_cutoff", "min_focal_region_size"):
+            if len(config[name]) != 1 or run[name] != config[name][0]:
+                raise ValueError(f"Trial must select its configured single {name}")
         selections = {
             "requested_workers": "worker_counts",
             "method": "methods",
@@ -827,11 +835,11 @@ def _write_manifest(config, allocation, folder, config_paths, max_ac_cutoff):
 
 
 def run_suite(config, allocation, config_paths=None):
-    """Finish a complete suite at each configured cutoff before the next pass.
+    """Finish a complete suite at each cutoff/minimum pair before the next pass.
 
-    Each pass is an ordinary single-cutoff experiment. Resident trials share
-    maximum-cutoff preparation; from-reference trials prepare their own cutoff
-    inside timing. Publish completion only after every trial and check succeeds.
+    Resident trials share maximum-cutoff preparation; from-reference trials
+    prepare their own cutoff and filter inside timing. Publish completion only
+    after every trial and check succeeds.
     """
     validate_config(config, allocation)
     _configure_helpers(config["performance"])
@@ -839,7 +847,12 @@ def run_suite(config, allocation, config_paths=None):
         config_paths = []
     folder = output_directory(config).resolve()
     folder.mkdir(parents=True, exist_ok=True)
-    pass_folders = {folder / f"ac{cutoff}" for cutoff in config["ac_cutoff"]}
+    combinations = list(
+        itertools.product(config["ac_cutoff"], config["min_focal_region_size"])
+    )
+    pass_folders = {
+        folder / f"ac{cutoff}_min{minimum}" for cutoff, minimum in combinations
+    }
     # Snakemake creates output parent directories before entering the rule.
     for entry in folder.iterdir():
         if entry not in pass_folders or not entry.is_dir() or any(entry.iterdir()):
@@ -848,27 +861,35 @@ def run_suite(config, allocation, config_paths=None):
             )
     max_ac_cutoff = max(config["ac_cutoff"])
     succeeded = []
-    for cutoff in config["ac_cutoff"]:
-        pass_config = {**config, "ac_cutoff": [cutoff]}
-        pass_folder = folder / f"ac{cutoff}"
+    for cutoff, minimum in combinations:
+        pass_config = {
+            **config,
+            "ac_cutoff": [cutoff],
+            "min_focal_region_size": [minimum],
+        }
+        pass_folder = folder / f"ac{cutoff}_min{minimum}"
         pass_folder.mkdir(exist_ok=True)
-        logger.info("Starting AC %d pass", cutoff)
+        logger.info("Starting AC %d, minimum %d pass", cutoff, minimum)
         pass_succeeded = _run_cutoff(
             pass_config, allocation, pass_folder, config_paths, max_ac_cutoff
         )
         succeeded.append(pass_succeeded)
-        logger.info("Finished AC %d pass", cutoff)
+        logger.info("Finished AC %d, minimum %d pass", cutoff, minimum)
     if not all(succeeded):
         raise RuntimeError("Benchmark trials or quality checks failed; see pass results")
-    completion = {"ac_cutoff": config["ac_cutoff"]}
+    completion = {
+        "ac_cutoff": config["ac_cutoff"],
+        "min_focal_region_size": config["min_focal_region_size"],
+    }
     (folder / "complete.json").write_text(json.dumps(completion, indent=2) + "\n")
     return folder
 
 
 def _run_cutoff(config, allocation, folder, config_paths, max_ac_cutoff):
-    """Run single-cutoff trials sequentially, retaining rows for failed trials."""
+    """Run one cutoff/minimum pair sequentially, retaining failed trial rows."""
     _write_manifest(config, allocation, folder, config_paths, max_ac_cutoff)
     cutoff = config["ac_cutoff"][0]
+    minimum = config["min_focal_region_size"][0]
     succeeded = True
     settings = config["performance"]
     rng = random.Random(settings["seed"])
@@ -895,13 +916,21 @@ def _run_cutoff(config, allocation, folder, config_paths, max_ac_cutoff):
                 rng.shuffle(combinations)
                 for order, (method, workers) in enumerate(combinations):
                     run_id = (
-                        f"{dataset}_ac{cutoff}_{mode}_{method}"
+                        f"{dataset}_ac{cutoff}_min{minimum}_{mode}_{method}"
                         f"_w{workers}_r{repeat}_o{order}"
                     )
                     trial_folder = folder / run_id
                     trial_folder.mkdir()
                     run = Run(
-                        run_id, dataset, cutoff, method, mode, repeat, order, workers
+                        run_id,
+                        dataset,
+                        cutoff,
+                        minimum,
+                        method,
+                        mode,
+                        repeat,
+                        order,
+                        workers,
                     )
                     if method != "full_hmm":
                         run.haplotype_batch_size = config["haplotype_batch_size"]
@@ -967,7 +996,12 @@ def quality_reports(config, folder, max_ac_cutoff=None):
                 and all(
                     candidate[name] == run[name]
                     for name in (
-                        "dataset", "ac_cutoff", "mode", "repeat", "requested_workers"
+                        "dataset",
+                        "ac_cutoff",
+                        "min_focal_region_size",
+                        "mode",
+                        "repeat",
+                        "requested_workers",
                     )
                 )
             ),
@@ -979,6 +1013,7 @@ def quality_reports(config, folder, max_ac_cutoff=None):
             report = {
                 "run_id": run["run_id"],
                 "ac_cutoff": int(run["ac_cutoff"]),
+                "min_focal_region_size": int(run["min_focal_region_size"]),
                 "status": "failed",
                 "error": traceback.format_exc(),
             }
@@ -1140,6 +1175,7 @@ def _quality(config, paths, run, baseline):
     return {
         "run_id": run["run_id"],
         "ac_cutoff": int(run["ac_cutoff"]),
+        "min_focal_region_size": int(run["min_focal_region_size"]),
         "status": "ok",
         "reconstructed_called_allele_errors": reconstruction_errors,
         "switches": switches,

@@ -12,6 +12,7 @@ if focal_choice not in ("left", "right"):
 ac_cutoff = config["ac_cutoff"]
 benchmark.validate_ac_cutoffs(ac_cutoff)
 max_ac_cutoff = max(ac_cutoff)
+min_focal_region_size = config["min_focal_region_size"]
 max_mismatches = config["max_mismatches"]
 if not isinstance(max_mismatches, list) or len(max_mismatches) == 0:
     raise ValueError("max_mismatches must be a nonempty list")
@@ -62,6 +63,7 @@ wildcard_constraints:
     kind="inferred|true",
     ac="|".join(str(value) for value in ac_cutoff),
     k="|".join(str(value) for value in max_mismatches),
+    min_size="|".join(str(value) for value in min_focal_region_size),
     method="|".join(focal_methods),
 
 
@@ -77,16 +79,18 @@ rule all:
             name=names,
         ),
         expand(
-            data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_focal_mask.npz",
+            data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_focal_mask.npz",
+            name=names, ac=ac_cutoff, k=max_mismatches, min_size=min_focal_region_size,
+        ),
+        expand(
+            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_{method}_stitched_samples_raw.trees",
             name=names, ac=ac_cutoff, k=max_mismatches,
+            min_size=min_focal_region_size, method=focal_methods,
         ),
         expand(
-            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_raw.trees",
-            name=names, ac=ac_cutoff, k=max_mismatches, method=focal_methods,
-        ),
-        expand(
-            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_{method}_stitched_samples_matches.jsonl",
-            name=names, ac=ac_cutoff, k=max_mismatches, method=focal_methods,
+            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_{method}_stitched_samples_matches.jsonl",
+            name=names, ac=ac_cutoff, k=max_mismatches,
+            min_size=min_focal_region_size, method=focal_methods,
         ),
 
 
@@ -271,19 +275,20 @@ rule make_focal_mask:
         interval_pattern,
     output:
         expand(
-            data_dir / "focal_masks" / "{{name}}_inferred_ac{ac}_k{k}_focal_mask.npz",
-            ac=ac_cutoff, k=max_mismatches,
+            data_dir / "focal_masks" / "{{name}}_inferred_ac{ac}_k{k}_min{min_size}_focal_mask.npz",
+            ac=ac_cutoff, k=max_mismatches, min_size=min_focal_region_size,
         ),
     params:
         ac_cutoff=ac_cutoff,
         max_mismatches=max_mismatches,
+        min_focal_region_size=min_focal_region_size,
     log:
         progress_dir / "make_focal_mask" / "{name}_inferred_make_focal_mask.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
         haplotypes.make_focal_masks(
             pathlib.Path(input[0]), [pathlib.Path(path) for path in output],
-            params.ac_cutoff, params.max_mismatches,
+            params.ac_cutoff, params.max_mismatches, params.min_focal_region_size,
         )
 
 
@@ -301,16 +306,16 @@ rule match_stitched_samples:
             if wildcards.method == "greedy" else []
         ),
         masks=expand(
-            data_dir / "focal_masks" / "{{name}}_inferred_ac{{ac}}_k{k}_focal_mask.npz",
+            data_dir / "focal_masks" / "{{name}}_inferred_ac{{ac}}_k{k}_min{{min_size}}_focal_mask.npz",
             k=max_mismatches,
         ),
     output:
         trees=expand(
-            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_{{method}}_stitched_samples_raw.trees",
+            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_min{{min_size}}_{{method}}_stitched_samples_raw.trees",
             k=max_mismatches,
         ),
         matches=expand(
-            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_{{method}}_stitched_samples_matches.jsonl",
+            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_min{{min_size}}_{{method}}_stitched_samples_matches.jsonl",
             k=max_mismatches,
         ),
     params:
@@ -320,7 +325,7 @@ rule match_stitched_samples:
         cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
     threads: workflow.cores
     log:
-        progress_dir / "match_stitched_samples" / "{name}_inferred_ac{ac}_{method}_match_stitched_samples.log",
+        progress_dir / "match_stitched_samples" / "{name}_inferred_ac{ac}_min{min_size}_{method}_match_stitched_samples.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
         matching.match_stitched_samples(
@@ -372,8 +377,8 @@ if "performance" in config:
     performance_outputs = [
         performance_dir / "complete.json",
         *expand(
-            performance_dir / "ac{ac}" / "{product}",
-            ac=ac_cutoff, product=performance_products,
+            performance_dir / "ac{ac}_min{min_size}" / "{product}",
+            ac=ac_cutoff, min_size=min_focal_region_size, product=performance_products,
         ),
     ]
     performance_names = config["performance"]["datasets"]
@@ -413,8 +418,9 @@ if "performance" in config:
                 name=performance_names,
             ) if performance_resident_focal else []),
             masks=(expand(
-                data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_focal_mask.npz",
+                data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_focal_mask.npz",
                 name=performance_names, ac=ac_cutoff, k=max_mismatches,
+                min_size=min_focal_region_size,
             ) if performance_resident_focal else []),
         output:
             protected(performance_outputs),
