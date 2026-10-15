@@ -13,7 +13,7 @@ import numpy as np
 import tsinfer
 import tskit
 
-from . import performance
+from . import haplotypes, performance
 
 logger = logging.getLogger(__name__)
 
@@ -266,6 +266,7 @@ def _prepare_stitched_inputs(
     if focal_path is not None:
         with np.load(focal_path, allow_pickle=False) as archive:
             focal = {name: archive[name] for name in archive.files}
+        haplotypes.check_ac_cutoff(focal, ac_cutoff)
     masks = {}
     for mask_path in mask_paths:
         with np.load(mask_path, allow_pickle=False) as archive:
@@ -283,8 +284,7 @@ def _prepare_stitched_inputs(
             ancestor_intervals = {name: archive[name] for name in archive.files}
         if int(ancestor_intervals["num_sites"]) != len(positions):
             raise ValueError("Ancestor intervals disagree with the reference site axis")
-        if ac_cutoff > int(ancestor_intervals["max_ac_cutoff"]):
-            raise ValueError("AC cutoff exceeds the ancestor interval maximum")
+        haplotypes.check_ac_cutoff(ancestor_intervals, ac_cutoff)
         for mask in masks.values():
             for name in ("sample_id", "ploidy_index", "num_sites", "focal_choice"):
                 if not np.array_equal(mask[name], ancestor_intervals[name]):

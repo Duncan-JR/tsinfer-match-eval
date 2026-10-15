@@ -50,6 +50,14 @@ for dataset in datasets.values():
             sample_ids = [sample_id for row in csv.reader(sample_file) for sample_id in row]
         dataset["samples"] = ",".join(sample_ids)
 names = list(datasets)
+focal_pattern = (
+    data_dir / "focal_ancestors"
+    / f"{{name}}_inferred_max_ac{max_ac_cutoff}_focal_ancestors.npz"
+)
+interval_pattern = (
+    data_dir / "haplotype_intervals"
+    / f"{{name}}_inferred_max_ac{max_ac_cutoff}_focal_ancestor_intervals.npz"
+)
 
 
 def panel_config(wildcards):
@@ -68,11 +76,11 @@ rule all:
     input:
         expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=names),
         expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=names),
-        expand(data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz", name=names),
+        expand(focal_pattern, name=names),
         expand(data_dir / "matches" / "{name}_inferred_samples_raw.trees", name=names),
         expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names),
         expand(
-            data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
+            interval_pattern,
             name=names,
         ),
         expand(
@@ -216,12 +224,13 @@ rule find_focal_ancestors:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
     output:
-        data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+        focal_pattern,
     log:
         progress_dir / "find_focal_ancestors" / "{name}_inferred_find_focal_ancestors.log",
     params:
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
         focal_choice=focal_choice,
+        max_ac_cutoff=max_ac_cutoff,
     run:
         utils.setup_log(pathlib.Path(log[0]))
         haplotypes.find_focal_ancestors(
@@ -230,6 +239,7 @@ rule find_focal_ancestors:
             pathlib.Path(output[0]),
             params.focal_choice,
             params.samples,
+            max_ac_cutoff=params.max_ac_cutoff,
         )
 
 
@@ -237,9 +247,9 @@ rule make_ancestor_intervals:
     input:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
-        focal=data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+        focal=focal_pattern,
     output:
-        data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
+        interval_pattern,
     params:
         samples=lambda wildcards: datasets[wildcards.name].get("samples"),
         max_ac_cutoff=max_ac_cutoff,
@@ -265,7 +275,7 @@ rule make_ancestor_intervals:
 
 rule make_focal_mask:
     input:
-        data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
+        interval_pattern,
     output:
         expand(
             data_dir / "focal_masks" / "{{name}}_inferred_ac{ac}_k{k}_focal_mask.npz",
@@ -290,11 +300,11 @@ rule match_stitched_samples:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",
         focal=lambda wildcards: (
-            [data_dir / "focal_ancestors" / f"{wildcards.name}_inferred_focal_ancestors.npz"]
+            [str(focal_pattern).format(name=wildcards.name)]
             if wildcards.method == "hmm" else []
         ),
         intervals=lambda wildcards: (
-            [data_dir / "haplotype_intervals" / f"{wildcards.name}_inferred_focal_ancestor_intervals.npz"]
+            [str(interval_pattern).format(name=wildcards.name)]
             if wildcards.method == "greedy" else []
         ),
         masks=expand(
@@ -394,11 +404,11 @@ if "performance" in config:
                 name=performance_names,
             ),
             focal=(expand(
-                data_dir / "focal_ancestors" / "{name}_inferred_focal_ancestors.npz",
+                focal_pattern,
                 name=performance_names,
             ) if performance_resident_focal else []),
             intervals=(expand(
-                data_dir / "haplotype_intervals" / "{name}_inferred_focal_ancestor_intervals.npz",
+                interval_pattern,
                 name=performance_names,
             ) if performance_resident_focal else []),
             masks=(expand(

@@ -23,6 +23,18 @@ class SampleHaplotypes:
     sample_rows: np.ndarray
 
 
+def _sample_rows(samples, positions):
+    """Map panel positions to sample rows, rejecting absent positions."""
+    sample_positions = samples["variant_position"][:]
+    rows = np.searchsorted(sample_positions, positions)
+    present = rows < len(sample_positions)
+    present[present] = sample_positions[rows[present]] == positions[present]
+    if not np.all(present):
+        absent = positions[np.flatnonzero(~present)[0]]
+        raise ValueError(f"Panel position {absent} is absent from the sample store")
+    return rows
+
+
 def _load_sample_haplotypes(samples, panel, sample_selection, site_indices=None):
     """Polarise sample allele strings using the inferred panel's ancestry.
 
@@ -33,13 +45,7 @@ def _load_sample_haplotypes(samples, panel, sample_selection, site_indices=None)
     positions = panel["variant_position"][:]
     if site_indices is not None:
         positions = positions[site_indices]
-    sample_positions = samples["variant_position"][:]
-    rows = np.searchsorted(sample_positions, positions)
-    present = rows < len(sample_positions)
-    present[present] = sample_positions[rows[present]] == positions[present]
-    if not np.all(present):
-        absent = positions[np.flatnonzero(~present)[0]]
-        raise ValueError(f"Panel position {absent} is absent from the sample store")
+    rows = _sample_rows(samples, positions)
     columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
     genotypes = samples["call_genotype"].oindex[rows, columns, :]
     alleles = samples["variant_allele"].oindex[rows, :]
@@ -81,13 +87,16 @@ def find_focal_ancestors(
     output_path: pathlib.Path,
     focal_choice: str = "left",
     sample_selection: str | None = None,
+    max_ac_cutoff: int | None = None,
 ) -> None:
     """Write inferred candidates defined by a derived call at one endpoint seed.
 
     Choose the smallest focal position for ``left`` and largest for ``right``.
-    Other focal calls do not affect membership. Save all candidates, without AC
-    filtering, in sorted panel-column order for each haplotype, including empty
-    rows. :func:`make_ancestor_intervals` reuses these saved seeds.
+    Other focal calls do not affect membership. Filter anchored ancestors using
+    annotated derived AC before loading seed calls or expanding associations.
+    ``None`` retains all candidates; the archive records this as maximum -1.
+    Save sorted panel-column order for each haplotype, including empty rows.
+    :func:`make_ancestor_intervals` reuses these saved seeds.
     Direct callers supply a valid choice; the Snakefile validates configuration.
     """
     samples = tsinfer.vcz.open_store(samples_path)
@@ -95,13 +104,16 @@ def find_focal_ancestors(
     focal_sites = _select_focal_sites(panel, focal_choice)
     ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
     anchored = np.flatnonzero(focal_sites >= 0)
+    positions = panel["variant_position"][:]
+    seed_rows = _sample_rows(samples, positions[focal_sites[anchored]])
+    derived_ac = np.zeros(len(ancestor_ids), dtype=np.int64)
+    derived_ac[anchored] = samples["variant_match_eval_derived_ac"].oindex[seed_rows]
+    if max_ac_cutoff is not None:
+        anchored = anchored[derived_ac[anchored] <= max_ac_cutoff]
     seed_sites, seed_indices = np.unique(focal_sites[anchored], return_inverse=True)
     haplotypes = _load_sample_haplotypes(
         samples, panel, sample_selection, site_indices=seed_sites
     )
-    seed_rows = haplotypes.sample_rows[seed_indices]
-    derived_ac = np.zeros(len(ancestor_ids), dtype=np.int64)
-    derived_ac[anchored] = samples["variant_match_eval_derived_ac"].oindex[seed_rows]
     offsets = [0]
     candidate_rows = []
     for haplotype in range(len(haplotypes.sample_id)):
@@ -123,12 +135,22 @@ def find_focal_ancestors(
         derived_ac=derived_ac,
         focal_site_index=focal_sites,
         focal_choice=np.asarray(focal_choice),
+        max_ac_cutoff=np.int64(-1 if max_ac_cutoff is None else max_ac_cutoff),
     )
     logger.info(
-        "Wrote focal candidates for %d haplotypes to %s",
+        "Wrote focal candidates for %d haplotypes (%d seeds, %d associations) to %s",
         len(haplotypes.sample_id),
+        len(seed_sites),
+        len(ancestor_index),
         output_path,
     )
+
+
+def check_ac_cutoff(archive, ac_cutoff):
+    """Reject requests beyond a candidate or interval archive's supported AC."""
+    maximum = int(archive["max_ac_cutoff"])
+    if maximum != -1 and ac_cutoff > maximum:
+        raise ValueError(f"AC cutoff {ac_cutoff} exceeds archive maximum {maximum}")
 
 
 @dataclasses.dataclass
@@ -188,6 +210,7 @@ def _prepare(
     ends = panel["sample_end_position"][:]
     intervals = panel["sequence_intervals"][:]
     with np.load(focal_path, allow_pickle=False) as candidates:
+        check_ac_cutoff(candidates, max_ac_cutoff)
         for name, expected in (
             ("sample_id", loaded.sample_id),
             ("ploidy_index", loaded.ploidy_index),
@@ -505,6 +528,7 @@ def _write_focal_mask(intervals, output_path, ac_cutoff, max_mismatches):
     touching bounds. Keep its complete haplotype roster, including empty slices.
     The Snakefile supplies an AC cutoff and budget within the generated maxima.
     """
+    check_ac_cutoff(intervals, ac_cutoff)
     sample_id = intervals["sample_id"]
     ploidy_index = intervals["ploidy_index"]
     association_offsets = intervals["offsets"]

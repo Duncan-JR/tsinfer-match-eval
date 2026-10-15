@@ -105,18 +105,22 @@ class TrialMeasurement:
     actual_workers: int
 
 
-def prepared_inputs(config, dataset):
+def prepared_inputs(config, dataset, max_ac_cutoff=None):
     root = pathlib.Path(config["data_dir"]).expanduser().resolve()
     name = dataset["name"]
     cutoff = config["ac_cutoff"][0]
+    if max_ac_cutoff is None:
+        max_ac_cutoff = max(config["ac_cutoff"])
     budget = config["max_mismatches"][0]
     return Inputs(
         root / "configs" / f"{name}_ancestor_inference.toml",
         root / "ancestors" / f"{name}_inferred_ancestors.trees",
         root / "samples" / f"{name}_samples_masked.zarr",
         root / "ancestors" / f"{name}_inferred_ancestors.zarr",
-        root / "focal_ancestors" / f"{name}_inferred_focal_ancestors.npz",
-        root / "haplotype_intervals" / f"{name}_inferred_focal_ancestor_intervals.npz",
+        root / "focal_ancestors"
+        / f"{name}_inferred_max_ac{max_ac_cutoff}_focal_ancestors.npz",
+        root / "haplotype_intervals"
+        / f"{name}_inferred_max_ac{max_ac_cutoff}_focal_ancestor_intervals.npz",
         root / "focal_masks" / f"{name}_inferred_ac{cutoff}_k{budget}_focal_mask.npz",
     )
 
@@ -374,15 +378,15 @@ def _resident_trial(config, dataset, paths, method, workers, folder, collector):
 
 
 def _focal_preparation(config, cfg, paths, folder, workers):
-    focal = folder / "focal_ancestors.npz"
-    intervals = folder / "ancestor_intervals.npz"
-    mask = folder / "focal_mask.npz"
     selection = cfg.sources["samples"].samples
     choice = config.get("focal_choice", "left")
     cutoff = config["ac_cutoff"][0]
     budget = config["max_mismatches"][0]
+    focal = folder / f"max_ac{cutoff}_focal_ancestors.npz"
+    intervals = folder / f"max_ac{cutoff}_ancestor_intervals.npz"
+    mask = folder / f"ac{cutoff}_focal_mask.npz"
     haplotypes.find_focal_ancestors(
-        paths.samples, paths.ancestors, focal, choice, selection
+        paths.samples, paths.ancestors, focal, choice, selection, max_ac_cutoff=cutoff
     )
     haplotypes.make_ancestor_intervals(
         paths.samples,
