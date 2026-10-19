@@ -1,19 +1,22 @@
-"""Full-reference and focal-mask stitched sample matching."""
+"""Native baseline and streamed, complete-haplotype greedy stitched matching."""
 
-import concurrent.futures as cf
+import collections
 import contextlib
 import dataclasses
 import json
 import logging
+import multiprocessing as mp
+import multiprocessing.connection
 import pathlib
+import tempfile
 import threading
+import traceback
 
-import numba
 import numpy as np
 import tsinfer
 import tskit
 
-from . import haplotypes, performance
+from . import greedy, haplotypes, performance, utils
 
 logger = logging.getLogger(__name__)
 
@@ -68,7 +71,7 @@ def match_samples(
     config_path: pathlib.Path,
     ancestors_ts_path: pathlib.Path,
     output_path: pathlib.Path,
-    match_file_path: pathlib.Path,
+    match_file_path: pathlib.Path | None,
     threads: int,
     cache_size: int | None = None,
     read_workers: int | None = None,
@@ -78,8 +81,7 @@ def match_samples(
     Preserve source selection/order and individual metadata so recreated job
     individual IDs correspond to the reference rows. Native JSONL has one record
     per haplotype, keyed by (source, sample_id, ploidy_index); parent IDs are raw
-    TS node IDs, joined to panel IDs through node metadata. Focal NPZs do not
-    participate in matching.
+    TS node IDs, joined to panel IDs through node metadata.
     """
     sample_cfg = _sample_config(config_path, ancestors_ts_path, output_path)
     ts = tsinfer.pipeline.match(
@@ -96,732 +98,718 @@ def match_samples(
 
 
 @dataclasses.dataclass
-class ReducedAncestors:
-    """Transient focal reference and reduced-to-original copying node IDs."""
-
-    ts: tskit.TreeSequence
-    original_nodes: np.ndarray
-
-
-def simplify_ancestors_ts(
-    ancestors_ts, focal, ancestor_nodes, haplotype_index, ac_cutoff
-):
-    """Retain roots and eligible panel candidates for one haplotype.
-
-    ``ancestor_nodes`` joins panel IDs to reference node metadata once per
-    dataset. Candidate columns are resolved through this join, never used as
-    node IDs. Retained internal ancestors remain available copying states.
-    """
-    start = focal["offsets"][haplotype_index]
-    end = focal["offsets"][haplotype_index + 1]
-    columns = focal["ancestor_index"][start:end]
-    eligible = columns[focal["derived_ac"][columns] <= ac_cutoff]
-    focal_nodes = [ancestor_nodes[focal["ancestor_id"][column]] for column in eligible]
-    retained_nodes = [0, 1, *focal_nodes]
-    reduced_ts, old_to_new = ancestors_ts.simplify(
-        retained_nodes, map_nodes=True, filter_sites=False
-    )
-    original_nodes = np.empty(reduced_ts.num_nodes, dtype=np.int32)
-    mapped = np.flatnonzero(old_to_new != tskit.NULL)
-    original_nodes[old_to_new[mapped]] = mapped
-    return ReducedAncestors(reduced_ts, original_nodes)
-
-
-@dataclasses.dataclass
 class CopyingRuns:
-    """Numeric copying runs with half-open bounds on the inference-site axis."""
+    """Half-open inference-site runs, independent of storage chunk boundaries."""
 
-    left_site: np.ndarray
-    right_site: np.ndarray
+    left: np.ndarray
+    right: np.ndarray
     parent: np.ndarray
 
 
 @dataclasses.dataclass
 class RegionMatch:
-    """Compact copying runs and owned mutations from one independent HMM."""
+    """Owned regional path and mutation sites before native scratch is reused."""
 
     runs: CopyingRuns
-    mutations: list[tsinfer.matching.Mutation]
-
-
-def _match_region(
-    matcher, haplotype, start, end, positions, match_out, original_nodes=None
-):
-    """Collect ordered runs and mutations before matched-allele scratch is reused.
-
-    Reduced parents are mapped back to the original reference here. Returned
-    arrays and mutations never refer to ``match_out``; only its requested slice
-    is read. See :func:`_assemble_stitched_match` for output seam merging.
-    """
-    left, right, parents = matcher.find_path(haplotype, start, end, match_out)
-    left_site = np.searchsorted(positions, left[::-1])
-    right_site = np.searchsorted(positions, right[::-1])
-    left_site = np.maximum(left_site, start)
-    right_site = np.minimum(right_site, end)
-    parents = parents[::-1].copy()
-    if original_nodes is not None:
-        parents = original_nodes[parents]
-    runs = CopyingRuns(left_site, right_site, parents)
-
-    observed = haplotype[start:end]
-    copied = match_out[start:end]
-    mismatch_sites = np.flatnonzero((observed >= 0) & (observed != copied))
-    mismatch_sites += start
-    mutations = [
-        tsinfer.matching.Mutation(
-            position=float(positions[site]), derived_state=int(haplotype[site])
-        )
-        for site in mismatch_sites
-    ]
-    return RegionMatch(runs, mutations)
-
-
-def _assemble_stitched_match(run_blocks, mutations, positions, sequence_length):
-    """Coalesce ordered runs once and convert to native BP path segments.
-
-    Touching equal parents merge across output seams. Regional HMM calls remain
-    independent even when their output runs merge. Mutations arrive in site
-    order from :func:`_match_region`; exact greedy focal runs add none.
-    """
-    left_site = np.concatenate([runs.left_site for runs in run_blocks])
-    right_site = np.concatenate([runs.right_site for runs in run_blocks])
-    parents = np.concatenate([runs.parent for runs in run_blocks])
-    last = 0
-    for current in range(1, len(parents)):
-        touches = left_site[current] == right_site[last]
-        same_parent = parents[current] == parents[last]
-        if touches and same_parent:
-            right_site[last] = right_site[current]
-        else:
-            last += 1
-            left_site[last] = left_site[current]
-            right_site[last] = right_site[current]
-            parents[last] = parents[current]
-
-    path = []
-    for run in range(last + 1):
-        left = left_site[run]
-        right = right_site[run]
-        bp_left = 0 if left == 0 else float(positions[left])
-        bp_right = (
-            sequence_length if right == len(positions) else float(positions[right])
-        )
-        path.append(
-            tsinfer.matching.PathSegment(
-                left=bp_left, right=bp_right, parent=int(parents[run])
-            )
-        )
-    return tsinfer.matching.MatchResult(path=path, mutations=mutations)
+    mutation_site: np.ndarray
 
 
 @dataclasses.dataclass
-class StitchedInputs:
-    """Reference, indexes, and read-only inputs shared by matching threads."""
+class ActiveSlab:
+    """Coordinator-owned descriptor and unappended result count."""
 
-    ancestors_ts: tskit.TreeSequence
-    positions: np.ndarray
-    focal: dict | None
-    masks: dict
-    ancestor_nodes: dict
-    interval_boundaries: np.ndarray
-    num_alleles: np.ndarray
-    recombination: np.ndarray
-    mismatch: np.ndarray
-    full_indexes: tsinfer.matching.MatcherIndexes
-    ac_cutoff: int
-    intervals: dict | None = None
-    interval_nodes: np.ndarray | None = None
+    slab: haplotypes.SampleSlab
+    remaining: int
 
 
 @dataclasses.dataclass
-class StitchedWorker:
-    """Shared inputs and a reusable full-reference HMM owned by one thread."""
+class HaplotypeResult:
+    """Owned numeric output, safe to enqueue after worker scratch is reused."""
 
-    inputs: StitchedInputs
-    full_matcher: tsinfer.matching.AncestorMatcher
-    match_out: np.ndarray
-
-
-@dataclasses.dataclass
-class StitchedResults:
-    """Native match results for every requested budget of one haplotype."""
-
-    job: tsinfer.config.MatchJob
-    results: dict[int, tsinfer.matching.MatchResult]
+    job_index: int
+    left: np.ndarray
+    right: np.ndarray
+    parent: np.ndarray
+    mutation_site: np.ndarray
+    mutation_code: np.ndarray
     measurements: performance.Collector | None = None
 
 
-def _prepare_stitched_inputs(
-    ancestors_ts,
-    positions,
-    focal_path,
-    mask_paths,
-    ac_cutoff,
-    num_alleles,
-    source_config,
-    intervals_path=None,
-):
-    """Load focal archives and masks and create shared indexes once."""
-    focal = None
-    if focal_path is not None:
-        with np.load(focal_path, allow_pickle=False) as archive:
-            focal = {name: archive[name] for name in archive.files}
-        haplotypes.check_ac_cutoff(focal, ac_cutoff)
-    masks = {}
-    for mask_path in mask_paths:
-        with np.load(mask_path, allow_pickle=False) as archive:
-            mask = {name: archive[name] for name in archive.files}
-        masks[int(mask["max_mismatches"])] = mask
-    ancestor_nodes = {}
-    for node in ancestors_ts.nodes():
-        metadata = node.metadata
-        if metadata.get("source") == "ancestors" and metadata["ploidy_index"] == 0:
-            ancestor_nodes[metadata["sample_id"]] = node.id
-    ancestor_intervals = None
-    interval_nodes = None
-    if intervals_path is not None:
-        with np.load(intervals_path, allow_pickle=False) as archive:
-            ancestor_intervals = {name: archive[name] for name in archive.files}
-        if int(ancestor_intervals["num_sites"]) != len(positions):
-            raise ValueError("Ancestor intervals disagree with the reference site axis")
-        haplotypes.check_ac_cutoff(ancestor_intervals, ac_cutoff)
-        for mask in masks.values():
-            for name in ("sample_id", "ploidy_index", "num_sites", "focal_choice"):
-                if not np.array_equal(mask[name], ancestor_intervals[name]):
-                    raise ValueError(f"Focal mask {name} disagrees with intervals")
-            if int(mask["ac_cutoff"]) != ac_cutoff:
-                raise ValueError("Focal mask disagrees with the requested AC cutoff")
-        panel_nodes = np.asarray(
-            [ancestor_nodes[name] for name in ancestor_intervals["ancestor_id"]],
-            dtype=np.int32,
-        )
-        interval_nodes = panel_nodes[ancestor_intervals["ancestor_index"]]
-    intervals = np.asarray(ancestors_ts.metadata["sequence_intervals"])
-    interval_boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
-    recombination = np.full(len(positions), source_config.recombination)
-    mismatch = np.full(len(positions), source_config.mismatch)
+@dataclasses.dataclass
+class HaplotypeTask:
+    """One complete row in a slab; no decoded calls travel through queues."""
+
+    slab: haplotypes.MappedCalls
+    row: int
+    job_index: int
+    chunk: int
+
+
+@dataclasses.dataclass
+class Worker:
+    """One private HMM and reusable numeric scratch per matching process."""
+
+    catalog: haplotypes.ReferenceCatalog
+    packed: np.ndarray
+    positions: np.ndarray
+    sequence_length: float
+    boundaries: np.ndarray
+    indexes: tsinfer.matching.MatcherIndexes
+    matcher: tsinfer.matching.AncestorMatcher
+    match_out: np.ndarray
+    candidate_left: np.ndarray
+    candidate_right: np.ndarray
+    candidate_ids: np.ndarray
+    run_left: np.ndarray
+    run_right: np.ndarray
+    run_ids: np.ndarray
+
+
+def make_worker(reference, catalog, num_alleles, parameters):
+    """Build native state once and warm the actual read-only Numba signatures."""
+    catalog.make_readonly()
+    packed = catalog.packed.open()
+    positions = reference.sites_position.astype(np.int32)
+    intervals = np.asarray(reference.metadata["sequence_intervals"])
+    boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
     indexes = tsinfer.matching.MatcherIndexes(
-        ancestors_ts, vestigial_root=False, num_alleles=num_alleles
+        reference, vestigial_root=False, num_alleles=num_alleles
     )
-    return StitchedInputs(
-        ancestors_ts=ancestors_ts,
-        positions=positions,
-        focal=focal,
-        masks=masks,
-        ancestor_nodes=ancestor_nodes,
-        interval_boundaries=interval_boundaries,
-        num_alleles=num_alleles,
-        recombination=recombination,
-        mismatch=mismatch,
-        full_indexes=indexes,
-        ac_cutoff=ac_cutoff,
-        intervals=ancestor_intervals,
-        interval_nodes=interval_nodes,
+    matcher = tsinfer.matching.AncestorMatcher(
+        indexes,
+        np.full(len(positions), parameters.recombination),
+        np.full(len(positions), parameters.mismatch),
+        reuse_topology=True,
     )
+    capacity = len(catalog.seeds)
+    worker = Worker(
+        catalog,
+        packed,
+        positions,
+        reference.sequence_length,
+        boundaries,
+        indexes,
+        matcher,
+        np.empty(len(positions), dtype=np.int8),
+        np.empty(capacity, dtype=np.int64),
+        np.empty(capacity, dtype=np.int64),
+        np.empty(capacity, dtype=np.int64),
+        np.empty(capacity, dtype=np.int64),
+        np.empty(capacity, dtype=np.int64),
+        np.empty(capacity, dtype=np.int64),
+    )
+    dummy = np.full(len(positions), -1, dtype=np.int8)
+    dummy.flags.writeable = False
+    focal_runs(dummy, worker, 1)
+    return worker
 
 
-@numba.njit(nogil=True)
-def _greedy_cover(
-    left, right, nodes, run_left, run_right, out_left, out_right, out_parent
-):
-    """Sweep sorted intervals once over ordered, disjoint coverage components.
+def focal_runs(haplotype, worker, minimum):
+    """Discover, extend, stable-sort and cover using reusable worker scratch.
 
-    At the first uncovered site choose the containing interval with maximum
-    exclusive right bound. Discard scanned alternatives: none extends further
-    than the choice. Touching intervals can continue at that exclusive bound.
-    Distinct components have no interval spanning between them, as guaranteed
-    by :func:`lib.haplotypes.make_focal_mask`. Equal reaches keep the first
-    interval in stable left-bound order. Each choice emits one copying run.
+    Returned views are consumed within :func:`match_stitched_haplotype`; result
+    ownership changes only when the final path is assembled.
     """
-    written = 0
-    scan = 0
-    for region in range(len(run_left)):
-        cursor = run_left[region]
-        end = run_right[region]
-        while cursor < end:
-            reach = cursor
-            chosen = -1
-            while scan < len(left) and left[scan] <= cursor:
-                if right[scan] > reach:
-                    reach = right[scan]
-                    chosen = nodes[scan]
-                scan += 1
-            if chosen == -1:
-                raise ValueError("Ancestor intervals do not cover the focal mask")
-            reach = min(reach, end)
-            out_left[written] = cursor
-            out_right[written] = reach
-            out_parent[written] = chosen
-            written += 1
-            cursor = reach
-    return written
-
-
-def greedy_focal_runs(inputs, haplotype_index, mask, start, end):
-    """Return a minimum-switch exact cover of the requested mask's focal runs.
-
-    This replaces the reduced HMM only for budget zero. Saved ancestor IDs are
-    joined to original reference nodes during :func:`_prepare_stitched_inputs`.
-    Sorting costs O(M log M); the sweep and output capacity cost O(M), for M
-    eligible intervals. Inference boundaries need no splitting:
-    every saved interval is confined to one inference interval.
-    """
-    if int(mask["max_mismatches"]) != 0:
-        raise ValueError("Greedy focal matching requires max_mismatches=0")
-    intervals = inputs.intervals
-    if intervals is None:
-        raise ValueError("Greedy focal matching requires ancestor intervals")
-    first, last = intervals["offsets"][haplotype_index : haplotype_index + 2]
-    eligible = np.flatnonzero(intervals["focal_ac"][first:last] <= inputs.ac_cutoff)
-    eligible += first
-    left = intervals["left_site_index"][eligible, 0]
-    order = np.argsort(left, kind="stable")
-    rows = eligible[order]
-    run_start, run_end = mask["offsets"][haplotype_index : haplotype_index + 2]
-    run_slice = slice(run_start, run_end)
-    run_left = np.maximum(mask["left_site_index"][run_slice], start)
-    run_right = np.minimum(mask["right_site_index"][run_slice], end)
-    covered = ~mask["is_gap"][run_slice]
-    covered &= run_left < run_right
-    left_site = np.empty(len(rows), dtype=np.int64)
-    right_site = np.empty(len(rows), dtype=np.int64)
-    parents = np.empty(len(rows), dtype=np.int32)
-    written = _greedy_cover(
-        intervals["left_site_index"][rows, 0],
-        intervals["right_site_index"][rows, 0],
-        inputs.interval_nodes[rows],
-        run_left[covered],
-        run_right[covered],
-        left_site,
-        right_site,
-        parents,
+    catalog = worker.catalog
+    count = greedy.extend_exact(
+        haplotype,
+        worker.packed,
+        catalog.seeds,
+        catalog.starts,
+        catalog.stops,
+        catalog.offsets,
+        worker.candidate_left,
+        worker.candidate_right,
+        worker.candidate_ids,
+    )
+    order = np.argsort(worker.candidate_left[:count], kind="stable")
+    written = greedy.cover_components(
+        worker.candidate_left,
+        worker.candidate_right,
+        worker.candidate_ids,
+        order,
+        minimum,
+        worker.run_left,
+        worker.run_right,
+        worker.run_ids,
     )
     return CopyingRuns(
-        left_site[:written].copy(),
-        right_site[:written].copy(),
-        parents[:written].copy(),
+        worker.run_left[:written],
+        worker.run_right[:written],
+        catalog.parents[worker.run_ids[:written]],
     )
 
 
-def match_stitched_haplotype(job, haplotype, worker, method="hmm", collector=None):
-    """Match each focal and gap run independently for every mask budget.
+def _match_region(haplotype, worker, start, end):
+    """Collect a regional HMM path and mutations before native scratch is reused."""
+    left, right, parents = worker.matcher.find_path(
+        haplotype, start, end, worker.match_out
+    )
+    left_site = np.searchsorted(worker.positions, left[::-1])
+    right_site = np.searchsorted(worker.positions, right[::-1])
+    np.maximum(left_site, start, out=left_site)
+    np.minimum(right_site, end, out=right_site)
+    runs = CopyingRuns(left_site, right_site, parents[::-1].copy())
+    observed = haplotype[start:end]
+    copied = worker.match_out[start:end]
+    mutations = np.flatnonzero((observed >= 0) & (observed != copied)) + start
+    return RegionMatch(runs, mutations)
 
-    Coverage is determined solely by :func:`lib.haplotypes.make_focal_mask`.
-    HMM runs split at inference-interval boundaries and use absolute site
-    indices with neutral missing calls. The ``hmm`` method prepares one reduced
-    matcher across budgets. The ``greedy`` method covers saved exact intervals
-    without a reduced reference; gaps use the full HMM with either method.
+
+def _match_gap(haplotype, worker, start, end, blocks, mutations):
+    """Split independent gap HMM calls at the existing inference boundaries."""
+    first = np.searchsorted(worker.boundaries, start, side="right")
+    last = np.searchsorted(worker.boundaries, end, side="left")
+    cursor = start
+    calls = 0
+    for stop in [*worker.boundaries[first:last], end]:
+        result = _match_region(haplotype, worker, cursor, int(stop))
+        blocks.append(result.runs)
+        mutations.append(result.mutation_site)
+        calls += 1
+        cursor = int(stop)
+    return calls
+
+
+def _assemble_result(job_index, blocks, mutation_blocks, haplotype, worker, collector):
+    """Merge equal-parent seams and apply the existing site-to-BP conventions."""
+    left = np.concatenate([block.left for block in blocks])
+    right = np.concatenate([block.right for block in blocks])
+    parents = np.concatenate([block.parent for block in blocks])
+    written = 0
+    for current in range(len(parents)):
+        if (
+            written > 0
+            and left[current] == right[written - 1]
+            and parents[current] == parents[written - 1]
+        ):
+            right[written - 1] = right[current]
+        else:
+            left[written] = left[current]
+            right[written] = right[current]
+            parents[written] = parents[current]
+            written += 1
+    bp_left = worker.positions[left[:written]].astype(float)
+    bp_left[left[:written] == 0] = 0
+    bp_right = np.full(written, worker.sequence_length)
+    internal = right[:written] < len(worker.positions)
+    bp_right[internal] = worker.positions[right[:written][internal]]
+    sites = np.empty(0, dtype=np.int64)
+    if len(mutation_blocks) > 0:
+        sites = np.concatenate(mutation_blocks)
+    return HaplotypeResult(
+        job_index,
+        bp_left,
+        bp_right,
+        parents[:written].copy(),
+        sites,
+        haplotype[sites],
+        collector,
+    )
+
+
+def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=None):
+    """Match one complete canonical haplotype against a prepared reference.
+
+    Exact intervals contain called derived seeds and respect clipped supports.
+    Their touching unions are filtered before taking the complement. Each gap
+    starts fresh HMM likelihoods; topology reuse supplies no boundary condition.
     """
-    if method not in ("hmm", "greedy"):
-        raise ValueError("Focal method must be 'hmm' or 'greedy'")
-    inputs = worker.inputs
-    num_sites = len(inputs.positions)
-    called_sites = np.flatnonzero(haplotype >= 0)
-    start, end = 0, num_sites
-    if len(called_sites) > 0:
-        start = int(called_sites[0])
-        end = int(called_sites[-1]) + 1
+    worker.matcher.reset_topology()
+    called = np.flatnonzero(haplotype >= 0)
+    start, end = 0, len(haplotype)
+    if len(called) > 0:
+        start, end = int(called[0]), int(called[-1]) + 1
+    with performance.measure(collector, "candidate_extension_cover", "thread"):
+        focal = focal_runs(haplotype, worker, minimum)
+    blocks = []
+    mutations = []
+    cursor = start
     focal_sites = 0
-    gap_sites = 0
-    focal_calls = 0
     gap_calls = 0
-    mask_slices = {}
-    has_coverage = False
-    for budget, mask in inputs.masks.items():
-        run_start = mask["offsets"][job.haplotype_index]
-        run_end = mask["offsets"][job.haplotype_index + 1]
-        mask_slices[budget] = slice(run_start, run_end)
-        covered = ~mask["is_gap"][run_start:run_end]
-        overlaps = mask["left_site_index"][run_start:run_end] < end
-        overlaps &= mask["right_site_index"][run_start:run_end] > start
-        has_coverage |= bool(np.any(covered & overlaps))
-
-    focal_matcher = None
-    if has_coverage and method == "hmm":
-        with performance.measure(collector, "simplify", "worker"):
-            reduced = simplify_ancestors_ts(
-                inputs.ancestors_ts,
-                inputs.focal,
-                inputs.ancestor_nodes,
-                job.haplotype_index,
-                inputs.ac_cutoff,
-            )
-        if collector is not None:
-            collector.count(
-                reductions=1,
-                reduced_nodes=reduced.ts.num_nodes,
-                reduced_edges=reduced.ts.num_edges,
-            )
-        with performance.measure(collector, "reduced_setup", "worker"):
-            indexes = tsinfer.matching.MatcherIndexes(
-                reduced.ts, vestigial_root=False, num_alleles=inputs.num_alleles
-            )
-            focal_matcher = tsinfer.matching.AncestorMatcher(
-                indexes, inputs.recombination, inputs.mismatch, reuse_topology=True
-            )
-
-    greedy_runs = None
-    if method == "greedy":
-        with performance.measure(collector, "focal_match", "worker"):
-            greedy_runs = greedy_focal_runs(
-                inputs, job.haplotype_index, inputs.masks[0], start, end
-            )
-        focal_calls = 1
-
-    results = {}
-    for budget, mask in inputs.masks.items():
-        worker.full_matcher.reset_topology()
-        if focal_matcher is not None:
-            focal_matcher.reset_topology()
-        run_blocks = []
-        mutation_blocks = []
-        focal_cursor = 0
-        run_slice = mask_slices[budget]
-        runs = zip(
-            mask["left_site_index"][run_slice],
-            mask["right_site_index"][run_slice],
-            mask["is_gap"][run_slice],
-            strict=True,
-        )
-        for left, right, is_gap in runs:
-            left = max(start, int(left))
-            right = min(end, int(right))
-            if left >= right:
-                continue
-            if collector is not None:
-                if is_gap:
-                    gap_sites += right - left
-                else:
-                    focal_sites += right - left
-            if not is_gap and method == "greedy":
-                first = focal_cursor
-                while (
-                    focal_cursor < len(greedy_runs.left_site)
-                    and greedy_runs.left_site[focal_cursor] < right
-                ):
-                    focal_cursor += 1
-                focal_slice = slice(first, focal_cursor)
-                run_blocks.append(
-                    CopyingRuns(
-                        greedy_runs.left_site[focal_slice],
-                        greedy_runs.right_site[focal_slice],
-                        greedy_runs.parent[focal_slice],
-                    )
+    with performance.measure(collector, "gap_matching_assembly", "thread"):
+        for left, right, parent in zip(
+            focal.left, focal.right, focal.parent, strict=True
+        ):
+            if cursor < left:
+                gap_calls += _match_gap(
+                    haplotype, worker, cursor, int(left), blocks, mutations
                 )
-                continue
-            boundaries = inputs.interval_boundaries
-            internal = boundaries[(boundaries > left) & (boundaries < right)]
-            run_bounds = [left, *internal, right]
-            matcher = worker.full_matcher if is_gap else focal_matcher
-            original_nodes = None if is_gap else reduced.original_nodes
-            if collector is not None:
-                if is_gap:
-                    gap_calls += len(run_bounds) - 1
-                else:
-                    focal_calls += len(run_bounds) - 1
-            for run_start, run_end in zip(run_bounds[:-1], run_bounds[1:], strict=True):
-                stage = "gap_match" if is_gap else "focal_match"
-                with performance.measure(collector, stage, "worker"):
-                    region = _match_region(
-                        matcher,
-                        haplotype,
-                        run_start,
-                        run_end,
-                        inputs.positions,
-                        worker.match_out,
-                        original_nodes=original_nodes,
-                    )
-                run_blocks.append(region.runs)
-                mutation_blocks.append(region.mutations)
-        with performance.measure(collector, "stitch", "worker"):
-            mutations = [mutation for block in mutation_blocks for mutation in block]
-            results[budget] = _assemble_stitched_match(
-                run_blocks,
-                mutations,
-                inputs.positions,
-                inputs.ancestors_ts.sequence_length,
+            blocks.append(
+                CopyingRuns(
+                    np.asarray([left]),
+                    np.asarray([right]),
+                    np.asarray([parent]),
+                )
             )
+            focal_sites += int(right - left)
+            cursor = int(right)
+        if cursor < end:
+            gap_calls += _match_gap(haplotype, worker, cursor, end, blocks, mutations)
+        result = _assemble_result(
+            job_index, blocks, mutations, haplotype, worker, collector
+        )
     if collector is not None:
         collector.count(
             matched_haplotypes=1,
             domain_sites=end - start,
             focal_sites=focal_sites,
-            gap_sites=gap_sites,
-            focal_calls=focal_calls,
+            gap_sites=end - start - focal_sites,
+            focal_runs=len(focal.left),
             gap_calls=gap_calls,
         )
-    return StitchedResults(job, results, collector)
+    return result
 
 
-def _worker_stitched_haplotype(job, reader, inputs, thread_state, method, stages=None):
-    """Read one haplotype in its task and reuse the thread's full matcher."""
-    worker = getattr(thread_state, "worker", None)
-    if worker is None:
-        matcher = tsinfer.matching.AncestorMatcher(
-            inputs.full_indexes,
-            inputs.recombination,
-            inputs.mismatch,
-            reuse_topology=True,
-        )
-        match_out = np.empty(len(inputs.positions), dtype=np.int8)
-        worker = StitchedWorker(inputs, matcher, match_out)
-        thread_state.worker = worker
-    haplotype = np.asarray(reader.read_haplotype(job), dtype=np.int8)
-    collector = None if stages is None else performance.Collector(stages=stages)
-    return match_stitched_haplotype(
-        job, haplotype, worker, method=method, collector=collector
-    )
-
-
-def _write_stitched_matches(
-    match_file, paired_results, ac_cutoff, max_mismatches, method
+@performance.sample_memory()
+def _worker_main(
+    work,
+    events,
+    start_matching,
+    panel_path,
+    reference_path,
+    catalog,
+    num_alleles,
+    parameters,
+    minimum,
+    helpers,
+    collect,
+    diagnostics,
 ):
-    """Append native-shaped JSONL records to an open file in haplotype order."""
-    for job, result in paired_results:
-        record = {
-            "group": job.group,
-            "haplotype_index": job.haplotype_index,
+    """Preparation barrier followed by matching, reusing the same processes."""
+    worker = None
+    try:
+        utils.configure_helpers(helpers)
+        while True:
+            chunk = work.get()
+            if chunk is None:
+                break
+            collector = performance.Collector(stages=diagnostics)
+            with performance.measure(
+                collector,
+                "reference_packing",
+                "thread",
+            ):
+                count = haplotypes.pack_reference_chunk(panel_path, catalog, chunk)
+            collector.count(ancestor_blocks_read=count)
+            events.put(("packed", collector))
+        collector = performance.Collector(stages=diagnostics)
+        with performance.measure(collector, "worker_setup", "thread"):
+            reference = tskit.load(reference_path)
+            worker = make_worker(reference, catalog, num_alleles, parameters)
+            del reference
+        events.put(("worker_ready", collector))
+        start_matching.wait()
+        while True:
+            task = work.get()
+            if task is None:
+                break
+            calls = task.slab.open()
+            try:
+                row = calls[task.row]
+                collector = (
+                    performance.Collector(stages=diagnostics) if collect else None
+                )
+                result = match_stitched_haplotype(
+                    task.job_index, row, worker, minimum, collector
+                )
+                del row
+            finally:
+                haplotypes.close_mapping(calls)
+            # Every numeric output owns its data; the sample map is already closed.
+            events.put(("result", (task.chunk, result)))
+    except Exception:
+        events.put(("error", traceback.format_exc()))
+    finally:
+        if worker is not None:
+            haplotypes.close_mapping(worker.packed)
+
+
+def _watch_workers(processes, events, stopping):
+    """Turn even a native crash into an event, without polling the work queues."""
+    waiting = {process.sentinel: process for process in processes}
+    while len(waiting) > 0:
+        ready = multiprocessing.connection.wait(list(waiting))
+        for sentinel in ready:
+            process = waiting.pop(sentinel)
+            if not stopping.is_set():
+                events.put(
+                    ("error", f"Matching worker {process.pid} exited unexpectedly")
+                )
+
+
+def _event(events):
+    kind, payload = events.get()
+    if kind == "error":
+        raise RuntimeError(payload)
+    return kind, payload
+
+
+def _pack_reference(work, events, chunks, cap, collector):
+    """Bound submitted-but-uncollected preparation tasks with one admission count."""
+    chunks = iter(chunks)
+    pending = 0
+    exhausted = False
+    while not exhausted or pending > 0:
+        while not exhausted and pending < cap:
+            chunk = next(chunks, None)
+            if chunk is None:
+                exhausted = True
+            else:
+                work.put(chunk)
+                pending += 1
+        if pending > 0:
+            _, measurements = _event(events)
+            if collector is not None:
+                collector.merge(measurements)
+            pending -= 1
+
+
+def _load_samples(inputs, directory, slots, stopping, events):
+    """Publish complete slabs; a slot covers loading, waiting and worker use."""
+    try:
+        for chunk in inputs.chunks:
+            slots.acquire()
+            if stopping.is_set():
+                return
+            slab = haplotypes.load_sample_chunk(inputs, chunk, directory)
+            if stopping.is_set():
+                return
+            events.put(("slab", slab))
+    except Exception:
+        events.put(("error", traceback.format_exc()))
+
+
+def _create_sample_nodes(tables, jobs):
+    """Reserve canonical child IDs before appending unordered completed results."""
+    nodes = []
+    for job in jobs:
+        metadata = {
             "source": job.source,
             "sample_id": job.sample_id,
             "ploidy_index": job.ploidy_index,
-            "time": job.time,
-            "path": [dataclasses.asdict(segment) for segment in result.path],
-            "mutations": [dataclasses.asdict(mutation) for mutation in result.mutations],
-            "ac_cutoff": ac_cutoff,
-            "max_mismatches": max_mismatches,
-            "method": method,
         }
-        match_file.write(json.dumps(record) + "\n")
+        node = tables.nodes.add_row(
+            time=job.time,
+            flags=job.node_flags,
+            metadata=metadata,
+            individual=-1 if job.individual_id is None else job.individual_id,
+            population=-1 if job.population_id is None else job.population_id,
+        )
+        nodes.append(node)
+    return nodes
 
 
-def _collect_stitched_batch(
-    jobs, reader, inputs, thread_state, method, executor, stages
-):
-    """Match one contiguous batch, releasing its futures before returning."""
-    if executor is None:
-        results = [
-            _worker_stitched_haplotype(job, reader, inputs, thread_state, method, stages)
-            for job in jobs
-        ]
-    else:
-        futures = [
-            executor.submit(
-                _worker_stitched_haplotype,
-                job,
-                reader,
-                inputs,
-                thread_state,
-                method,
-                stages,
+def append_result(tables, child, result, allele_mapper):
+    """Narrow local append contract for pre-created nodes and numeric results."""
+    for left, right, parent in zip(
+        result.left, result.right, result.parent, strict=True
+    ):
+        tables.edges.add_row(
+            left=float(left), right=float(right), parent=int(parent), child=child
+        )
+    states = allele_mapper.decode_mutations(result.mutation_site, result.mutation_code)
+    for site, state in zip(result.mutation_site, states, strict=True):
+        tables.mutations.add_row(site=int(site), node=child, derived_state=state)
+
+
+def write_result(output, job, result, positions):
+    """Build optional native-shaped JSON only in the output owner."""
+    record = {
+        "group": job.group,
+        "haplotype_index": job.haplotype_index,
+        "source": job.source,
+        "sample_id": job.sample_id,
+        "ploidy_index": job.ploidy_index,
+        "time": job.time,
+        "path": [
+            {"left": float(left), "right": float(right), "parent": int(parent)}
+            for left, right, parent in zip(
+                result.left, result.right, result.parent, strict=True
             )
-            for job in jobs
-        ]
-        results = [future.result() for future in cf.as_completed(futures)]
-    results.sort(key=lambda result: result.job.haplotype_index)
-    return results
+        ],
+        "mutations": [
+            {"position": float(positions[site]), "derived_state": int(code)}
+            for site, code in zip(
+                result.mutation_site, result.mutation_code, strict=True
+            )
+        ],
+    }
+    output.write(json.dumps(record) + "\n")
 
 
-def iter_stitched_batches(
-    jobs, reader, inputs, method, threads, haplotype_batch_size, collector=None
+def _coordinate(
+    work,
+    events,
+    jobs,
+    tables,
+    nodes,
+    samples,
+    match_file,
+    positions,
+    cap,
+    slots,
+    collector,
+    resident_slabs,
 ):
-    """Yield canonical batches with one executor and persistent worker state.
-
-    Only batch execution/collection and executor lifetime operations enter the
-    process ``matching`` aggregate. The consumer may assemble and release each
-    batch while matching tasks are quiescent. Close this iterator on failures.
-    Task-local diagnostics are merged and released before yielding each batch.
-    """
-    workers = min(threads, len(jobs), haplotype_batch_size)
-    thread_state = threading.local()
-    stages = None if collector is None else collector.stages
-    executor = None
-    with performance.measure(collector, "matching"):
-        if workers > 1:
-            executor = cf.ThreadPoolExecutor(max_workers=workers)
-    try:
-        for first in range(0, len(jobs), haplotype_batch_size):
-            batch_jobs = jobs[first : first + haplotype_batch_size]
-            with performance.measure(collector, "matching"):
-                results = _collect_stitched_batch(
-                    batch_jobs, reader, inputs, thread_state, method, executor, stages
-                )
-                if collector is not None:
-                    for result in results:
-                        if collector.stages:
-                            service_s = sum(
-                                record.service_s
-                                for record in result.measurements.records.values()
-                                if record.scope == "worker"
-                            )
-                            collector.haplotype_times.append(
-                                {
-                                    "sample_id": result.job.sample_id,
-                                    "ploidy_index": result.job.ploidy_index,
-                                    "service_s": service_s,
-                                }
-                            )
-                        collector.merge(result.measurements)
-                        result.measurements = None
-                    del result
-            yield results
-            del results
-    finally:
-        with performance.measure(collector, "matching"):
-            if executor is not None:
-                executor.shutdown(wait=True)
-
-
-def assemble_stitched_batches(
-    batches,
-    ancestors_ts,
-    allele_mapper,
-    max_mismatches,
-    output_paths,
-    match_file_paths,
-    ac_cutoff,
-    method,
-    collector=None,
-):
-    """Consume/release batches and finalise once per budget for both runners."""
-    outputs = list(zip(max_mismatches, output_paths, match_file_paths, strict=True))
-    file_stack = contextlib.ExitStack()
-    try:
-        with performance.measure(collector, "assembly_output"):
-            tables = {budget: ancestors_ts.dump_tables() for budget in max_mismatches}
-            match_files = {}
-            for budget, output_path, match_file_path in outputs:
-                output_path.parent.mkdir(parents=True, exist_ok=True)
-                match_file_path.parent.mkdir(parents=True, exist_ok=True)
-                match_files[budget] = file_stack.enter_context(match_file_path.open("w"))
-        for results in batches:
+    """Drain events and refill continuously; pending includes unappended results."""
+    ready = collections.deque()
+    live = {}
+    next_row = 0
+    pending = 0
+    completed = 0
+    if resident_slabs is not None:
+        ready.extend(resident_slabs)
+        live.update(
+            {
+                slab.chunk: ActiveSlab(slab, len(slab.job_indices))
+                for slab in resident_slabs
+            }
+        )
+    while completed < len(jobs):
+        while pending < cap and len(ready) > 0:
+            slab = ready[0]
+            index = int(slab.job_indices[next_row])
+            work.put(HaplotypeTask(slab.calls, next_row, index, slab.chunk))
+            pending += 1
+            next_row += 1
+            if next_row == len(slab.job_indices):
+                ready.popleft()
+                next_row = 0
+        kind, payload = _event(events)
+        if kind == "slab":
+            slab = payload
+            ready.append(slab)
+            live[slab.chunk] = ActiveSlab(slab, len(slab.job_indices))
+            if collector is not None:
+                collector.count(sample_blocks_read=slab.blocks_read)
+                if collector.stages:
+                    collector.add(
+                        performance.Measurement(
+                            "sample_loading_remapping",
+                            "loader",
+                            call_count=1,
+                            service_s=slab.load_s,
+                        )
+                    )
+        elif kind == "result":
+            chunk, result = payload
             with performance.measure(collector, "assembly_output"):
-                _append_stitched_batch(
-                    results, tables, match_files, allele_mapper, ac_cutoff, method
+                append_result(
+                    tables, nodes[result.job_index], result, samples.allele_mapper
                 )
-            del results
-        with performance.measure(collector, "assembly_output"):
-            for budget, output_path, match_file_path in outputs:
-                budget_tables = tables.pop(budget)
-                ts = tsinfer.matching.finalise_match_tables(budget_tables)
-                ts.dump(output_path)
-                del ts, budget_tables
-                logger.info(
-                    "Wrote stitched samples to %s and %s", output_path, match_file_path
-                )
-    finally:
-        with performance.measure(collector, "assembly_output"):
-            file_stack.close()
-
-
-def _append_stitched_batch(
-    results, tables, match_files, allele_mapper, ac_cutoff, method
-):
-    """Append a canonical batch to each budget, retaining no Python results."""
-    for budget, budget_tables in tables.items():
-        paired_results = [(result.job, result.results[budget]) for result in results]
-        tsinfer.matching.append_match_results(
-            budget_tables, paired_results, allele_mapper
-        )
-        _write_stitched_matches(
-            match_files[budget], paired_results, ac_cutoff, budget, method
-        )
+                if match_file is not None:
+                    write_result(match_file, jobs[result.job_index], result, positions)
+            if collector is not None and result.measurements is not None:
+                collector.merge(result.measurements)
+            pending -= 1
+            completed += 1
+            live[chunk].remaining -= 1
+            if live[chunk].remaining == 0:
+                active = live.pop(chunk)
+                active.slab.calls.path.unlink()
+                if resident_slabs is None:
+                    slots.release()
+            del result
 
 
 def match_stitched_samples(
     config_path: pathlib.Path,
     ancestors_ts_path: pathlib.Path,
-    focal_path: pathlib.Path | None,
-    mask_paths: list[pathlib.Path],
-    output_paths: list[pathlib.Path],
-    match_file_paths: list[pathlib.Path],
-    ac_cutoff: int,
-    max_mismatches: list[int],
-    method: str,
-    threads: int,
-    cache_size: int | None = None,
-    intervals_path: pathlib.Path | None = None,
+    output_path: pathlib.Path,
     *,
-    haplotype_batch_size: int,
-    read_workers: int | None = None,
+    ac_cutoff: int,
+    min_focal_region_size: int,
+    workers: int,
+    sample_prefetch_chunks: int,
+    max_pending_haplotypes: int,
+    helper_threads: dict,
+    focal_choice: str = "left",
+    temp_dir: pathlib.Path | None = None,
+    match_file_path: pathlib.Path | None = None,
     collector: performance.Collector | None = None,
-) -> None:
-    """Match one dataset/cutoff/method across all budgets and assemble raw TSs.
+    resident: bool = False,
+    window: performance.Window | None = None,
+) -> int:
+    """Pack once, stream slabs and append completed full-haplotype jobs immediately.
 
-    Each native haplotype is read once inside its task. Threads share the
-    reference, indexes and reader, reusing one full matcher per thread and one
-    transient reduced matcher per haplotype across budgets for method ``hmm``.
-    Method ``greedy`` requires ``intervals_path`` and budget zero, and uses no
-    reduced matcher. Numba and native HMM calls release the GIL. Simplification
-    holds the GIL, so its preparation does not scale with matching threads.
-    Contiguous canonical batches bound pending tasks and Python results. Each
-    budget's tables start from the immutable reference and are finalised once.
-    Native appending preserves original parent IDs, metadata and assignments.
-    Final tables, input archives and reader chunks still scale with the output
-    or cohort; ``haplotype_batch_size`` bounds only matching tasks/results.
+    The entry point receives validated configuration. One spawn pool handles
+    packing and matching; a single loader owns sample Zarr reads. Outstanding
+    jobs and live decoded slabs have separate bounds. Temporary inputs are
+    removed only after loader and children stop. Returns the actual worker count.
+
+    Diagnostic resident runs preload all slabs and initialise workers before
+    ``window``; the benchmark limits their total size. Normal end-to-end timing
+    wraps this entire function, including startup, packing and final output.
     """
-    if (
-        isinstance(haplotype_batch_size, bool)
-        or not isinstance(haplotype_batch_size, int)
-        or haplotype_batch_size <= 0
-    ):
-        raise ValueError("haplotype_batch_size must be a positive integer")
-    if method not in ("hmm", "greedy"):
-        raise ValueError("Focal method must be 'hmm' or 'greedy'")
-    if method == "greedy":
-        if max_mismatches != [0]:
-            raise ValueError("Greedy focal matching requires max_mismatches=[0]")
-        if intervals_path is None:
-            raise ValueError("Greedy focal matching requires ancestor intervals")
-    cfg = _sample_config(config_path, ancestors_ts_path, output_paths[0])
-    ancestors_ts = tskit.load(ancestors_ts_path)
-    positions = ancestors_ts.sites_position.astype(np.int32)
-    ancestral_alleles = np.asarray(
-        [site.ancestral_state for site in ancestors_ts.sites()]
-    )
-    jobs, _, _ = tsinfer.pipeline._build_jobs_with_metadata(cfg, positions)
-    jobs.sort(key=lambda job: job.haplotype_index)
-    workers = min(threads, len(jobs), haplotype_batch_size)
-    schedule = [(job.source, job.sample_id, job.ploidy_index) for job in jobs]
-    reader = tsinfer.vcz.HaplotypeReader(
-        cfg.sources,
-        positions,
-        ancestral_alleles,
-        cache_size_mb=cache_size,
-        schedule=schedule,
-        num_threads=workers,
-        read_workers=read_workers,
-    )
-    try:
-        inputs = _prepare_stitched_inputs(
-            ancestors_ts,
-            positions,
-            focal_path,
-            mask_paths,
-            ac_cutoff,
-            reader.get_num_alleles(),
-            cfg.match.sources["samples"],
-            intervals_path=intervals_path,
+    native = tsinfer.config.Config.from_toml(config_path)
+    panel_path = native.ancestors[0].path
+    cfg = _sample_config(config_path, ancestors_ts_path, output_path)
+    utils.configure_helpers(helper_threads)
+    with performance.measure(collector, "input_setup"):
+        reference = tskit.load(ancestors_ts_path)
+        positions = reference.sites_position.astype(np.int32)
+        jobs, individuals, populations = tsinfer.pipeline._build_jobs_with_metadata(
+            cfg, positions
         )
-        logger.info(
-            "Stitching %d haplotypes with %d threads in batches of %d",
-            len(jobs),
-            workers,
-            haplotype_batch_size,
-        )
-        batches = iter_stitched_batches(
-            jobs, reader, inputs, method, threads, haplotype_batch_size, collector
-        )
-        with contextlib.closing(batches):
-            assemble_stitched_batches(
-                batches,
-                ancestors_ts,
-                reader.allele_mapper,
-                max_mismatches,
-                output_paths,
-                match_file_paths,
-                ac_cutoff,
-                method,
+        jobs.sort(key=lambda job: job.haplotype_index)
+        if len(jobs) == 0 or reference.num_sites == 0:
+            raise ValueError("Matching requires samples and reference sites")
+        samples = haplotypes.prepare_samples(cfg.sources["samples"], reference, jobs)
+        tables = reference.dump_tables()
+        if [row.metadata for row in tables.individuals] != individuals:
+            raise ValueError(
+                "Reference individuals disagree with selected sample metadata"
+            )
+        if [row.metadata for row in tables.populations] != populations:
+            raise ValueError(
+                "Reference populations disagree with selected sample metadata"
+            )
+        nodes = _create_sample_nodes(tables, jobs)
+    workers = min(workers, len(jobs), max_pending_haplotypes)
+    ctx = mp.get_context("spawn")
+    work = ctx.Queue(maxsize=max_pending_haplotypes)
+    events = ctx.Queue()
+    start_matching = ctx.Event()
+    stopping = threading.Event()
+    slots = threading.Semaphore(sample_prefetch_chunks)
+    processes = []
+    loader = None
+    watcher = None
+    success = False
+    diagnostics = collector is not None and collector.stages
+    if temp_dir is not None:
+        temp_dir.mkdir(parents=True, exist_ok=True)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp_dir, prefix="greedy_") as temporary:
+        directory = pathlib.Path(temporary)
+        try:
+            with performance.measure(collector, "reference_catalog"):
+                catalog = haplotypes.prepare_reference(
+                    panel_path,
+                    samples,
+                    reference,
+                    ac_cutoff,
+                    focal_choice,
+                    directory,
+                )
+            if collector is not None:
+                slab_sizes = [
+                    len(chunk.job_indices) * reference.num_sites
+                    for chunk in samples.chunks
+                ]
+                slab_sizes.sort(reverse=True)
+                live_count = len(slab_sizes) if resident else sample_prefetch_chunks
+                mapped_bound = catalog.packed.shape[0] + sum(slab_sizes[:live_count])
+                collector.count(
+                    mapped_input_bound_bytes=mapped_bound,
+                    packed_calls=catalog.packed.shape[0],
+                    eligible_ancestors=len(catalog.seeds),
+                )
+            for _ in range(workers):
+                process = ctx.Process(
+                    target=_worker_main,
+                    args=(
+                        work,
+                        events,
+                        start_matching,
+                        panel_path,
+                        ancestors_ts_path,
+                        catalog,
+                        samples.allele_mapper.num_alleles_array(),
+                        cfg.match.sources["samples"],
+                        min_focal_region_size,
+                        helper_threads,
+                        collector is not None,
+                        diagnostics,
+                    ),
+                )
+                process.start()
+                processes.append(process)
+            watcher = threading.Thread(
+                target=_watch_workers, args=(processes, events, stopping)
+            )
+            watcher.start()
+            _pack_reference(
+                work,
+                events,
+                haplotypes.reference_chunks(panel_path, catalog),
+                max_pending_haplotypes,
                 collector,
             )
-    finally:
-        reader.shutdown()
+            for _ in processes:
+                work.put(None)
+            for _ in processes:
+                _, measurements = _event(events)
+                if collector is not None:
+                    collector.merge(measurements)
+            resident_slabs = None
+            if resident:
+                resident_slabs = [
+                    haplotypes.load_sample_chunk(samples, chunk, directory)
+                    for chunk in samples.chunks
+                ]
+                if collector is not None:
+                    collector.count(
+                        sample_blocks_read=sum(
+                            slab.blocks_read for slab in resident_slabs
+                        )
+                    )
+            else:
+                loader = threading.Thread(
+                    target=_load_samples,
+                    args=(samples, directory, slots, stopping, events),
+                )
+                loader.start()
+            with contextlib.ExitStack() as stack:
+                match_file = None
+                if match_file_path is not None:
+                    match_file_path.parent.mkdir(parents=True, exist_ok=True)
+                    match_file = stack.enter_context(match_file_path.open("w"))
+                if window is not None:
+                    stack.enter_context(window)
+                start_matching.set()
+                _coordinate(
+                    work,
+                    events,
+                    jobs,
+                    tables,
+                    nodes,
+                    samples,
+                    match_file,
+                    positions,
+                    max_pending_haplotypes,
+                    slots,
+                    collector,
+                    resident_slabs,
+                )
+            with performance.measure(collector, "finalise_output"):
+                ts = tsinfer.matching.finalise_match_tables(tables)
+                ts.dump(output_path)
+            success = True
+        finally:
+            stopping.set()
+            for _ in range(sample_prefetch_chunks):
+                slots.release()
+            if loader is not None:
+                loader.join()
+            if success:
+                for _ in processes:
+                    work.put(None)
+            else:
+                for process in processes:
+                    process.terminate()
+            for process in processes:
+                process.join()
+            if watcher is not None:
+                watcher.join()
+            for channel in (work, events):
+                if not success:
+                    channel.cancel_join_thread()
+                channel.close()
+                if success:
+                    channel.join_thread()
+    logger.info(
+        "Wrote greedy stitched samples to %s using %d workers", output_path, workers
+    )
+    return workers

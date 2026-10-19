@@ -1,37 +1,17 @@
 import csv
 import pathlib
 
-from lib import ancestors, benchmark, haplotypes, matching, utils
+from lib import ancestors, benchmark, matching, utils
 
 
 configfile: "config.yaml"
 
+utils.validate_config(config)
 focal_choice = config.get("focal_choice", "left")
-if focal_choice not in ("left", "right"):
-    raise ValueError("focal_choice must be exactly 'left' or 'right'")
 ac_cutoff = config["ac_cutoff"]
-benchmark.validate_ac_cutoffs(ac_cutoff)
-max_ac_cutoff = max(ac_cutoff)
 min_focal_region_size = config["min_focal_region_size"]
-max_mismatches = config["max_mismatches"]
-if not isinstance(max_mismatches, list) or len(max_mismatches) == 0:
-    raise ValueError("max_mismatches must be a nonempty list")
-if any(isinstance(value, bool) or not isinstance(value, int) for value in max_mismatches):
-    raise ValueError("max_mismatches values must be integers, not booleans")
-if any(value < 0 for value in max_mismatches) or any(
-    right <= left for left, right in zip(max_mismatches, max_mismatches[1:])
-):
-    raise ValueError("max_mismatches must contain strictly increasing nonnegative integers")
-max_mismatch_budget = max(max_mismatches)
-focal_methods = config["focal_methods"]
-if not isinstance(focal_methods, list) or len(focal_methods) == 0:
-    raise ValueError("focal_methods must be a nonempty list")
-if any(method not in ("hmm", "greedy") for method in focal_methods):
-    raise ValueError("focal_methods may contain only 'hmm' and 'greedy'")
-if len(set(focal_methods)) != len(focal_methods):
-    raise ValueError("focal_methods must not contain duplicates")
-if "greedy" in focal_methods and max_mismatches != [0]:
-    raise ValueError("Greedy focal matching requires max_mismatches: [0]")
+helpers = config["helper_threads"]
+utils.configure_helpers(helpers)
 
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
@@ -44,14 +24,6 @@ for dataset in datasets.values():
             sample_ids = [sample_id for row in csv.reader(sample_file) for sample_id in row]
         dataset["samples"] = ",".join(sample_ids)
 names = list(datasets)
-focal_pattern = (
-    data_dir / "focal_ancestors"
-    / f"{{name}}_inferred_max_ac{max_ac_cutoff}_focal_ancestors.npz"
-)
-interval_pattern = (
-    data_dir / "haplotype_intervals"
-    / f"{{name}}_inferred_max_ac{max_ac_cutoff}_focal_ancestor_intervals.npz"
-)
 
 
 def panel_config(wildcards):
@@ -61,37 +33,16 @@ def panel_config(wildcards):
 
 wildcard_constraints:
     kind="inferred|true",
-    ac="|".join(str(value) for value in ac_cutoff),
-    k="|".join(str(value) for value in max_mismatches),
-    min_size="|".join(str(value) for value in min_focal_region_size),
-    method="|".join(focal_methods),
 
 
 rule all:
     input:
-        expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=names),
-        expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=names),
-        expand(focal_pattern, name=names),
         expand(data_dir / "matches" / "{name}_inferred_samples_raw.trees", name=names),
-        expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names),
-        expand(
-            interval_pattern,
-            name=names,
-        ),
-        expand(
-            data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_focal_mask.npz",
-            name=names, ac=ac_cutoff, k=max_mismatches, min_size=min_focal_region_size,
-        ),
-        expand(
-            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_{method}_stitched_samples_raw.trees",
-            name=names, ac=ac_cutoff, k=max_mismatches,
-            min_size=min_focal_region_size, method=focal_methods,
-        ),
-        expand(
-            data_dir / "matches" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_{method}_stitched_samples_matches.jsonl",
-            name=names, ac=ac_cutoff, k=max_mismatches,
-            min_size=min_focal_region_size, method=focal_methods,
-        ),
+        expand(data_dir / "matches" / "{name}_inferred_greedy_samples_raw.trees", name=names),
+        (expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names)
+         if config["path_output"] else []),
+        (expand(data_dir / "matches" / "{name}_inferred_greedy_samples_matches.jsonl", name=names)
+         if config["path_output"] else []),
 
 
 rule annotate_derived_counts:
@@ -216,130 +167,42 @@ rule match_ancestors:
         )
 
 
-rule find_focal_ancestors:
-    input:
-        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
-        ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
-    output:
-        focal_pattern,
-    log:
-        progress_dir / "find_focal_ancestors" / "{name}_inferred_find_focal_ancestors.log",
-    params:
-        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
-        focal_choice=focal_choice,
-        max_ac_cutoff=max_ac_cutoff,
-    run:
-        utils.setup_log(pathlib.Path(log[0]))
-        haplotypes.find_focal_ancestors(
-            pathlib.Path(input.samples),
-            pathlib.Path(input.ancestors),
-            pathlib.Path(output[0]),
-            params.focal_choice,
-            params.samples,
-            max_ac_cutoff=params.max_ac_cutoff,
-        )
-
-
-rule make_ancestor_intervals:
-    input:
-        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
-        ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
-        focal=focal_pattern,
-    output:
-        interval_pattern,
-    params:
-        samples=lambda wildcards: datasets[wildcards.name].get("samples"),
-        max_ac_cutoff=max_ac_cutoff,
-        max_mismatches=max_mismatch_budget,
-        focal_choice=focal_choice,
-    threads: workflow.cores
-    log:
-        progress_dir / "make_ancestor_intervals" / "{name}_inferred_make_ancestor_intervals.log",
-    run:
-        utils.setup_log(pathlib.Path(log[0]))
-        haplotypes.make_ancestor_intervals(
-            pathlib.Path(input.samples),
-            pathlib.Path(input.ancestors),
-            pathlib.Path(input.focal),
-            pathlib.Path(output[0]),
-            params.max_ac_cutoff,
-            params.max_mismatches,
-            threads,
-            params.focal_choice,
-            params.samples,
-        )
-
-
-rule make_focal_mask:
-    input:
-        interval_pattern,
-    output:
-        expand(
-            data_dir / "focal_masks" / "{{name}}_inferred_ac{ac}_k{k}_min{min_size}_focal_mask.npz",
-            ac=ac_cutoff, k=max_mismatches, min_size=min_focal_region_size,
-        ),
-    params:
-        ac_cutoff=ac_cutoff,
-        max_mismatches=max_mismatches,
-        min_focal_region_size=min_focal_region_size,
-    log:
-        progress_dir / "make_focal_mask" / "{name}_inferred_make_focal_mask.log",
-    run:
-        utils.setup_log(pathlib.Path(log[0]))
-        haplotypes.make_focal_masks(
-            pathlib.Path(input[0]), [pathlib.Path(path) for path in output],
-            params.ac_cutoff, params.max_mismatches, params.min_focal_region_size,
-        )
-
-
 rule match_stitched_samples:
     input:
         reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+        ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",
-        focal=lambda wildcards: (
-            [str(focal_pattern).format(name=wildcards.name)]
-            if wildcards.method == "hmm" else []
-        ),
-        intervals=lambda wildcards: (
-            [str(interval_pattern).format(name=wildcards.name)]
-            if wildcards.method == "greedy" else []
-        ),
-        masks=expand(
-            data_dir / "focal_masks" / "{{name}}_inferred_ac{{ac}}_k{k}_min{{min_size}}_focal_mask.npz",
-            k=max_mismatches,
-        ),
     output:
-        trees=expand(
-            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_min{{min_size}}_{{method}}_stitched_samples_raw.trees",
-            k=max_mismatches,
-        ),
-        matches=expand(
-            data_dir / "matches" / "{{name}}_inferred_ac{{ac}}_k{k}_min{{min_size}}_{{method}}_stitched_samples_matches.jsonl",
-            k=max_mismatches,
-        ),
+        trees=data_dir / "matches" / "{name}_inferred_greedy_samples_raw.trees",
+        matches=([data_dir / "matches" / "{name}_inferred_greedy_samples_matches.jsonl"]
+                 if config["path_output"] else []),
     params:
-        ac_cutoff=lambda wildcards: int(wildcards.ac),
-        max_mismatches=max_mismatches,
-        haplotype_batch_size=config["haplotype_batch_size"],
-        cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
-    threads: workflow.cores
+        ac_cutoff=ac_cutoff,
+        min_focal_region_size=min_focal_region_size,
+        focal_choice=focal_choice,
+        workers=config["matching_threads"],
+        sample_prefetch_chunks=config["sample_prefetch_chunks"],
+        max_pending_haplotypes=config["max_pending_haplotypes"],
+        temp_dir=config["temp_dir"],
+        helper_threads=helpers,
+    threads: utils.cpu_allocation(config["matching_threads"], helpers)
     log:
-        progress_dir / "match_stitched_samples" / "{name}_inferred_ac{ac}_min{min_size}_{method}_match_stitched_samples.log",
+        progress_dir / "match_stitched_samples" / "{name}_inferred_match_stitched_samples.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
+        required = utils.cpu_allocation(params.workers, params.helper_threads)
+        if threads < required:
+            raise ValueError(f"Greedy matching needs {required} CPUs including helpers; got {threads}")
         matching.match_stitched_samples(
-            pathlib.Path(input.config), pathlib.Path(input.reference),
-            pathlib.Path(input.focal[0]) if len(input.focal) > 0 else None,
-            [pathlib.Path(path) for path in input.masks],
-            [pathlib.Path(path) for path in output.trees],
-            [pathlib.Path(path) for path in output.matches],
-            params.ac_cutoff, params.max_mismatches, wildcards.method,
-            threads, params.cache_size,
-            intervals_path=(
-                pathlib.Path(input.intervals[0]) if len(input.intervals) > 0 else None
-            ),
-            haplotype_batch_size=params.haplotype_batch_size,
+            pathlib.Path(input.config), pathlib.Path(input.reference), pathlib.Path(output.trees),
+            ac_cutoff=params.ac_cutoff, min_focal_region_size=params.min_focal_region_size,
+            focal_choice=params.focal_choice, workers=params.workers,
+            sample_prefetch_chunks=params.sample_prefetch_chunks,
+            max_pending_haplotypes=params.max_pending_haplotypes,
+            temp_dir=None if params.temp_dir is None else pathlib.Path(params.temp_dir).expanduser(),
+            helper_threads=params.helper_threads,
+            match_file_path=pathlib.Path(output.matches[0]) if output.matches else None,
         )
 
 
@@ -351,7 +214,8 @@ rule match_samples:
         config=panel_config,
     output:
         trees=data_dir / "matches" / "{name}_{kind}_samples_raw.trees",
-        matches=data_dir / "matches" / "{name}_{kind}_samples_matches.jsonl",
+        matches=([data_dir / "matches" / "{name}_{kind}_samples_matches.jsonl"]
+                 if config["path_output"] else []),
     log:
         progress_dir / "match_samples" / "{name}_{kind}_match_samples.log",
     params:
@@ -363,7 +227,7 @@ rule match_samples:
             pathlib.Path(input.config),
             pathlib.Path(input.reference),
             pathlib.Path(output.trees),
-            pathlib.Path(output.matches),
+            pathlib.Path(output.matches[0]) if output.matches else None,
             threads,
             params.cache_size,
         )
@@ -371,67 +235,29 @@ rule match_samples:
 
 if "performance" in config:
     performance_dir = benchmark.output_directory(config)
-    performance_products = ["manifest.json", "runs.csv", "stages.csv"]
+    performance_products = ["manifest.json", "runs.csv", "stages.csv", "complete.json"]
     if config["performance"]["quality_checks"]:
         performance_products.append("quality.json")
-    performance_outputs = [
-        performance_dir / "complete.json",
-        *expand(
-            performance_dir / "ac{ac}_min{min_size}" / "{product}",
-            ac=ac_cutoff, min_size=min_focal_region_size, product=performance_products,
-        ),
-    ]
     performance_names = config["performance"]["datasets"]
-    performance_resident_focal = (
-        "resident_match" in config["performance"]["modes"]
-        and any(method != "full_hmm" for method in config["performance"]["methods"])
-    )
 
     rule performance:
         input:
-            performance_outputs,
+            expand(performance_dir / "{product}", product=performance_products),
 
     rule performance_suite:
         input:
-            configs=expand(
-                data_dir / "configs" / "{name}_ancestor_inference.toml",
-                name=performance_names,
-            ),
-            samples=expand(
-                data_dir / "samples" / "{name}_samples_masked.zarr",
-                name=performance_names,
-            ),
-            panels=expand(
-                data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
-                name=performance_names,
-            ),
-            references=expand(
-                data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
-                name=performance_names,
-            ),
-            focal=(expand(
-                focal_pattern,
-                name=performance_names,
-            ) if performance_resident_focal else []),
-            intervals=(expand(
-                interval_pattern,
-                name=performance_names,
-            ) if performance_resident_focal else []),
-            masks=(expand(
-                data_dir / "focal_masks" / "{name}_inferred_ac{ac}_k{k}_min{min_size}_focal_mask.npz",
-                name=performance_names, ac=ac_cutoff, k=max_mismatches,
-                min_size=min_focal_region_size,
-            ) if performance_resident_focal else []),
+            configs=expand(data_dir / "configs" / "{name}_ancestor_inference.toml", name=performance_names),
+            samples=expand(data_dir / "samples" / "{name}_samples_masked.zarr", name=performance_names),
+            panels=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=performance_names),
+            references=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=performance_names),
         output:
-            protected(performance_outputs),
+            protected(expand(performance_dir / "{product}", product=performance_products)),
         threads: benchmark.required_allocation(config)
         log:
             progress_dir / "performance" / f"{config['performance']['experiment_id']}.log",
         run:
             utils.setup_log(pathlib.Path(log[0]))
-            benchmark.run_suite(
-                config, threads, [pathlib.Path(path) for path in workflow.configfiles]
-            )
+            benchmark.run_suite(config, threads, [pathlib.Path(path) for path in workflow.configfiles])
 else:
     rule performance:
         run:

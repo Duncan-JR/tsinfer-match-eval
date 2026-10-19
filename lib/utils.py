@@ -1,10 +1,12 @@
 """Small helpers for the sample VCZ and native tsinfer configuration."""
 
 import logging
+import os
 import pathlib
 import shutil
 import subprocess
 
+import numcodecs
 import numpy as np
 import tomli_w
 import tsinfer
@@ -132,3 +134,68 @@ def make_inference_config(
     }
     output.write_text(tomli_w.dumps(native))
     logger.info("Wrote %s", output)
+
+
+def configure_helpers(helpers):
+    """Apply numerical/codec limits before spawning and inside each child."""
+    for name in (
+        "OPENBLAS_NUM_THREADS",
+        "MKL_NUM_THREADS",
+        "OMP_NUM_THREADS",
+        "VECLIB_MAXIMUM_THREADS",
+        "BLIS_NUM_THREADS",
+    ):
+        os.environ[name] = str(helpers["blas_threads"])
+    numcodecs.blosc.set_nthreads(helpers["blosc_threads"])
+    zarr.config.set(
+        {
+            "async.concurrency": helpers["zarr_async_concurrency"],
+            "threading.max_workers": helpers["zarr_threading_max_workers"],
+        }
+    )
+
+
+def cpu_allocation(workers, helpers):
+    """Reserve match/loader CPUs and the simultaneously active decoding helpers."""
+    decoding = helpers["zarr_threading_max_workers"] + helpers["blosc_threads"]
+    packing = workers * decoding
+    matching = workers + 1 + decoding
+    return max(packing, matching) + (workers + 1) * (helpers["blas_threads"] - 1)
+
+
+def validate_config(config):
+    """Validate the scalar workflow interface once, before preparing any data."""
+    if config.get("focal_choice", "left") not in ("left", "right"):
+        raise ValueError("focal_choice must be left or right")
+    for name in (
+        "ac_cutoff",
+        "min_focal_region_size",
+        "ancestor_chunk_size",
+        "inference_threads",
+        "matching_threads",
+        "sample_prefetch_chunks",
+        "max_pending_haplotypes",
+    ):
+        value = config[name]
+        if type(value) is not int or value < 1:
+            raise ValueError(f"{name} must be a positive integer")
+    for name in ("recombination", "mismatch"):
+        if not 0 < config["hmm"][name] < 1:
+            raise ValueError(f"hmm.{name} must be between zero and one")
+    for name in (
+        "blas_threads",
+        "blosc_threads",
+        "zarr_async_concurrency",
+        "zarr_threading_max_workers",
+    ):
+        value = config["helper_threads"][name]
+        if type(value) is not int or value < 1:
+            raise ValueError(f"helper_threads.{name} must be a positive integer")
+    if type(config["path_output"]) is not bool:
+        raise ValueError("path_output must be a boolean")
+    names = [dataset["name"] for dataset in config["datasets"]]
+    if len(names) == 0 or len(set(names)) != len(names):
+        raise ValueError("datasets must have distinct names")
+    for dataset in config["datasets"]:
+        if dataset.get("include") is not None and dataset.get("exclude") is not None:
+            raise ValueError("Choose at most one of include and exclude")

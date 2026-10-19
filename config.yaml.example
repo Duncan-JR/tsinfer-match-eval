@@ -1,10 +1,9 @@
 data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
-ac_cutoff: [10]  # Distinct positive cutoffs; performance passes run in this order.
-min_focal_region_size: [1]  # Inference sites in a merged focal region; 1 keeps all.
-max_mismatches: [0]
-focal_methods: [hmm, greedy]
+ac_cutoff: 10
+min_focal_region_size: 1
+path_output: false
 hmm:
   recombination: 0.01
   mismatch: 1.0e-20
@@ -21,7 +20,6 @@ datasets:
     ts_path: null
     ancestral_state:
       field: variant_ancestral_allele
-    # Native include and exclude are alternatives; null omits either key.
     include: 'POS >= 1000000 & POS < 11000000'
     matching_cache_size: 1024
     sample_list: data/sample_lists/tgp_chr20_n100.csv
@@ -29,31 +27,27 @@ datasets:
 ancestor_chunk_size: 5000
 inference_threads: 1
 matching_threads: 1
-# Keep at least as many haplotypes in a batch as stitched matching workers.
-haplotype_batch_size: 64
+sample_prefetch_chunks: 2
+max_pending_haplotypes: 16
+temp_dir: null
+helper_threads:
+  blosc_threads: 1
+  zarr_async_concurrency: 1
+  zarr_threading_max_workers: 1
+  blas_threads: 1
 
-# Opt-in: uv run snakemake performance --cores 9
-# Complete all repeats per AC/minimum pair, AC first, in configured order.
-# Results: data/performance/{experiment_id}/ac{cutoff}_min{min_size}/.
-# Performance trials are separate from the ordinary rule all.
+# Opt-in: uv run snakemake performance --cores 12
 performance:
-  experiment_id: sample_matching_pilot
+  experiment_id: greedy_pilot
   datasets: [tgp_chr20_n100]
-  modes: [resident_match, from_reference]
-  methods: [full_hmm, reduced_hmm, greedy]
+  modes: [from_reference, resident_match]
+  methods: [full_hmm, greedy]
   worker_counts: [1, 6]
-  repeats: 1  # Per AC/minimum pair; pilot first, then use a new experiment_id and 3.
-  seed: 20261014
-  read_workers: 1
-  rss_sample_interval_s: 0.02
+  repeats: 1
+  seed: 20261016
+  rss_sample_interval_s: 0.05
   trial_timeout_s: 3600
-  collect_stages: true  # false gives total-only trials with workload counters.
-  quality_checks: true  # Separate post-trial scientific checks, never timed.
+  collect_stages: false
+  quality_checks: true
   resident_max_matrix_mib: 512
-  resident_max_rss_mib: 8192
-  helper_threads:
-    blosc_threads: 1
-    zarr_async_concurrency: 1
-    zarr_threading_max_workers: 1
-    blas_threads: 1
-    numba_threads: 1
+  resident_max_private_mib: 8192

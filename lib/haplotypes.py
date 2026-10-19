@@ -1,12 +1,10 @@
-"""Inferred focal candidates, direct intervals, and their coverage masks."""
+"""Packed ancestor references and physical-block, selected-cohort sample loading."""
 
-import concurrent.futures as cf
 import dataclasses
-import itertools
 import logging
 import pathlib
+import time
 
-import numba
 import numpy as np
 import tsinfer
 
@@ -14,596 +12,270 @@ logger = logging.getLogger(__name__)
 
 
 @dataclasses.dataclass
-class SampleHaplotypes:
-    """Panel-aligned canonical calls and identities in sample-major order."""
+class MappedCalls:
+    """A temporary int8 input; empty references use an ordinary empty array."""
 
-    calls: np.ndarray
-    sample_id: np.ndarray
-    ploidy_index: np.ndarray
-    sample_rows: np.ndarray
+    path: pathlib.Path
+    shape: tuple[int, ...]
+
+    def open(self, mode="r"):
+        if np.prod(self.shape) == 0:
+            calls = np.empty(self.shape, dtype=np.int8)
+            calls.flags.writeable = mode != "r"
+            return calls
+        return np.memmap(self.path, dtype=np.int8, mode=mode, shape=self.shape)
 
 
-def _sample_rows(samples, positions):
-    """Map panel positions to sample rows, rejecting absent positions."""
-    sample_positions = samples["variant_position"][:]
-    rows = np.searchsorted(sample_positions, positions)
-    present = rows < len(sample_positions)
-    present[present] = sample_positions[rows[present]] == positions[present]
+def close_mapping(calls):
+    """Close a mapping only after all row views have been released."""
+    if isinstance(calls, np.memmap):
+        calls._mmap.close()
+
+
+@dataclasses.dataclass
+class ReferenceCatalog:
+    """Eligible ancestors in original panel-column order; bounds are site indices."""
+
+    parents: np.ndarray
+    columns: np.ndarray
+    seeds: np.ndarray
+    starts: np.ndarray
+    stops: np.ndarray
+    offsets: np.ndarray
+    packed: MappedCalls
+
+    def make_readonly(self):
+        for field in dataclasses.fields(self):
+            array = getattr(self, field.name)
+            if isinstance(array, np.ndarray):
+                array.flags.writeable = False
+
+
+@dataclasses.dataclass
+class VariantBlock:
+    """Reference-site rows selected from one physical variant block."""
+
+    block: int
+    local_rows: np.ndarray
+    output_rows: np.ndarray
+
+
+@dataclasses.dataclass
+class SampleChunk:
+    """Selected source columns and canonical jobs in one physical sample chunk."""
+
+    block: int
+    columns: np.ndarray
+    job_indices: np.ndarray
+
+
+@dataclasses.dataclass
+class SampleInput:
+    """Small, prepared reader adapter; contains no decoded genotype matrix."""
+
+    path: pathlib.Path
+    blocks: list[VariantBlock]
+    chunks: list[SampleChunk]
+    remap: np.ndarray
+    allele_mapper: tsinfer.vcz.AlleleMapper
+    num_sites: int
+    source_rows: np.ndarray
+
+
+@dataclasses.dataclass
+class SampleSlab:
+    """Published only when complete; rows are contiguous complete haplotypes."""
+
+    chunk: int
+    calls: MappedCalls
+    job_indices: np.ndarray
+    blocks_read: int
+    load_s: float
+
+
+def site_rows(store, positions):
+    """Align a sorted store to the reference once, requiring every reference site."""
+    source_positions = store["variant_position"][:]
+    rows = np.searchsorted(source_positions, positions)
+    present = rows < len(source_positions)
+    present[present] = source_positions[rows[present]] == positions[present]
     if not np.all(present):
-        absent = positions[np.flatnonzero(~present)[0]]
-        raise ValueError(f"Panel position {absent} is absent from the sample store")
+        raise ValueError("Reference sites are absent from a genotype store")
     return rows
 
 
-def _load_sample_haplotypes(samples, panel, sample_selection, site_indices=None):
-    """Polarise allele indices using one numeric lookup per panel site.
-
-    Shared by :func:`find_focal_ancestors` and interval :func:`_prepare`.
-    Check the cross-store position mapping at this loading boundary. Optional
-    ``site_indices`` restrict calls and polarisation to selected panel sites.
-    """
-    positions = panel["variant_position"][:]
-    if site_indices is not None:
-        positions = positions[site_indices]
-    rows = _sample_rows(samples, positions)
-    columns = tsinfer.vcz.resolve_samples_selection(samples, sample_selection)
-    genotypes = samples["call_genotype"].oindex[rows, columns, :]
-    alleles = samples["variant_allele"].oindex[rows, :]
-    if site_indices is None:
-        ancestral = panel["variant_allele"][:, 0]
-    else:
-        ancestral = panel["variant_allele"].oindex[site_indices, 0]
-    allele_codes = (alleles != ancestral[:, None]).astype(np.int8)
-    missing = genotypes < 0
-    genotypes[missing] = 0
-    calls = np.take_along_axis(allele_codes[:, None, :], genotypes, axis=2)
-    calls[missing] = -1
+def prepare_samples(source, reference, jobs):
+    """Resolve columns, identities and native canonical allele maps once."""
+    store = tsinfer.vcz.open_store(source.path)
+    positions = reference.sites_position.astype(np.int32)
+    rows = site_rows(store, positions)
+    columns = tsinfer.vcz.resolve_samples_selection(store, source.samples)
+    ids = np.asarray(store["sample_id"][:].tolist(), dtype=str)
+    genotypes = store["call_genotype"]
     ploidy = genotypes.shape[2]
-    num_haplotypes = genotypes.shape[1] * ploidy
-    calls = calls.reshape(len(positions), num_haplotypes)
-    ids = np.asarray(samples["sample_id"].oindex[columns].tolist(), dtype=str)
-    sample_id = np.repeat(ids, ploidy)
-    ploidy_index = np.tile(np.arange(ploidy, dtype=np.int64), len(ids))
-    return SampleHaplotypes(calls, sample_id, ploidy_index, rows)
+    expected = [(ids[col], p) for col in columns for p in range(ploidy)]
+    actual = [(job.sample_id, job.ploidy_index) for job in jobs]
+    if actual != expected or len(set(ids)) != len(ids):
+        raise ValueError("Sample identities/order disagree with native jobs")
+    ancestral = np.asarray([site.ancestral_state for site in reference.sites()])
+    alleles = store["variant_allele"].oindex[rows, :]
+    mapper = tsinfer.vcz.build_allele_mapper(
+        positions, ancestral, [(positions, alleles)]
+    )
+    if np.any(mapper.num_alleles_array() != 2):
+        raise ValueError("Matching requires biallelic reference sites")
+    remap = np.full(alleles.shape, -1, dtype=np.int8)
+    site_indices = np.arange(len(positions))
+    for code in range(alleles.shape[1]):
+        remap[:, code] = mapper.batch_lookup(site_indices, alleles[:, code])
+    blocks = []
+    variant_blocks = rows // genotypes.chunks[0]
+    for block in np.unique(variant_blocks):
+        output_rows = np.flatnonzero(variant_blocks == block)
+        local_rows = rows[output_rows] - block * genotypes.chunks[0]
+        blocks.append(VariantBlock(int(block), local_rows, output_rows))
+    chunks = []
+    sample_blocks = columns // genotypes.chunks[1]
+    for block in np.unique(sample_blocks):
+        selected = np.flatnonzero(sample_blocks == block)
+        local_columns = columns[selected] - block * genotypes.chunks[1]
+        job_indices = selected[:, None] * ploidy + np.arange(ploidy)
+        chunks.append(SampleChunk(int(block), local_columns, job_indices.ravel()))
+    return SampleInput(source.path, blocks, chunks, remap, mapper, len(rows), rows)
 
 
-def _select_focal_sites(panel, focal_choice):
-    """Select one endpoint seed per ancestor for :func:`find_focal_ancestors`."""
-    positions = panel["variant_position"][:]
-    focal_positions = panel["sample_focal_positions"][:]
-    sites = np.full(len(focal_positions), -1, dtype=np.int64)
-    for ancestor, values in enumerate(focal_positions):
-        values = values[values >= 0]
-        if len(values) == 0:
-            continue
-        position = np.min(values) if focal_choice == "left" else np.max(values)
-        sites[ancestor] = np.searchsorted(positions, position)
-    return sites
+def load_sample_chunk(inputs, chunk, directory):
+    """Read each required physical tile once, selecting before numeric remapping."""
+    started = time.perf_counter()
+    store = tsinfer.vcz.open_store(inputs.path)
+    genotypes = store["call_genotype"]
+    descriptor = MappedCalls(
+        directory / f"samples_{chunk.block}.bin",
+        (len(chunk.job_indices), inputs.num_sites),
+    )
+    slab = descriptor.open("w+")
+    blocks_read = 0
+    try:
+        for block in inputs.blocks:
+            # Slice all ploidy blocks together, keeping both chromosome copies.
+            tile = genotypes.blocks[block.block, chunk.block, :]
+            raw = tile[block.local_rows[:, None], chunk.columns[None, :], :]
+            del tile
+            remap = inputs.remap[block.output_rows]
+            safe = np.maximum(raw, 0)
+            encoded = remap[np.arange(len(remap))[:, None, None], safe]
+            encoded[raw < 0] = -1
+            selected = encoded.reshape(len(remap), -1)
+            slab[:, block.output_rows] = selected.T
+            blocks_read += genotypes.cdata_shape[2]
+        slab.flush()
+    finally:
+        close_mapping(slab)
+    elapsed = time.perf_counter() - started
+    return SampleSlab(chunk.block, descriptor, chunk.job_indices, blocks_read, elapsed)
 
 
-def find_focal_ancestors(
-    samples_path: pathlib.Path,
-    ancestors_path: pathlib.Path,
-    output_path: pathlib.Path,
-    focal_choice: str = "left",
-    sample_selection: str | None = None,
-    max_ac_cutoff: int | None = None,
-) -> None:
-    """Write inferred candidates defined by a derived call at one endpoint seed.
+def prepare_reference(panel_path, sample_input, reference, cutoff, choice, directory):
+    """Validate alignment and clip eligible seeded supports before any extension.
 
-    Choose the smallest focal position for ``left`` and largest for ``right``.
-    Other focal calls do not affect membership. Filter anchored ancestors using
-    annotated derived AC before loading seed calls or expanding associations.
-    ``None`` retains all candidates; the archive records this as maximum -1.
-    Save sorted panel-column order for each haplotype, including empty rows.
-    :func:`make_ancestor_intervals` reuses these saved seeds.
-    Direct callers supply a valid choice; the Snakefile validates configuration.
+    Genotypes are packed by :func:`pack_reference_chunk` in the persistent pool.
+    A shared seed does not collapse distinct panel ancestors.
     """
-    samples = tsinfer.vcz.open_store(samples_path)
-    panel = tsinfer.vcz.open_store(ancestors_path)
-    focal_sites = _select_focal_sites(panel, focal_choice)
-    ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
-    anchored = np.flatnonzero(focal_sites >= 0)
-    positions = panel["variant_position"][:]
-    seed_rows = _sample_rows(samples, positions[focal_sites[anchored]])
-    derived_ac = np.zeros(len(ancestor_ids), dtype=np.int64)
-    derived_ac[anchored] = samples["variant_match_eval_derived_ac"].oindex[seed_rows]
-    if max_ac_cutoff is not None:
-        anchored = anchored[derived_ac[anchored] <= max_ac_cutoff]
-    seed_sites, seed_indices = np.unique(focal_sites[anchored], return_inverse=True)
-    haplotypes = _load_sample_haplotypes(
-        samples, panel, sample_selection, site_indices=seed_sites
+    panel = tsinfer.vcz.open_store(panel_path)
+    samples = tsinfer.vcz.open_store(sample_input.path)
+    positions = reference.sites_position.astype(np.int32)
+    if not np.array_equal(panel["variant_position"][:], positions):
+        raise ValueError("Ancestor panel and reference site axes disagree")
+    ancestral = np.asarray([site.ancestral_state for site in reference.sites()])
+    if not np.array_equal(panel["variant_allele"][:, 0], ancestral):
+        raise ValueError("Ancestor panel and reference polarisation disagree")
+    intervals = np.asarray(reference.metadata["sequence_intervals"])
+    if not np.array_equal(panel["sequence_intervals"][:], intervals):
+        raise ValueError("Ancestor panel and reference inference intervals disagree")
+    nodes = {}
+    for node in reference.nodes():
+        if node.metadata.get("source") == "ancestors":
+            nodes[node.metadata["sample_id"]] = node.id
+    ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
+    if len(set(ids)) != len(ids) or not set(ids) <= nodes.keys():
+        raise ValueError("Ancestor panel identities disagree with reference nodes")
+    seeds = np.full(len(ids), -1, dtype=np.int64)
+    for column, focal_positions in enumerate(panel["sample_focal_positions"][:]):
+        focal_positions = focal_positions[focal_positions >= 0]
+        if len(focal_positions) > 0:
+            focal = min(focal_positions) if choice == "left" else max(focal_positions)
+            seed = np.searchsorted(positions, focal)
+            if seed == len(positions) or positions[seed] != focal:
+                raise ValueError("An ancestor seed is absent from the reference")
+            seeds[column] = seed
+    columns = np.flatnonzero(seeds >= 0)
+    sample_rows = sample_input.source_rows
+    counts = samples["variant_match_eval_derived_ac"].oindex[sample_rows[seeds[columns]]]
+    columns = columns[counts <= cutoff]
+    seeds = seeds[columns]
+    containing = np.searchsorted(intervals[:, 0], positions[seeds], side="right") - 1
+    supports = intervals[containing]
+    start_positions = np.maximum(
+        panel["sample_start_position"][:][columns], supports[:, 0]
     )
-    offsets = [0]
-    candidate_rows = []
-    for haplotype in range(len(haplotypes.sample_id)):
-        seed_calls = haplotypes.calls[seed_indices, haplotype]
-        candidates = anchored[seed_calls == 1]
-        candidate_rows.append(candidates)
-        offsets.append(offsets[-1] + len(candidates))
-    ancestor_index = np.empty(0, dtype=np.int64)
-    if len(candidate_rows) > 0:
-        ancestor_index = np.concatenate(candidate_rows)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        sample_id=haplotypes.sample_id,
-        ploidy_index=haplotypes.ploidy_index,
-        ancestor_id=ancestor_ids,
-        offsets=np.asarray(offsets, dtype=np.int64),
-        ancestor_index=ancestor_index,
-        derived_ac=derived_ac,
-        focal_site_index=focal_sites,
-        focal_choice=np.asarray(focal_choice),
-        max_ac_cutoff=np.int64(-1 if max_ac_cutoff is None else max_ac_cutoff),
+    stop_positions = np.minimum(panel["sample_end_position"][:][columns], supports[:, 1])
+    starts = np.searchsorted(positions, start_positions)
+    stops = np.searchsorted(positions, stop_positions)
+    if np.any(containing < 0) or np.any((seeds < starts) | (seeds >= stops)):
+        raise ValueError("An ancestor seed is outside its clipped support")
+    lengths = stops - starts
+    offsets = np.zeros(len(columns), dtype=np.int64)
+    offsets[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
+    descriptor = MappedCalls(directory / "ancestors.bin", (int(lengths.sum()),))
+    packed = descriptor.open("w+")
+    close_mapping(packed)
+    parents = np.asarray([nodes[ids[col]] for col in columns], dtype=np.int32)
+    catalog = ReferenceCatalog(
+        parents, columns, seeds, starts, stops, offsets, descriptor
     )
-    logger.info(
-        "Wrote focal candidates for %d haplotypes (%d seeds, %d associations) to %s",
-        len(haplotypes.sample_id),
-        len(seed_sites),
-        len(ancestor_index),
-        output_path,
-    )
+    catalog.make_readonly()
+    return catalog
 
 
-def check_ac_cutoff(archive, ac_cutoff):
-    """Reject requests beyond a candidate or interval archive's supported AC."""
-    maximum = int(archive["max_ac_cutoff"])
-    if maximum != -1 and ac_cutoff > maximum:
-        raise ValueError(f"AC cutoff {ac_cutoff} exceeds archive maximum {maximum}")
+def reference_chunks(panel_path, catalog):
+    """One packing job per required physical ancestor-column chunk."""
+    panel = tsinfer.vcz.open_store(panel_path)
+    width = panel["call_genotype"].chunks[1]
+    return np.unique(catalog.columns // width).tolist()
 
 
-@dataclasses.dataclass
-class ComparisonData:
-    """Panel axis, resident sample calls, and canonical association order."""
-
-    panel: object
-    num_sites: int
-    num_ancestors: int
-    calls: np.ndarray
-    sample_ids: np.ndarray
-    ploidy_indices: np.ndarray
-    ancestor_ids: np.ndarray
-    offsets: np.ndarray
-    focal_ac: np.ndarray
-    haplotypes: np.ndarray
-    ancestors: np.ndarray
-    focals: np.ndarray
-    left: np.ndarray
-    right: np.ndarray
-    column_width: int
-    site_height: int
-    block_seeds: dict
-
-
-@dataclasses.dataclass
-class IntervalBounds:
-    """Canonical bounds for every association and generated budget."""
-
-    left: np.ndarray
-    right: np.ndarray
-
-
-@dataclasses.dataclass
-class BlockBounds:
-    """Numeric block results indexed by the canonical global seed number."""
-
-    seeds: np.ndarray
-    left: np.ndarray
-    right: np.ndarray
-
-
-def _prepare(
-    samples_path,
-    ancestors_path,
-    focal_path,
-    max_ac_cutoff,
-    sample_selection,
-):
-    """Load and filter saved seed associations for interval comparison."""
-    samples = tsinfer.vcz.open_store(samples_path)
-    panel = tsinfer.vcz.open_store(ancestors_path)
-    loaded = _load_sample_haplotypes(samples, panel, sample_selection)
-    positions = panel["variant_position"][:]
-    ancestor_ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
-    starts = panel["sample_start_position"][:]
-    ends = panel["sample_end_position"][:]
-    intervals = panel["sequence_intervals"][:]
-    with np.load(focal_path, allow_pickle=False) as candidates:
-        check_ac_cutoff(candidates, max_ac_cutoff)
-        for name, expected in (
-            ("sample_id", loaded.sample_id),
-            ("ploidy_index", loaded.ploidy_index),
-            ("ancestor_id", ancestor_ids),
-        ):
-            if not np.array_equal(candidates[name], expected):
-                raise ValueError(f"Focal NPZ {name} disagrees with store identity/order")
-        offsets = candidates["offsets"]
-        columns = candidates["ancestor_index"]
-        derived_ac = candidates["derived_ac"]
-        ancestor_focals = candidates["focal_site_index"]
-        haplotype_rows = []
-        ancestor_rows = []
-        output_offsets = [0]
-        for haplotype in range(len(loaded.sample_id)):
-            selected = columns[offsets[haplotype] : offsets[haplotype + 1]]
-            selected = selected[derived_ac[selected] <= max_ac_cutoff]
-            haplotype_rows.append(np.full(len(selected), haplotype, dtype=np.int64))
-            ancestor_rows.append(selected)
-            output_offsets.append(output_offsets[-1] + len(selected))
-        haplotypes = np.empty(0, dtype=np.int64)
-        ancestors = np.empty(0, dtype=np.int64)
-        if len(ancestor_rows) > 0:
-            haplotypes = np.concatenate(haplotype_rows)
-            ancestors = np.concatenate(ancestor_rows)
-        focals = ancestor_focals[ancestors]
-        focal_ac = derived_ac[ancestors]
-    # Each seed is confined to the inference interval containing its focal site.
-    interval_indices = np.searchsorted(intervals[:, 0], positions[focals], side="right")
-    interval_indices -= 1
-    containing = intervals[interval_indices]
-    bp_left = np.maximum(starts[ancestors], containing[:, 0]).astype(np.int64)
-    bp_right = np.minimum(ends[ancestors], containing[:, 1]).astype(np.int64)
-    left = np.searchsorted(positions, bp_left)
-    right = np.searchsorted(positions, bp_right)
-    column_width = panel["call_genotype"].chunks[1]
-    site_height = panel["call_genotype"].chunks[0]
-    block_ids = ancestors // column_width
-    order = np.argsort(block_ids, kind="stable")
-    sorted_blocks = block_ids[order]
-    unique_blocks, first = np.unique(sorted_blocks, return_index=True)
-    block_seeds = {}
-    if len(focals) > 0:
-        groups = np.split(order, first[1:])
-        block_seeds = dict(zip(unique_blocks.tolist(), groups, strict=True))
-    return ComparisonData(
-        panel=panel,
-        num_sites=len(positions),
-        num_ancestors=len(ancestor_ids),
-        calls=loaded.calls,
-        sample_ids=loaded.sample_id,
-        ploidy_indices=loaded.ploidy_index,
-        ancestor_ids=ancestor_ids,
-        offsets=np.asarray(output_offsets, dtype=np.int64),
-        focal_ac=focal_ac,
-        haplotypes=haplotypes,
-        ancestors=ancestors,
-        focals=focals,
-        left=left.astype(np.int64),
-        right=right.astype(np.int64),
-        column_width=column_width,
-        site_height=site_height,
-        block_seeds=block_seeds,
-    )
-
-
-@numba.njit(nogil=True)
-def _sweep_block(
-    genotypes,
-    site_start,
-    samples,
-    haplotypes,
-    columns,
-    focals,
-    support,
-    events,
-    active,
-    counters,
-    progress,
-    bounds,
-    direction,
-):
-    """Advance a directional event sweep through one physical site block.
-
-    Used by :func:`make_ancestor_intervals`. Bounds are half-open;
-    budgets apply independently to each side. With support [0, 10), focal 4,
-    left mismatches 3, 1 and right mismatches 6, 8, budgets 0, 1, 2 retain
-    [4, 6), [2, 8), [0, 10). The (k + 1)th mismatch is excluded.
-    ``progress`` holds event cursor and active length across physical blocks.
-    """
-    cursor = progress[0]
-    active_length = progress[1]
-    height = genotypes.shape[0]
-    site_stop = site_start + height
-    site = site_start if direction == 1 else site_stop - 1
-    num_budgets = bounds.shape[1]
-    while site_start <= site < site_stop:
-        if active_length == 0:
-            if cursor == len(events):
-                break
-            next_site = focals[events[cursor]]
-            if next_site < site_start or next_site >= site_stop:
-                break
-            site = next_site
-        while cursor < len(events) and focals[events[cursor]] == site:
-            seed = events[cursor]
-            active[active_length] = seed
-            active_length += 1
-            cursor += 1
-        slot = 0
-        while slot < active_length:
-            seed = active[slot]
-            count = counters[seed]
-            outside = site >= support[seed] if direction == 1 else site < support[seed]
-            remove = outside
-            if not outside:
-                sample_call = samples[site, haplotypes[seed]]
-                ancestor_call = genotypes[site - site_start, columns[seed]]
-                boundary = site if direction == 1 else site + 1
-                if sample_call == -1 or ancestor_call == -1:
-                    for budget in range(count, num_budgets):
-                        bounds[seed, budget] = boundary
-                    remove = True
-                elif sample_call != ancestor_call:
-                    bounds[seed, count] = boundary
-                    counters[seed] += 1
-                    remove = counters[seed] == num_budgets
-            if remove:
-                active_length -= 1
-                active[slot] = active[active_length]
-            else:
-                slot += 1
-        site += direction
-    progress[0] = cursor
-    progress[1] = active_length
-
-
-def _block_bounds(data, block, max_mismatches):
-    """Read physical ancestor columns once and reuse across all sample seeds.
-
-    Multi-height stores stream forward and backward, preserving the numeric
-    sweep state. A full-height block is retained for both directions.
-    """
-    seeds = data.block_seeds[block]
-    column_start = block * data.column_width
-    column_end = min(column_start + data.column_width, data.num_ancestors)
-    columns = data.ancestors[seeds] - column_start
-    haplotypes = data.haplotypes[seeds]
-    focals = data.focals[seeds]
-    order = np.argsort(focals, kind="stable")
-    left = np.repeat(data.left[seeds, None], max_mismatches + 1, axis=1)
-    right = np.repeat(data.right[seeds, None], max_mismatches + 1, axis=1)
-    genotypes = data.panel["call_genotype"]
-    num_sites = data.num_sites
-    resident = None
-    if data.site_height >= num_sites:
-        resident = genotypes[:, column_start:column_end, 0]
-    for direction, bounds, support in (
-        (1, right, data.right[seeds]),
-        (-1, left, data.left[seeds]),
-    ):
-        events = order if direction == 1 else order[::-1].copy()
-        active = np.empty(len(seeds), dtype=np.int64)
-        counters = np.zeros(len(seeds), dtype=np.int64)
-        progress = np.zeros(2, dtype=np.int64)
-        site_starts = range(0, num_sites, data.site_height)
-        if direction == -1:
-            site_starts = reversed(site_starts)
-        for site_start in site_starts:
-            site_end = min(site_start + data.site_height, num_sites)
-            if progress[1] == 0:
-                if progress[0] == len(events):
-                    break
-                next_site = focals[events[progress[0]]]
-                if not site_start <= next_site < site_end:
-                    continue
-            calls = resident
-            if calls is None:
-                calls = genotypes[site_start:site_end, column_start:column_end, 0]
-            _sweep_block(
-                calls,
-                site_start,
-                data.calls,
-                haplotypes,
-                columns,
-                focals,
-                support,
-                events,
-                active,
-                counters,
-                progress,
-                bounds,
-                direction,
-            )
-    return BlockBounds(seeds, left, right)
-
-
-def _collect_bounds(data, max_mismatches, threads):
-    """Run independent block sweeps with shared read-only calls and associations.
-
-    The Numba sweep releases the GIL. Each block owns its state and outputs;
-    assemble results in canonical association order and propagate failures.
-    """
-    if isinstance(threads, bool) or not isinstance(threads, int) or threads < 1:
-        raise ValueError("threads must be an integer >= 1")
-    shape = (len(data.focals), max_mismatches + 1)
-    left = np.empty(shape, dtype=np.int64)
-    right = np.empty(shape, dtype=np.int64)
-    workers = min(threads, len(data.block_seeds))
-    if workers <= 1:
-        for block in data.block_seeds:
-            result = _block_bounds(data, block, max_mismatches)
-            left[result.seeds] = result.left
-            right[result.seeds] = result.right
-    else:
-        with cf.ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {
-                executor.submit(_block_bounds, data, block, max_mismatches): block
-                for block in data.block_seeds
-            }
-            for future in cf.as_completed(futures):
-                result = future.result()
-                left[result.seeds] = result.left
-                right[result.seeds] = result.right
-                del futures[future]
-    return IntervalBounds(left, right)
-
-
-def make_ancestor_intervals(
-    samples_path: pathlib.Path,
-    ancestors_path: pathlib.Path,
-    focal_ancestors_path: pathlib.Path,
-    output_path: pathlib.Path,
-    max_ac_cutoff: int,
-    max_mismatches: int,
-    threads: int,
-    focal_choice: str = "left",
-    sample_selection: str | None = None,
-) -> None:
-    """Write compressed raw intervals anchored at the saved selected focal seed.
-
-    One association per eligible ancestor is retained in focal-NPZ haplotype
-    order, then increasing ancestor column. Exact AC uses an inclusive maximum.
-    ``ancestor_id`` stores panel IDs once; ``ancestor_index`` maps each
-    association to that dictionary, independently of the candidate archive.
-    Budget column k tolerates k called mismatches on each side; the matching
-    derived focal consumes neither budget. Missing calls terminate extension.
-    Bounds are half-open on the inferred panel axis and confined to ancestor
-    support and the containing inference interval. See :func:`_sweep_block` for
-    a worked example. No HMM or coverage statistics enter this comparison.
-    Seeds come from :func:`find_focal_ancestors`; ``focal_choice`` records
-    provenance only. Direct callers supply valid AC, budget, and choice values.
-    """
-    data = _prepare(
-        samples_path,
-        ancestors_path,
-        focal_ancestors_path,
-        max_ac_cutoff,
-        sample_selection,
-    )
-    workers = min(threads, len(data.block_seeds))
-    logger.info("Comparing %d associations with %d workers", len(data.focals), workers)
-    bounds = _collect_bounds(data, max_mismatches, threads)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        sample_id=data.sample_ids,
-        ploidy_index=data.ploidy_indices,
-        offsets=data.offsets,
-        ancestor_id=data.ancestor_ids,
-        ancestor_index=data.ancestors,
-        focal_ac=data.focal_ac,
-        left_site_index=bounds.left,
-        right_site_index=bounds.right,
-        num_sites=np.int64(data.num_sites),
-        max_ac_cutoff=np.int64(max_ac_cutoff),
-        max_mismatches=np.int64(max_mismatches),
-        focal_choice=np.asarray(focal_choice),
-    )
-    logger.info("Wrote %d associations to %s", len(data.focals), output_path)
-
-
-def make_focal_mask(
-    intervals_path: pathlib.Path,
-    output_path: pathlib.Path,
-    ac_cutoff: int,
-    max_mismatches: int,
-    min_focal_region_size: int,
-) -> None:
-    """Write one coverage mask; see :func:`make_focal_masks` for batch generation."""
-    make_focal_masks(
-        intervals_path,
-        [output_path],
-        [ac_cutoff],
-        [max_mismatches],
-        [min_focal_region_size],
-    )
-
-
-def make_focal_masks(
-    intervals_path: pathlib.Path,
-    output_paths: list[pathlib.Path],
-    ac_cutoffs: list[int],
-    max_mismatches: list[int],
-    min_focal_region_sizes: list[int],
-) -> None:
-    """Load intervals once and write every cutoff/budget/minimum-size mask.
-
-    ``output_paths`` follows cutoff, then budget, then minimum-size order,
-    matching the Snakefile's expansion. Each output keeps
-    :func:`make_focal_mask`'s format; :func:`_write_focal_mask` defines filtering.
-    """
-    with np.load(intervals_path, allow_pickle=False) as archive:
-        intervals = {name: archive[name] for name in archive.files}
-    selections = itertools.product(ac_cutoffs, max_mismatches, min_focal_region_sizes)
-    for output_path, (cutoff, budget, minimum) in zip(
-        output_paths, selections, strict=True
-    ):
-        _write_focal_mask(intervals, output_path, cutoff, budget, minimum)
-
-
-def _write_focal_mask(
-    intervals, output_path, ac_cutoff, max_mismatches, min_focal_region_size
-):
-    """Partition the inference-site axis into focal-covered and all-gap runs.
-
-    Union eligible associations from :func:`make_ancestor_intervals`, merging
-    touching bounds, then retain unions spanning at least
-    ``min_focal_region_size`` inference sites. Removed unions become gaps.
-    Keep the complete haplotype roster, including empty slices.
-    The Snakefile supplies an AC cutoff and budget within the generated maxima.
-    """
-    check_ac_cutoff(intervals, ac_cutoff)
-    sample_id = intervals["sample_id"]
-    ploidy_index = intervals["ploidy_index"]
-    association_offsets = intervals["offsets"]
-    focal_ac = intervals["focal_ac"]
-    left = intervals["left_site_index"][:, max_mismatches]
-    right = intervals["right_site_index"][:, max_mismatches]
-    num_sites = int(intervals["num_sites"])
-    focal_choice = intervals["focal_choice"]
-
-    offsets = [0]
-    run_left = []
-    run_right = []
-    is_gap = []
-    for haplotype in range(len(sample_id)):
-        start = association_offsets[haplotype]
-        end = association_offsets[haplotype + 1]
-        eligible = np.flatnonzero(focal_ac[start:end] <= ac_cutoff) + start
-        order = np.argsort(left[eligible], kind="stable")
-        covered = []
-        for association in eligible[order]:
-            interval_left = int(left[association])
-            interval_right = int(right[association])
-            if len(covered) > 0 and interval_left <= covered[-1][1]:
-                covered[-1][1] = max(covered[-1][1], interval_right)
-            else:
-                covered.append([interval_left, interval_right])
-        covered = [
-            (interval_left, interval_right)
-            for interval_left, interval_right in covered
-            if interval_right - interval_left >= min_focal_region_size
-        ]
-        cursor = 0
-        for interval_left, interval_right in covered:
-            if cursor < interval_left:
-                run_left.append(cursor)
-                run_right.append(interval_left)
-                is_gap.append(True)
-            run_left.append(interval_left)
-            run_right.append(interval_right)
-            is_gap.append(False)
-            cursor = interval_right
-        if cursor < num_sites or len(covered) == 0:
-            run_left.append(cursor)
-            run_right.append(num_sites)
-            is_gap.append(True)
-        offsets.append(len(run_left))
-
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    np.savez_compressed(
-        output_path,
-        sample_id=sample_id,
-        ploidy_index=ploidy_index,
-        offsets=np.asarray(offsets, dtype=np.int64),
-        left_site_index=np.asarray(run_left, dtype=np.int64),
-        right_site_index=np.asarray(run_right, dtype=np.int64),
-        is_gap=np.asarray(is_gap, dtype=bool),
-        num_sites=np.int64(num_sites),
-        ac_cutoff=np.int64(ac_cutoff),
-        max_mismatches=np.int64(max_mismatches),
-        min_focal_region_size=np.int64(min_focal_region_size),
-        focal_choice=focal_choice,
-    )
-    logger.info("Wrote focal mask for %d haplotypes to %s", len(sample_id), output_path)
+def pack_reference_chunk(panel_path, catalog, chunk):
+    """Copy disjoint ancestor spans, decoding each intersecting block once."""
+    panel = tsinfer.vcz.open_store(panel_path)
+    genotypes = panel["call_genotype"]
+    height, width, _ = genotypes.chunks
+    ancestors = np.flatnonzero(catalog.columns // width == chunk)
+    required = set()
+    for ancestor in ancestors:
+        first = catalog.starts[ancestor] // height
+        last = (catalog.stops[ancestor] - 1) // height
+        required.update(range(first, last + 1))
+    packed = catalog.packed.open("r+")
+    try:
+        for block in sorted(required):
+            tile = genotypes.blocks[block, chunk, 0]
+            block_start = block * height
+            for ancestor in ancestors:
+                start = max(catalog.starts[ancestor], block_start)
+                stop = min(catalog.stops[ancestor], block_start + tile.shape[0])
+                if start < stop:
+                    column = catalog.columns[ancestor] - chunk * width
+                    offset = catalog.offsets[ancestor] + start - catalog.starts[ancestor]
+                    packed[offset : offset + stop - start] = tile[
+                        start - block_start : stop - block_start, column, 0
+                    ]
+            del tile
+        for ancestor in ancestors:
+            offset = catalog.offsets[ancestor]
+            seed_offset = catalog.seeds[ancestor] - catalog.starts[ancestor]
+            if packed[offset + seed_offset] != 1:
+                raise ValueError("An eligible ancestor seed is not called and derived")
+        packed.flush()
+    finally:
+        close_mapping(packed)
+    return len(required)
