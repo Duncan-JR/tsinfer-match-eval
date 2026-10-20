@@ -36,14 +36,20 @@ def annotate_derived_counts(
 
     Retain both original axes. Read selected columns in physical variant chunks;
     missing calls do not enter either allele count or frequency denominator.
-    Under the biallelic input contract, non-reference ancestry makes REF derived.
+    Mask sites unless they are biallelic with a known, present ancestral allele.
+    The boolean inference-site mask is False for eligible sites.
+    Unknown or absent ancestral alleles cannot be polarised and get zero
+    counts/frequencies. Other sites retain counts of all non-ancestral calls,
+    although multiallelic sites are excluded from the inference axis.
     """
     shutil.copytree(source, output)
     store = zarr.open_group(output, mode="a", use_consolidated=False)
+    normalise_contig(store)
     columns = tsinfer.vcz.resolve_samples_selection(store, samples)
     genotypes = store["call_genotype"]
     allele_count = np.zeros(genotypes.shape[0], dtype=np.int64)
     frequency = np.zeros(genotypes.shape[0], dtype=float)
+    inference_site_mask = np.zeros(genotypes.shape[0], dtype=bool)
     for start in range(0, genotypes.shape[0], genotypes.chunks[0]):
         end = min(start + genotypes.chunks[0], genotypes.shape[0])
         calls = genotypes.oindex[start:end, columns, :]
@@ -51,8 +57,14 @@ def annotate_derived_counts(
         ancestral = alleles[:, 0]
         if not ancestral_state.get("is_reference", False):
             ancestral = store[ancestral_state["field"]][start:end]
-        reference_ancestral = ancestral == alleles[:, 0]
-        derived = np.where(reference_ancestral[:, None, None], calls == 1, calls == 0)
+        known_ancestral = (ancestral != "") & (ancestral != ".")
+        ancestral_matches = (alleles == ancestral[:, None]) & (alleles != "")
+        polarised = known_ancestral & ancestral_matches.any(axis=1)
+        ancestral_index = np.argmax(ancestral_matches, axis=1)
+        biallelic = np.sum(alleles != "", axis=1) == 2
+        inference_site_mask[start:end] = ~(polarised & biallelic)
+        derived = (calls >= 0) & (calls != ancestral_index[:, None, None])
+        derived &= polarised[:, None, None]
         counts = derived.sum(axis=(1, 2))
         called = (calls >= 0).sum(axis=(1, 2))
         allele_count[start:end] = counts
@@ -61,6 +73,7 @@ def annotate_derived_counts(
     for name, values in (
         ("variant_match_eval_derived_ac", allele_count),
         ("variant_match_eval_derived_af", frequency),
+        ("variant_match_eval_inference_site_mask", inference_site_mask),
     ):
         array = store.create_array(name, data=values, chunks=chunks, overwrite=True)
         array.attrs["_ARRAY_DIMENSIONS"] = ["variants"]
@@ -68,6 +81,27 @@ def annotate_derived_counts(
     logger.info(
         "Annotated %d variants for %d individuals", len(allele_count), len(columns)
     )
+
+
+def normalise_contig(store: zarr.Group) -> None:
+    """Keep the variants' one contig as index zero in the private sample copy.
+
+    VCZ headers may declare every chromosome even in a chromosome-only store.
+    Upstream tsinfer reads contig_id[0] and contig_length[0], so retain the
+    actual chromosome's metadata and remap variant_contig consistently.
+    """
+    contigs = np.unique(store["variant_contig"][:])
+    if len(contigs) != 1:
+        raise ValueError("VCZ variants must belong to exactly one contig")
+    index = int(contigs[0])
+    contig_id = store["contig_id"][index]
+    contig_length = store["contig_length"][index]
+    store["contig_id"].resize((1,))
+    store["contig_length"].resize((1,))
+    store["contig_id"][0] = contig_id
+    store["contig_length"][0] = contig_length
+    store["variant_contig"][:] = 0
+    logger.info("Retained contig %s (length %d)", contig_id, contig_length)
 
 
 def make_inference_config(
@@ -82,16 +116,24 @@ def make_inference_config(
 ) -> None:
     """Write native inference/matching TOML for the selected ancestor panel.
 
-    Exclude selected-cohort singletons using the annotated derived counts.
+    Require annotated biallelic sites with a known, present ancestral allele;
+    exclude selected-cohort singletons using the annotated derived counts.
     Both sources stay in match.sources so ancestor matching obtains the full
     sample contig length. A true-panel configuration is for matching only.
     """
+    required = (
+        "(INFO/match_eval_inference_site_mask == 0) & (INFO/match_eval_derived_ac != 1)"
+    )
     if include is not None:
-        include = f"({include}) & (INFO/match_eval_derived_ac != 1)"
+        include = f"({include}) & ({required})"
     elif exclude is not None:
-        exclude = f"({exclude}) | (INFO/match_eval_derived_ac == 1)"
+        invalid = (
+            "(INFO/match_eval_inference_site_mask != 0) | "
+            "(INFO/match_eval_derived_ac == 1)"
+        )
+        exclude = f"({exclude}) | ({invalid})"
     else:
-        exclude = "INFO/match_eval_derived_ac == 1"
+        include = required
 
     source = {
         "name": "samples",

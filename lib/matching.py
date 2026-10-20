@@ -16,7 +16,7 @@ import numpy as np
 import tsinfer
 import tskit
 
-from . import greedy, haplotypes, performance, utils
+from . import greedy, haplotypes, native_matching, performance, utils
 
 logger = logging.getLogger(__name__)
 
@@ -87,13 +87,12 @@ def match_samples(
     per haplotype, keyed by (source, sample_id, ploidy_index); parent IDs are raw
     TS node IDs, joined to panel IDs through node metadata.
     """
-    sample_cfg = _sample_config(config_path, ancestors_ts_path, output_path)
-    ts = tsinfer.pipeline.match(
-        sample_cfg,
-        num_threads=threads,
-        match_file=match_file_path,
-        cache_size=cache_size,
-        read_workers=read_workers,
+    cfg = tsinfer.config.Config.from_toml(config_path)
+    jobs, _, _ = tsinfer.pipeline._build_jobs_with_metadata(cfg)
+    sample_jobs = [job for job in jobs if job.source == "samples"]
+    reference = tskit.load(ancestors_ts_path)
+    ts = native_matching.match_reference(
+        cfg, reference, sample_jobs, threads, cache_size, read_workers, match_file_path
     )
     ts.dump(output_path)
     logger.info(

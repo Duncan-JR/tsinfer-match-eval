@@ -1,5 +1,6 @@
 """Save a native linesweep group's complete matching inputs and outputs."""
 
+import argparse
 import collections
 import dataclasses
 import json
@@ -11,6 +12,9 @@ import subprocess
 import numpy as np
 import tomli_w
 import tsinfer
+import tskit
+
+from . import native_matching
 
 logger = logging.getLogger(__name__)
 
@@ -51,10 +55,10 @@ def write_group_panel(panel, jobs, output):
 
 
 def write_inputs(cfg, config_path, panel, jobs, checkpoint_dir, frequency):
-    """Write IDs, haplotypes and a native TOML that replays exactly this group.
+    """Write IDs, haplotypes and a native TOML describing this group's match.
 
     The replay config uses paths relative to the checkpoint directory, so the
-    bundle can be moved and replayed by running tsinfer from that directory.
+    bundle can be moved and replayed with :func:`replay`.
     """
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     write_group_panel(panel, jobs, checkpoint_dir / "group.zarr")
@@ -191,3 +195,50 @@ def match_ancestors(
         logger.info("Wrote complete raw ancestor reference to %s", output_path)
     finally:
         reader.shutdown()
+
+
+def replay(
+    checkpoint_dir: pathlib.Path,
+    threads: int | None = None,
+    cache_size: int | None = None,
+    read_workers: int | None = None,
+) -> None:
+    """Recreate after.trees using only the movable checkpoint's saved inputs.
+
+    Current tsinfer main does not honour match.reference_ts in its pipeline
+    runner. Use its native group processor directly, with the saved original
+    jobs and IDs, rather than requiring a patched tsinfer checkout.
+    """
+    if threads is None:
+        threads = tsinfer.config.DEFAULT_NUM_THREADS
+    checkpoint_dir = checkpoint_dir.resolve()
+    cfg = tsinfer.config.Config.from_toml(checkpoint_dir / "group.toml")
+    for source in cfg.sources.values():
+        source.path = checkpoint_dir / source.path
+    cfg.ancestral_state.path = checkpoint_dir / cfg.ancestral_state.path
+    cfg.match.reference_ts = checkpoint_dir / cfg.match.reference_ts
+    cfg.match.output = checkpoint_dir / cfg.match.output
+    manifest = json.loads((checkpoint_dir / "group.json").read_text())
+    jobs = [tsinfer.config.MatchJob(**record) for record in manifest["jobs"]]
+    reference = tskit.load(cfg.match.reference_ts)
+    ts = native_matching.match_reference(
+        cfg, reference, jobs, threads, cache_size, read_workers
+    )
+    ts.dump(cfg.match.output)
+    logger.info("Replayed group %d to %s", manifest["group"], cfg.match.output)
+
+
+def main():
+    """Command-line entry point for replaying a saved checkpoint."""
+    parser = argparse.ArgumentParser(description="Replay a native ancestor checkpoint")
+    parser.add_argument("checkpoint_dir", type=pathlib.Path)
+    parser.add_argument("--threads", type=int)
+    parser.add_argument("--cache-size", type=int)
+    parser.add_argument("--read-workers", type=int)
+    args = parser.parse_args()
+    logging.basicConfig(level=logging.INFO)
+    replay(args.checkpoint_dir, args.threads, args.cache_size, args.read_workers)
+
+
+if __name__ == "__main__":
+    main()

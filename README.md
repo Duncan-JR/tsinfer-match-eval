@@ -6,9 +6,10 @@ belongs in separate notebooks.
 
 ## Running
 
-Use phased, biallelic, single-contig VCF Zarr inputs and the editable tsinfer
-checkout at `../tsinfer`. The runner uses its regional `AncestorMatcher`,
-`reset_topology()` and raw table APIs directly.
+Use phased, single-contig VCF Zarr inputs and the editable tsinfer checkout
+at `../tsinfer`. The `native` target supports upstream tsinfer main. Greedy
+matching and performance targets still require the evaluation checkout's
+regional matcher, `reset_topology()` and raw table APIs.
 
 ```sh
 cp config.yaml.example config.yaml
@@ -34,8 +35,10 @@ actual tsinfer revision.
 ## Matching
 
 1. Copy each input store and annotate derived allele counts and frequencies for
-   the selected cohort. Missing calls are excluded; singletons are excluded from
-   inference. The annotated store retains both original axes.
+   the selected cohort. Missing calls are excluded from counts. Inference uses
+   biallelic sites with a known ancestral allele among the stored alleles and
+   excludes singletons. The annotated copy retains both original axes and
+   normalises its actual chromosome to contig index zero for upstream tsinfer.
 2. Infer ancestors and match them to make a raw reference tree sequence. True
    ancestor extraction remains available through explicit `true` targets.
 3. Run the independent native full-HMM baseline.
@@ -110,13 +113,15 @@ Each `datasets` entry has:
 | `ancestral_state.field` | Array of ancestral allele strings. |
 | `ancestral_state.is_reference` | Alternative to `field`: `true` treats REF as ancestral. |
 | `include` | Optional native site filter, e.g. `'POS >= 1000000 & POS < 11000000'`. |
-| `exclude` | Alternative to `include`. Singleton exclusion is added automatically. |
+| `exclude` | Alternative to `include`. Biallelic/present-ancestral and singleton filters are added automatically to either selection. |
 | `sample_list` | Optional headerless CSV of sample IDs. The same cohort is used for annotation, inference and matching; both ploidies are retained. |
 | `matching_cache_size` | Native ancestor/full-HMM reader cache in MiB; `null` uses tsinfer's default. Greedy uses its slab bound instead. |
 
 Coordinates remain absolute when selecting a region. Main products are:
 
-- `samples/{name}_samples_masked.zarr`: count-annotated sample copy.
+- `samples/{name}_samples_masked.zarr`: sample copy with derived counts/frequencies,
+  boolean `variant_match_eval_inference_site_mask` (`False` for eligible inference
+  sites, `True` for excluded sites) and normalised single-contig metadata.
 - `configs/{name}_ancestor_inference.toml`: native inference/matching config.
 - `ancestors/{name}_inferred_ancestors.zarr` and `.trees`: panel and raw reference.
 - `matches/{name}_inferred_samples_raw.trees`: native full-HMM baseline.
@@ -132,22 +137,24 @@ also contains:
   with original ancestor IDs, times, support bounds and focal positions.
 - `group.json`: original linesweep jobs (including ancestor IDs and group ID),
   threshold, group frequency range and tsinfer version/revision.
-- `group.toml`: standalone native matching config with relative bundle paths.
+- `group.toml`: native source/HMM/reference settings with relative bundle paths.
 - `original_config.toml`: original configuration for the complete run.
 
 Groups can mix frequencies; selection uses their minimum without splitting
 or reordering them. A threshold with no eligible group raises an error.
 To replay the selected group after moving or copying the checkpoint directory,
-run from inside it (using your pipeline checkout's absolute path):
+run from the pipeline checkout and pass the checkpoint's path:
 
 ```sh
-uv run --project /path/to/tsinfer-match-eval tsinfer match group.toml \
-    --threads 180 --cache-size 65536 --read-workers 8 --force
+uv run -m lib.ancestor_checkpoint /path/to/checkpoint \
+    --threads 180 --cache-size 65536 --read-workers 8
 ```
 
 This overwrites `after.trees`. Replay reproduces its tables; provenance timing
 and command records differ. The complete ancestor panel/reference and annotated
 sample VCZ remain at the usual paths above.
+The replay runner uses native matching groups directly because current
+upstream tsinfer's pipeline runner does not honour `match.reference_ts`.
 
 ## Performance
 
