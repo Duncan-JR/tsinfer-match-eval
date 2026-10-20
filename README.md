@@ -18,6 +18,15 @@ uv run snakemake --dry-run --cores all
 uv run snakemake --cores all
 ```
 
+Use the `native` target to generate references and run only native full-HMM
+sample matching. `config.yaml.example` prepares all 1000 Genomes individuals
+on GRCh38 chr20p, including an ancestor checkpoint at frequency 0.5. Within
+an exclusive 196-CPU, 1024-GB HPC allocation, run:
+
+```sh
+uv run snakemake native --configfile config.yaml.example --cores 196
+```
+
 Each run uses one AC cutoff and minimum focal size. Use separate configurations
 and output directories for different biological settings. Logs record the
 actual tsinfer revision.
@@ -77,6 +86,8 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
 | `inference_threads` | Native ancestor inference workers. |
 | `matching_threads` | Native ancestor/baseline threads and greedy process workers. |
+| `matching_read_workers` | Background genotype readers for checkpointed ancestor and native sample matching; omitted or `null` uses tsinfer's default (half the matching threads, minimum one). |
+| `ancestor_match_freq` | Optional inferred-ancestor checkpoint threshold, strictly between 0 and 1; omitted or `null` disables it. Stop before the first linesweep group containing any ancestor at or below this frequency, save the group input/output, then finish ancestor matching. Native frequency times are derived counts divided by the cohort haplotype count, including missing haplotypes in the denominator. |
 | `sample_prefetch_chunks` | Maximum live decoded sample slabs; start with `2`. |
 | `max_pending_haplotypes` | Maximum queued, running and completed-but-unappended haplotype jobs; also bounds preparation admission. `null` uses the requested worker count. An explicit limit must be at least that count. |
 | `temp_dir` | Temporary mapped-file parent, or `null` for the system temporary directory. |
@@ -112,6 +123,32 @@ Coordinates remain absolute when selecting a region. Main products are:
 - `matches/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples.
 - Corresponding `*_samples_matches.jsonl` when `path_output` is enabled.
 
+With `ancestor_match_freq` enabled, `ancestors/{name}_inferred_checkpoint/`
+also contains:
+
+- `before.trees` and `after.trees`: raw ancestor TS immediately before and after
+  the selected group, retaining node IDs and sample individual rows.
+- `group.zarr`: that entire group's haplotypes on the full inference-site axis,
+  with original ancestor IDs, times, support bounds and focal positions.
+- `group.json`: original linesweep jobs (including ancestor IDs and group ID),
+  threshold, group frequency range and tsinfer version/revision.
+- `group.toml`: standalone native matching config with relative bundle paths.
+- `original_config.toml`: original configuration for the complete run.
+
+Groups can mix frequencies; selection uses their minimum without splitting
+or reordering them. A threshold with no eligible group raises an error.
+To replay the selected group after moving or copying the checkpoint directory,
+run from inside it (using your pipeline checkout's absolute path):
+
+```sh
+uv run --project /path/to/tsinfer-match-eval tsinfer match group.toml \
+    --threads 180 --cache-size 65536 --read-workers 8 --force
+```
+
+This overwrites `after.trees`. Replay reproduces its tables; provenance timing
+and command records differ. The complete ancestor panel/reference and annotated
+sample VCZ remain at the usual paths above.
+
 ## Performance
 
 ```sh
@@ -125,6 +162,7 @@ experiment directory must be empty. Output is under
 `data/performance/{experiment_id}/`: configuration and dependency/source
 manifest, `runs.csv`, `stages.csv`, optional `quality.json`, trial logs,
 process-tree memory samples and matched trees.
+Omit `performance` or set it to `null` to disable the suite.
 
 Worker counts are never silently reduced. Every dataset must have at least as
 many haplotypes as the largest requested worker count. The suite checks its CPU

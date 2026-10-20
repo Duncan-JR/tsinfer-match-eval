@@ -1,7 +1,7 @@
 import csv
 import pathlib
 
-from lib import ancestors, benchmark, matching, utils
+from lib import ancestor_checkpoint, ancestors, benchmark, matching, utils
 
 
 configfile: "config.yaml"
@@ -42,6 +42,13 @@ rule all:
         (expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names)
          if config["path_output"] else []),
         (expand(data_dir / "matches" / "{name}_inferred_greedy_samples_matches.jsonl", name=names)
+         if config["path_output"] else []),
+
+
+rule native:
+    input:
+        expand(data_dir / "matches" / "{name}_inferred_samples_raw.trees", name=names),
+        (expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names)
          if config["path_output"] else []),
 
 
@@ -167,6 +174,33 @@ rule match_ancestors:
         )
 
 
+if config.get("ancestor_match_freq") is not None:
+    ruleorder: match_ancestors_checkpoint > match_ancestors
+
+    rule match_ancestors_checkpoint:
+        input:
+            ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
+            samples=data_dir / "samples" / "{name}_samples_masked.zarr",
+            config=data_dir / "configs" / "{name}_ancestor_inference.toml",
+        output:
+            trees=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+            checkpoint=directory(data_dir / "ancestors" / "{name}_inferred_checkpoint"),
+        log:
+            progress_dir / "match_ancestors" / "{name}_inferred_match_ancestors.log",
+        params:
+            frequency=config["ancestor_match_freq"],
+            cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
+            read_workers=config.get("matching_read_workers"),
+        threads: config["matching_threads"]
+        run:
+            utils.setup_log(pathlib.Path(log[0]))
+            ancestor_checkpoint.match_ancestors(
+                pathlib.Path(input.config), pathlib.Path(output.trees),
+                pathlib.Path(output.checkpoint), params.frequency, threads,
+                params.cache_size, params.read_workers,
+            )
+
+
 rule match_stitched_samples:
     input:
         reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
@@ -220,6 +254,7 @@ rule match_samples:
         progress_dir / "match_samples" / "{name}_{kind}_match_samples.log",
     params:
         cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
+        read_workers=config.get("matching_read_workers"),
     threads: config["matching_threads"]
     run:
         utils.setup_log(pathlib.Path(log[0]))
@@ -230,10 +265,11 @@ rule match_samples:
             pathlib.Path(output.matches[0]) if output.matches else None,
             threads,
             params.cache_size,
+            params.read_workers,
         )
 
 
-if "performance" in config:
+if config.get("performance") is not None:
     performance_dir = benchmark.output_directory(config)
     performance_products = ["manifest.json", "runs.csv", "stages.csv", "complete.json"]
     if config["performance"]["quality_checks"]:
@@ -261,4 +297,4 @@ if "performance" in config:
 else:
     rule performance:
         run:
-            raise ValueError("Add the performance section from config.yaml.example")
+            raise ValueError("Add a performance configuration; see README.md")

@@ -165,6 +165,14 @@ def cpu_allocation(workers, helpers):
 
 def validate_config(config):
     """Validate the scalar workflow interface once, before preparing any data."""
+    frequency = config.get("ancestor_match_freq")
+    if frequency is not None and (
+        type(frequency) not in (int, float) or not 0 < frequency < 1
+    ):
+        raise ValueError("ancestor_match_freq must be between zero and one, or null")
+    read_workers = config.get("matching_read_workers")
+    if read_workers is not None and (type(read_workers) is not int or read_workers < 1):
+        raise ValueError("matching_read_workers must be a positive integer or null")
     if config.get("focal_choice", "left") not in ("left", "right"):
         raise ValueError("focal_choice must be left or right")
     for name in (
