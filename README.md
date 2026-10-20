@@ -18,9 +18,10 @@ uv run snakemake --dry-run --cores all
 uv run snakemake --cores all
 ```
 
-Each run uses one AC cutoff and minimum focal size. Use separate configurations
-and output directories for different biological settings. Logs record the
-actual tsinfer revision.
+`af_cutoff` and `min_focal_region_size` accept a scalar or a list. The default
+target runs their Cartesian product, sharing annotated samples, ancestor panels,
+references and one full-HMM baseline per dataset. Use separate output directories
+when changing inputs or HMM settings. Logs record the actual tsinfer revision.
 
 ## Matching
 
@@ -31,7 +32,8 @@ actual tsinfer revision.
    ancestor extraction remains available through explicit `true` targets.
 3. Run the independent native full-HMM baseline.
 4. Select each ancestor's leftmost or rightmost focal site as its seed. Keep
-   ancestors with annotated derived AC at most `ac_cutoff`. Pack their supports,
+   ancestors with annotated derived AF at most `af_cutoff`. AF is derived copies
+   divided by called haplotypes in the selected cohort at the seed. Pack their supports,
    clipped to the containing inference interval, into one temporary mapped file.
 5. Load selected samples by physical Zarr chunks into temporary mapped slabs.
    Each worker matches one complete haplotype. A derived sample seed activates
@@ -69,8 +71,8 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `data_dir` | Ordinary output root. Use a separate directory for each biological configuration. |
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
-| `ac_cutoff` | Positive integer; inclusive maximum selected-cohort derived AC at the seed. |
-| `min_focal_region_size` | Positive integer; minimum inference sites in a complete touching union. `1` keeps all. |
+| `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
+| `min_focal_region_size` | Positive integer or nonempty list of distinct positive integers; minimum inference sites in a complete touching union. `1` keeps all. These are site counts, not base pairs. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.mismatch` | HMM mismatch probability, strictly between 0 and 1. Exact focal copying always allows zero mismatches. |
 | `path_output` | Write optional native-shaped JSONL paths/mutations for both runners. Greedy records may be in completion order; use `haplotype_index` for canonical order. |
@@ -109,8 +111,23 @@ Coordinates remain absolute when selecting a region. Main products are:
 - `configs/{name}_ancestor_inference.toml`: native inference/matching config.
 - `ancestors/{name}_inferred_ancestors.zarr` and `.trees`: panel and raw reference.
 - `matches/{name}_inferred_samples_raw.trees`: native full-HMM baseline.
-- `matches/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples.
+- `matches/af_{af_cutoff}/min_region_{min_focal_region_size}/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples for each parameter pair.
 - Corresponding `*_samples_matches.jsonl` when `path_output` is enabled.
+
+`config.yaml.hpc_params1` selects the 10 Mb simulated n=300 and n=3000 cohorts
+from `../tsinfer-anc-eval/config.yaml.matching`. It runs AF cutoffs
+`[0.01, 0.03, 0.05]` and minimum sizes `[1, 100, 300, 1000]`: 24 greedy outputs
+plus two full-HMM baselines. With `TMPDIR` set to node-local scratch inside the
+196-CPU, 1024-GB allocation, run:
+
+```sh
+uv run snakemake all --configfile config.yaml.hpc_params1 --cores 196
+```
+
+It uses 48 matching workers per job, allowing two greedy jobs to run concurrently
+within their helper-inclusive CPU reservations. `performance: null` disables the
+benchmark target, including any performance settings inherited from `config.yaml`.
+Ordinary matching does not collect benchmark timings or memory samples.
 
 ## Performance
 
@@ -125,6 +142,7 @@ experiment directory must be empty. Output is under
 `data/performance/{experiment_id}/`: configuration and dependency/source
 manifest, `runs.csv`, `stages.csv`, optional `quality.json`, trial logs,
 process-tree memory samples and matched trees.
+Performance trials require scalar `af_cutoff` and `min_focal_region_size` settings.
 
 Worker counts are never silently reduced. Every dataset must have at least as
 many haplotypes as the largest requested worker count. The suite checks its CPU
@@ -133,7 +151,7 @@ records host CPU/memory information, allowed CPU/core/socket/NUMA topology and
 selected scheduler allocation and binding variables.
 
 For the five simulated cohorts in `../tsinfer-anc-eval/config.yaml.matching`,
-`config.yaml.hpc1` runs both methods once at 32 workers, using identical references
+`config.yaml.hpc_perf1` runs both methods once at 32 workers, using identical references
 and settings. Generate just their inputs from the `tsinfer-anc-eval` directory:
 
 ```sh
@@ -145,7 +163,7 @@ Inside an exclusive 196-CPU allocation, set `TMPDIR` to node-local scratch, then
 run from this directory:
 
 ```sh
-uv run snakemake performance --configfile config.yaml.hpc1 --cores 196
+uv run snakemake performance --configfile config.yaml.hpc_perf1 --cores 196
 ```
 
 This target prepares all references before starting sequential measurements.

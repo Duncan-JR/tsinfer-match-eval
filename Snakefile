@@ -1,5 +1,6 @@
 import csv
 import pathlib
+import re
 
 from lib import ancestors, benchmark, matching, utils
 
@@ -8,8 +9,8 @@ configfile: "config.yaml"
 
 utils.validate_config(config)
 focal_choice = config.get("focal_choice", "left")
-ac_cutoff = config["ac_cutoff"]
-min_focal_region_size = config["min_focal_region_size"]
+af_cutoffs = utils.parameter_values(config["af_cutoff"])
+min_focal_region_sizes = utils.parameter_values(config["min_focal_region_size"])
 helpers = config["helper_threads"]
 utils.configure_helpers(helpers)
 
@@ -24,6 +25,9 @@ for dataset in datasets.values():
             sample_ids = [sample_id for row in csv.reader(sample_file) for sample_id in row]
         dataset["samples"] = ",".join(sample_ids)
 names = list(datasets)
+parameter_dir = pathlib.Path("af_{af_cutoff}") / "min_region_{min_focal_region_size}"
+greedy_dir = data_dir / "matches" / parameter_dir
+greedy_log_dir = progress_dir / "match_stitched_samples" / parameter_dir
 
 
 def panel_config(wildcards):
@@ -33,15 +37,19 @@ def panel_config(wildcards):
 
 wildcard_constraints:
     kind="inferred|true",
+    af_cutoff="|".join(re.escape(str(value)) for value in af_cutoffs),
+    min_focal_region_size="|".join(str(value) for value in min_focal_region_sizes),
 
 
 rule all:
     input:
         expand(data_dir / "matches" / "{name}_inferred_samples_raw.trees", name=names),
-        expand(data_dir / "matches" / "{name}_inferred_greedy_samples_raw.trees", name=names),
+        expand(greedy_dir / "{name}_inferred_greedy_samples_raw.trees", name=names,
+               af_cutoff=af_cutoffs, min_focal_region_size=min_focal_region_sizes),
         (expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names)
          if config["path_output"] else []),
-        (expand(data_dir / "matches" / "{name}_inferred_greedy_samples_matches.jsonl", name=names)
+        (expand(greedy_dir / "{name}_inferred_greedy_samples_matches.jsonl", name=names,
+                af_cutoff=af_cutoffs, min_focal_region_size=min_focal_region_sizes)
          if config["path_output"] else []),
 
 
@@ -174,12 +182,12 @@ rule match_stitched_samples:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",
     output:
-        trees=data_dir / "matches" / "{name}_inferred_greedy_samples_raw.trees",
-        matches=([data_dir / "matches" / "{name}_inferred_greedy_samples_matches.jsonl"]
+        trees=greedy_dir / "{name}_inferred_greedy_samples_raw.trees",
+        matches=([greedy_dir / "{name}_inferred_greedy_samples_matches.jsonl"]
                  if config["path_output"] else []),
     params:
-        ac_cutoff=ac_cutoff,
-        min_focal_region_size=min_focal_region_size,
+        af_cutoff=lambda wildcards: float(wildcards.af_cutoff),
+        min_focal_region_size=lambda wildcards: int(wildcards.min_focal_region_size),
         focal_choice=focal_choice,
         workers=config["matching_threads"],
         sample_prefetch_chunks=config["sample_prefetch_chunks"],
@@ -188,7 +196,7 @@ rule match_stitched_samples:
         helper_threads=helpers,
     threads: utils.cpu_allocation(config["matching_threads"], helpers)
     log:
-        progress_dir / "match_stitched_samples" / "{name}_inferred_match_stitched_samples.log",
+        greedy_log_dir / "{name}_inferred_match_stitched_samples.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
         required = utils.cpu_allocation(params.workers, params.helper_threads)
@@ -196,7 +204,7 @@ rule match_stitched_samples:
             raise ValueError(f"Greedy matching needs {required} CPUs including helpers; got {threads}")
         matching.match_stitched_samples(
             pathlib.Path(input.config), pathlib.Path(input.reference), pathlib.Path(output.trees),
-            ac_cutoff=params.ac_cutoff, min_focal_region_size=params.min_focal_region_size,
+            af_cutoff=params.af_cutoff, min_focal_region_size=params.min_focal_region_size,
             focal_choice=params.focal_choice, workers=params.workers,
             sample_prefetch_chunks=params.sample_prefetch_chunks,
             max_pending_haplotypes=params.max_pending_haplotypes,
@@ -233,7 +241,7 @@ rule match_samples:
         )
 
 
-if "performance" in config:
+if config.get("performance") is not None:
     performance_dir = benchmark.output_directory(config)
     performance_products = ["manifest.json", "runs.csv", "stages.csv", "complete.json"]
     if config["performance"]["quality_checks"]:

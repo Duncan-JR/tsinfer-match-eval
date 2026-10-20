@@ -1,7 +1,7 @@
 data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
-ac_cutoff: 10
+af_cutoff: 0.03
 min_focal_region_size: 1
 path_output: false
 hmm:

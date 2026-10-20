@@ -163,13 +163,30 @@ def cpu_allocation(workers, helpers):
     return max(packing, matching) + (workers + 1) * (helpers["blas_threads"] - 1)
 
 
+def parameter_values(value):
+    """Normalise a scalar or explicit parameter grid axis to a list."""
+    return value if isinstance(value, list) else [value]
+
+
 def validate_config(config):
-    """Validate the scalar workflow interface once, before preparing any data."""
+    """Validate workflow settings and optional parameter grid axes."""
     if config.get("focal_choice", "left") not in ("left", "right"):
         raise ValueError("focal_choice must be left or right")
+    for name in ("af_cutoff", "min_focal_region_size"):
+        values = parameter_values(config[name])
+        if len(values) == 0:
+            raise ValueError(f"{name} must contain at least one value")
+        for value in values:
+            if name == "af_cutoff":
+                if type(value) not in (int, float) or not 0 <= value <= 1:
+                    raise ValueError("af_cutoff values must be numbers between 0 and 1")
+            elif type(value) is not int or value < 1:
+                raise ValueError(
+                    "min_focal_region_size values must be positive integers"
+                )
+        if len(set(values)) != len(values):
+            raise ValueError(f"{name} must not contain duplicates")
     for name in (
-        "ac_cutoff",
-        "min_focal_region_size",
         "ancestor_chunk_size",
         "inference_threads",
         "matching_threads",

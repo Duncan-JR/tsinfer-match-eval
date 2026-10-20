@@ -67,6 +67,9 @@ def required_allocation(config):
 def validate_config(config, allocation):
     """Validate performance settings at the suite entry point."""
     utils.validate_config(config)
+    for name in ("af_cutoff", "min_focal_region_size"):
+        if isinstance(config[name], list):
+            raise ValueError(f"Performance trials require a scalar {name}")
     settings = config["performance"]
     if not settings["methods"] or not set(settings["methods"]) <= {"full_hmm", "greedy"}:
         raise ValueError("performance.methods: choose full_hmm and/or greedy")
@@ -262,7 +265,7 @@ def trial(spec_path):
         if run["method"] == "greedy":
             temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
             kwargs = {
-                "ac_cutoff": config["ac_cutoff"],
+                "af_cutoff": config["af_cutoff"],
                 "min_focal_region_size": config["min_focal_region_size"],
                 "focal_choice": config.get("focal_choice", "left"),
                 "workers": workers,

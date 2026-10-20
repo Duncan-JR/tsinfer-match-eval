@@ -622,7 +622,7 @@ def match_stitched_samples(
     ancestors_ts_path: pathlib.Path,
     output_path: pathlib.Path,
     *,
-    ac_cutoff: int,
+    af_cutoff: float,
     min_focal_region_size: int,
     workers: int,
     sample_prefetch_chunks: int,
@@ -701,7 +701,7 @@ def match_stitched_samples(
                     panel_path,
                     samples,
                     reference,
-                    ac_cutoff,
+                    af_cutoff,
                     focal_choice,
                     directory,
                 )

@@ -175,8 +175,8 @@ def load_sample_chunk(inputs, chunk, directory):
     return SampleSlab(chunk.block, descriptor, chunk.job_indices, blocks_read, elapsed)
 
 
-def prepare_reference(panel_path, sample_input, reference, cutoff, choice, directory):
-    """Validate alignment and clip eligible seeded supports before any extension.
+def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, directory):
+    """Select by cohort-derived seed AF and clip supports before any extension.
 
     Genotypes are packed by :func:`pack_reference_chunk` in the persistent pool.
     A shared seed does not collapse distinct panel ancestors.
@@ -210,8 +210,9 @@ def prepare_reference(panel_path, sample_input, reference, cutoff, choice, direc
             seeds[column] = seed
     columns = np.flatnonzero(seeds >= 0)
     sample_rows = sample_input.source_rows
-    counts = samples["variant_match_eval_derived_ac"].oindex[sample_rows[seeds[columns]]]
-    columns = columns[counts <= cutoff]
+    seed_rows = sample_rows[seeds[columns]]
+    frequencies = samples["variant_match_eval_derived_af"].oindex[seed_rows]
+    columns = columns[frequencies <= af_cutoff]
     seeds = seeds[columns]
     containing = np.searchsorted(intervals[:, 0], positions[seeds], side="right") - 1
     supports = intervals[containing]
