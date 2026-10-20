@@ -174,11 +174,13 @@ def validate_config(config):
         "inference_threads",
         "matching_threads",
         "sample_prefetch_chunks",
-        "max_pending_haplotypes",
     ):
         value = config[name]
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    pending = config["max_pending_haplotypes"]
+    if pending is not None and (type(pending) is not int or pending < 1):
+        raise ValueError("max_pending_haplotypes must be a positive integer or null")
     for name in ("recombination", "mismatch"):
         if not 0 < config["hmm"][name] < 1:
             raise ValueError(f"hmm.{name} must be between zero and one")

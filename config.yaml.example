@@ -28,7 +28,7 @@ ancestor_chunk_size: 5000
 inference_threads: 1
 matching_threads: 1
 sample_prefetch_chunks: 2
-max_pending_haplotypes: 16
+max_pending_haplotypes: null
 temp_dir: null
 helper_threads:
   blosc_threads: 1

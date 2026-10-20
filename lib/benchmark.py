@@ -23,6 +23,7 @@ import time
 import traceback
 
 import numpy as np
+import psutil
 import tsinfer
 import tskit
 import yaml
@@ -89,6 +90,16 @@ def validate_config(config, allocation):
         raise ValueError(
             "Performance worker counts and repeats must be positive integers"
         )
+    pending = config["max_pending_haplotypes"]
+    if (
+        "greedy" in settings["methods"]
+        and pending is not None
+        and pending < max(settings["worker_counts"])
+    ):
+        raise ValueError(
+            "max_pending_haplotypes must cover every performance.worker_counts "
+            "entry; use null to derive it from each trial's workers"
+        )
     for name in (
         "rss_sample_interval_s",
         "trial_timeout_s",
@@ -106,6 +117,13 @@ def validate_config(config, allocation):
         raise ValueError(
             f"Performance suite requires {required_allocation(config)} CPUs; "
             f"got {allocation}"
+        )
+    affinity = _cpu_affinity()
+    available = len(affinity) if affinity is not None else os.cpu_count()
+    if available is not None and required_allocation(config) > available:
+        raise ValueError(
+            f"Performance suite requires {required_allocation(config)} CPUs, "
+            f"but this process can use only {available}"
         )
 
 
@@ -235,7 +253,8 @@ def trial(spec_path):
             cfg = matching._sample_config(paths.config, paths.reference, output)
             reference = tskit.load(paths.reference)
             jobs = _sample_jobs(cfg, reference)
-            workers = min(workers, len(jobs))
+            if workers > len(jobs):
+                raise ValueError("Requested workers exceed the sample haplotype count")
             matrix_bytes = reference.num_sites * len(jobs)
             if matrix_bytes > config["performance"]["resident_max_matrix_mib"] * 1024**2:
                 raise ValueError("Resident sample calls exceed resident_max_matrix_mib")
@@ -287,8 +306,11 @@ def trial(spec_path):
             matched_ts = tskit.load(output)
             reference = tskit.load(paths.reference)
             count = matched_ts.num_nodes - reference.num_nodes
-            workers = min(workers, count)
+            if workers > count:
+                raise ValueError("Requested workers exceed the matched haplotype count")
             collector.count(matched_haplotypes=count, full_calls=count)
+        if workers != run["requested_workers"]:
+            raise ValueError("Actual worker count differs from requested_workers")
         result = {
             "status": "ok",
             "window": dataclasses.asdict(window),
@@ -402,6 +424,75 @@ def _revision(root):
     return {"path": str(root), "commit": commit, "status": status.splitlines()}
 
 
+def _cpu_affinity():
+    """Return the effective Linux CPU mask, including scheduler/cpuset limits."""
+    if hasattr(os, "sched_getaffinity"):
+        return sorted(os.sched_getaffinity(0))
+    return None
+
+
+def _machine_resources():
+    """Record host topology and the allocation visible to this suite process."""
+    affinity = _cpu_affinity()
+    topology = []
+    if affinity is not None:
+        for cpu in affinity:
+            directory = pathlib.Path(f"/sys/devices/system/cpu/cpu{cpu}")
+            package = directory / "topology" / "physical_package_id"
+            core = directory / "topology" / "core_id"
+            if package.exists() and core.exists():
+                numa_nodes = sorted(path.name for path in directory.glob("node[0-9]*"))
+                topology.append(
+                    {
+                        "cpu": cpu,
+                        "package": int(package.read_text()),
+                        "core": int(core.read_text()),
+                        "numa_nodes": numa_nodes,
+                    }
+                )
+    cpu_model = platform.processor()
+    cpu_info = pathlib.Path("/proc/cpuinfo")
+    if cpu_info.exists():
+        for line in cpu_info.read_text().splitlines():
+            if line.startswith("model name"):
+                cpu_model = line.partition(":")[2].strip()
+                break
+    scheduler_variables = (
+        "SLURM_JOB_ID",
+        "SLURM_JOB_NODELIST",
+        "SLURM_CPUS_PER_TASK",
+        "SLURM_CPUS_ON_NODE",
+        "SLURM_JOB_CPUS_PER_NODE",
+        "SLURM_NTASKS",
+        "SLURM_JOB_NUM_NODES",
+        "SLURM_MEM_PER_NODE",
+        "SLURM_MEM_PER_CPU",
+        "SLURM_CPU_BIND",
+        "SLURM_CPU_BIND_LIST",
+        "SLURM_HINT",
+        "SLURM_THREADS_PER_CORE",
+        "PBS_JOBID",
+        "PBS_NP",
+        "PBS_NODEFILE",
+        "NCPUS",
+        "NSLOTS",
+        "LSB_JOBID",
+        "LSB_DJOB_NUMPROC",
+    )
+    return {
+        "cpu_model": cpu_model,
+        "logical_cpus": psutil.cpu_count(logical=True),
+        "physical_cores": psutil.cpu_count(logical=False),
+        "cpu_affinity": affinity,
+        "allowed_cpu_topology": topology,
+        "host_memory_bytes": psutil.virtual_memory().total,
+        "scheduler": {
+            name: os.environ[name] for name in scheduler_variables if name in os.environ
+        },
+        "temp_directory": str(pathlib.Path(tempfile.gettempdir()).resolve()),
+    }
+
+
 def _manifest(config, allocation):
     source_paths = [pathlib.Path("Snakefile"), *pathlib.Path("lib").glob("*.py")]
     versions = {
@@ -425,6 +516,11 @@ def _manifest(config, allocation):
         ):
             raise ValueError("Prepared native configuration disagrees with hmm settings")
         jobs = _sample_jobs(cfg, reference)
+        if max(config["performance"]["worker_counts"]) > len(jobs):
+            raise ValueError(
+                f"Dataset {dataset['name']} has only {len(jobs)} haplotypes; "
+                "reduce performance.worker_counts for the entire comparison"
+            )
         identities = [(job.source, job.sample_id, job.ploidy_index) for job in jobs]
         datasets[dataset["name"]] = {
             "inputs": {
@@ -433,6 +529,8 @@ def _manifest(config, allocation):
             "cohort_sha256": hashlib.sha256(json.dumps(identities).encode()).hexdigest(),
             "haplotypes": len(jobs),
             "sites": reference.num_sites,
+            "reference_nodes": reference.num_nodes,
+            "reference_edges": reference.num_edges,
             "sequence_intervals": reference.metadata["sequence_intervals"],
         }
     return {
@@ -446,6 +544,7 @@ def _manifest(config, allocation):
         "packages": versions,
         "python": sys.version,
         "machine": platform.uname()._asdict(),
+        "machine_resources": _machine_resources(),
         "source_sha256": {
             str(path): hashlib.sha256(path.read_bytes()).hexdigest()
             for path in source_paths

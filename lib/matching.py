@@ -41,7 +41,11 @@ def match_ancestors(
     if any(group >= first_sample_group for group in ancestor_groups):
         raise ValueError("All ancestor groups must precede the first sample group")
     ts = tsinfer.pipeline.match(
-        cfg, group_stop=first_sample_group, num_threads=threads, cache_size=cache_size
+        cfg,
+        group_stop=first_sample_group,
+        num_threads=threads,
+        cache_size=cache_size,
+        read_workers=1,
     )
     ts.dump(output_path)
     logger.info("Wrote raw ancestor reference to %s", output_path)
@@ -622,7 +626,7 @@ def match_stitched_samples(
     min_focal_region_size: int,
     workers: int,
     sample_prefetch_chunks: int,
-    max_pending_haplotypes: int,
+    max_pending_haplotypes: int | None,
     helper_threads: dict,
     focal_choice: str = "left",
     temp_dir: pathlib.Path | None = None,
@@ -642,6 +646,13 @@ def match_stitched_samples(
     ``window``; the benchmark limits their total size. Normal end-to-end timing
     wraps this entire function, including startup, packing and final output.
     """
+    if max_pending_haplotypes is None:
+        max_pending_haplotypes = workers
+    if max_pending_haplotypes < workers:
+        raise ValueError(
+            "max_pending_haplotypes must be at least the worker count; "
+            "use null to derive it from workers"
+        )
     native = tsinfer.config.Config.from_toml(config_path)
     panel_path = native.ancestors[0].path
     cfg = _sample_config(config_path, ancestors_ts_path, output_path)
@@ -666,7 +677,8 @@ def match_stitched_samples(
                 "Reference populations disagree with selected sample metadata"
             )
         nodes = _create_sample_nodes(tables, jobs)
-    workers = min(workers, len(jobs), max_pending_haplotypes)
+    if workers > len(jobs):
+        raise ValueError(f"Requested {workers} workers for only {len(jobs)} haplotypes")
     ctx = mp.get_context("spawn")
     work = ctx.Queue(maxsize=max_pending_haplotypes)
     events = ctx.Queue()
