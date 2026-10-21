@@ -19,6 +19,7 @@ import subprocess
 import sys
 import tarfile
 import tempfile
+import time
 
 import numpy as np
 import pandas as pd
@@ -418,6 +419,69 @@ def read_paths(path, reference, identities):
     return result
 
 
+@dataclasses.dataclass
+class IndexedPaths:
+    """Read-only ragged copying paths in canonical haplotype order."""
+
+    offsets: np.ndarray
+    left: np.ndarray
+    right: np.ndarray
+    parent: np.ndarray
+
+    def __getitem__(self, index):
+        first, last = self.offsets[index : index + 2]
+        return EdgePath(
+            self.left[first:last], self.right[first:last], self.parent[first:last]
+        )
+
+
+@dataclasses.dataclass
+class PathIndex:
+    """Location of shared columns prepared by :func:`prepare_paths`."""
+
+    directory: pathlib.Path
+
+    def open(self):
+        arrays = [
+            np.load(self.directory / f"{name}.npy", mmap_mode="r", allow_pickle=False)
+            for name in ("offsets", "left", "right", "parent")
+        ]
+        return IndexedPaths(*arrays)
+
+
+def prepare_paths(path, reference, identities, directory):
+    """Validate once and copy paths directly into canonical, shared edge columns."""
+    started = time.perf_counter()
+    paths = read_paths(path, reference, identities)
+    directory.mkdir()
+    offsets = np.zeros(len(identities) + 1, dtype=np.int64)
+    lengths = [len(paths[key].left) for key in identities]
+    offsets[1:] = np.cumsum(lengths, dtype=np.int64)
+    np.save(directory / "offsets.npy", offsets, allow_pickle=False)
+    for name, dtype in (
+        ("left", np.float64),
+        ("right", np.float64),
+        ("parent", np.int32),
+    ):
+        column = np.lib.format.open_memmap(
+            directory / f"{name}.npy", mode="w+", dtype=dtype, shape=(int(offsets[-1]),)
+        )
+        try:
+            for index, key in enumerate(identities):
+                first, last = offsets[index : index + 2]
+                column[first:last] = getattr(paths[key], name)
+        finally:
+            haplotypes.close_mapping(column)
+    logger.info(
+        "Prepared diagnostic paths %s: %d haplotypes, %d edges in %.3fs",
+        path,
+        len(identities),
+        offsets[-1],
+        time.perf_counter() - started,
+    )
+    return PathIndex(directory)
+
+
 def intersect_intervals(first, second):
     """Intersect two sorted disjoint physical interval lists in linear time."""
     result = []
@@ -592,7 +656,7 @@ class HaplotypeAnalysis:
 
 @dataclasses.dataclass
 class WorkerData:
-    """One decoded chunk at a time; exact scratch and indexed trees persist."""
+    """Private exact scratch and read-only shared inputs persist across tasks."""
 
     samples: haplotypes.SampleInput
     directory: pathlib.Path
@@ -601,8 +665,8 @@ class WorkerData:
     axis: SiteAxis
     labels: list[dict]
     runs: list[Run]
-    full: dict[tuple, EdgePath]
-    stitched: dict[int, dict[tuple, EdgePath]]
+    full: IndexedPaths
+    stitched: dict[int, IndexedPaths]
 
 
 @dataclasses.dataclass
@@ -625,8 +689,9 @@ def _initialise_worker(
     samples,
     directory,
     panel_path,
-    reference_path,
-    full_path,
+    axis,
+    full_index,
+    stitched_indexes,
     catalog,
     labels,
     runs,
@@ -634,25 +699,16 @@ def _initialise_worker(
 ):
     global _worker
     _serial_helpers(helpers)
-    reference = tskit.load(reference_path)
-    identities = [
-        (row["source"], row["sample_id"], row["ploidy_index"]) for row in labels
-    ]
-    full = read_paths(full_path, reference, identities)
-    stitched = {
-        run.min_focal_region_size: read_paths(run.stitched, reference, identities)
-        for run in runs
-    }
     _worker = WorkerData(
         samples,
         directory,
         panel_path,
         greedy.make_state(catalog),
-        SiteAxis.from_reference(reference),
+        axis,
         labels,
         runs,
-        full,
-        stitched,
+        full_index.open(),
+        {minimum: index.open() for minimum, index in stitched_indexes.items()},
     )
 
 
@@ -679,12 +735,12 @@ def _analyse_chunk(chunk):
             order = greedy.candidates(haplotype, state.exact)
             label = state.labels[index]
             key = (label["source"], label["sample_id"], label["ploidy_index"])
-            full_path = state.full[key]
+            full_path = state.full[index]
             full = full_path.parents_at_sites(state.axis.positions)
             for run in state.runs:
                 minimum = run.min_focal_region_size
                 mask = mask_runs(state.exact, order, minimum, start, end)
-                stitched_path = state.stitched[minimum][key]
+                stitched_path = state.stitched[minimum][index]
                 stitched = stitched_path.parents_at_sites(state.axis.positions)
                 analysis = comparison_metrics(
                     full, stitched, full_path, stitched_path, mask, state.axis
@@ -1086,99 +1142,119 @@ def run(config, workers):
                 "reference_inference_intervals": axis.inference_intervals.tolist(),
             }
         )
-        for af in utils.parameter_values(config["af_cutoff"]):
-            runs = [
-                item
-                for item in products.runs
-                if item.dataset == dataset["name"] and item.af_cutoff == af
-            ]
-            logger.info(
-                "Diagnostics %s AF=%s with %d workers", dataset["name"], af, workers
+        identities = [(job.source, job.sample_id, job.ploidy_index) for job in jobs]
+        with tempfile.TemporaryDirectory(
+            dir=temp_dir, prefix="diagnostics_dataset_"
+        ) as dataset_temporary:
+            dataset_directory = pathlib.Path(dataset_temporary)
+            full_index = prepare_paths(
+                full_path, reference, identities, dataset_directory / "full"
             )
-            with tempfile.TemporaryDirectory(
-                dir=temp_dir, prefix="diagnostics_"
-            ) as temporary:
-                directory = pathlib.Path(temporary)
-                catalog = haplotypes.prepare_reference(
-                    native.ancestors[0].path,
-                    samples,
-                    reference,
-                    af,
-                    config.get("focal_choice", "left"),
-                    directory,
-                )
-                results = {
-                    item.min_focal_region_size: [None] * len(jobs) for item in runs
-                }
-                with cf.ProcessPoolExecutor(
-                    max_workers=workers,
-                    mp_context=mp.get_context("spawn"),
-                    initializer=_initialise_worker,
-                    initargs=(
-                        samples,
-                        directory,
-                        native.ancestors[0].path,
-                        inputs.reference,
-                        full_path,
-                        catalog,
-                        labels,
-                        runs,
-                        config["helper_threads"],
-                    ),
-                ) as pool:
-                    chunks = haplotypes.reference_chunks(
-                        native.ancestors[0].path, catalog
-                    )
-                    for _ in pool.map(_pack_chunk, chunks):
-                        pass
-                    for chunk_results in pool.map(_analyse_chunk, samples.chunks):
-                        for result in chunk_results:
-                            results[result.minimum][result.index] = result
-                rows, lengths, summaries = [], [], []
-                for item in runs:
-                    selected = results[item.min_focal_region_size]
-                    if any(result is None for result in selected):
-                        raise RuntimeError(
-                            "Diagnostics did not return every selected haplotype"
-                        )
-                    _save_mask(
-                        item.mask,
-                        selected,
-                        jobs,
-                        len(axis.positions),
-                        item,
-                        config.get("focal_choice", "left"),
-                    )
-                    run_rows = [result.row for result in selected]
-                    rows.extend(run_rows)
-                    lengths.extend(
-                        region for result in selected for region in result.regions
-                    )
-                    summaries.append(_summary(run_rows))
-                region_fields = [
-                    "dataset",
-                    "af_cutoff",
-                    "min_focal_region_size",
-                    "source",
-                    "sample_id",
-                    "ploidy_index",
-                    "population",
-                    "region_index",
-                    "is_gap",
-                    "left_site_index",
-                    "right_site_index",
-                    "num_sites",
-                    "left_bp",
-                    "right_bp",
-                    "span_bp",
+            for af in utils.parameter_values(config["af_cutoff"]):
+                runs = [
+                    item
+                    for item in products.runs
+                    if item.dataset == dataset["name"] and item.af_cutoff == af
                 ]
-                _write_rows(products.tables[0], rows, list(rows[0]), not first_pair)
-                _write_rows(products.tables[1], lengths, region_fields, not first_pair)
-                _write_rows(
-                    products.tables[2], summaries, list(summaries[0]), not first_pair
+                logger.info(
+                    "Diagnostics %s AF=%s with %d workers", dataset["name"], af, workers
                 )
-                first_pair = False
-                del results, selected, rows, lengths, summaries
+                with tempfile.TemporaryDirectory(
+                    dir=dataset_directory, prefix="diagnostics_af_"
+                ) as temporary:
+                    directory = pathlib.Path(temporary)
+                    stitched_indexes = {
+                        item.min_focal_region_size: prepare_paths(
+                            item.stitched,
+                            reference,
+                            identities,
+                            directory / f"stitched_{item.min_focal_region_size}",
+                        )
+                        for item in runs
+                    }
+                    catalog = haplotypes.prepare_reference(
+                        native.ancestors[0].path,
+                        samples,
+                        reference,
+                        af,
+                        config.get("focal_choice", "left"),
+                        directory,
+                    )
+                    results = {
+                        item.min_focal_region_size: [None] * len(jobs) for item in runs
+                    }
+                    with cf.ProcessPoolExecutor(
+                        max_workers=workers,
+                        mp_context=mp.get_context("spawn"),
+                        initializer=_initialise_worker,
+                        initargs=(
+                            samples,
+                            directory,
+                            native.ancestors[0].path,
+                            axis,
+                            full_index,
+                            stitched_indexes,
+                            catalog,
+                            labels,
+                            runs,
+                            config["helper_threads"],
+                        ),
+                    ) as pool:
+                        chunks = haplotypes.reference_chunks(
+                            native.ancestors[0].path, catalog
+                        )
+                        for _ in pool.map(_pack_chunk, chunks):
+                            pass
+                        for chunk_results in pool.map(_analyse_chunk, samples.chunks):
+                            for result in chunk_results:
+                                results[result.minimum][result.index] = result
+                    rows, lengths, summaries = [], [], []
+                    for item in runs:
+                        selected = results[item.min_focal_region_size]
+                        if any(result is None for result in selected):
+                            raise RuntimeError(
+                                "Diagnostics did not return every selected haplotype"
+                            )
+                        _save_mask(
+                            item.mask,
+                            selected,
+                            jobs,
+                            len(axis.positions),
+                            item,
+                            config.get("focal_choice", "left"),
+                        )
+                        run_rows = [result.row for result in selected]
+                        rows.extend(run_rows)
+                        lengths.extend(
+                            region for result in selected for region in result.regions
+                        )
+                        summaries.append(_summary(run_rows))
+                    region_fields = [
+                        "dataset",
+                        "af_cutoff",
+                        "min_focal_region_size",
+                        "source",
+                        "sample_id",
+                        "ploidy_index",
+                        "population",
+                        "region_index",
+                        "is_gap",
+                        "left_site_index",
+                        "right_site_index",
+                        "num_sites",
+                        "left_bp",
+                        "right_bp",
+                        "span_bp",
+                    ]
+                    _write_rows(products.tables[0], rows, list(rows[0]), not first_pair)
+                    _write_rows(
+                        products.tables[1], lengths, region_fields, not first_pair
+                    )
+                    _write_rows(
+                        products.tables[2], summaries, list(summaries[0]), not first_pair
+                    )
+                    first_pair = False
+                    del results, selected, rows, lengths, summaries
     population_fields = [
         "dataset",
         "source",
