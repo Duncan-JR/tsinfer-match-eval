@@ -451,12 +451,12 @@ def _create_sample_nodes(tables, jobs):
 
 def append_result(tables, child, result, allele_mapper):
     """Narrow local append contract for pre-created nodes and numeric results."""
-    for left, right, parent in zip(
-        result.left, result.right, result.parent, strict=True
-    ):
-        tables.edges.add_row(
-            left=float(left), right=float(right), parent=int(parent), child=child
-        )
+    tables.edges.append_columns(
+        left=result.left,
+        right=result.right,
+        parent=result.parent,
+        child=np.full(len(result.left), child, dtype=np.int32),
+    )
     states = allele_mapper.decode_mutations(result.mutation_site, result.mutation_code)
     for site, state in zip(result.mutation_site, states, strict=True):
         tables.mutations.add_row(site=int(site), node=child, derived_state=state)
