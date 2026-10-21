@@ -3,7 +3,7 @@ data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
 af_cutoff: 0.03
-min_focal_region_size: 1
+min_region_size_kb: 0
 hmm:
   recombination: 0.01
   mismatch: 1.0e-20

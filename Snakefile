@@ -10,7 +10,7 @@ configfile: "config.yaml"
 utils.validate_config(config)
 focal_choice = config.get("focal_choice", "left")
 af_cutoffs = utils.parameter_values(config["af_cutoff"])
-min_focal_region_sizes = utils.parameter_values(config["min_focal_region_size"])
+min_region_sizes_kb = utils.parameter_values(config["min_region_size_kb"])
 helpers = config["helper_threads"]
 utils.configure_helpers(helpers)
 
@@ -25,7 +25,7 @@ for dataset in datasets.values():
             sample_ids = [sample_id for row in csv.reader(sample_file) for sample_id in row]
         dataset["samples"] = ",".join(sample_ids)
 names = list(datasets)
-parameter_dir = pathlib.Path("af_{af_cutoff}") / "min_region_{min_focal_region_size}"
+parameter_dir = pathlib.Path("af_{af_cutoff}") / "min_region_kb_{min_region_size_kb}"
 greedy_dir = data_dir / "matches" / parameter_dir
 greedy_log_dir = progress_dir / "match_stitched_samples" / parameter_dir
 
@@ -38,7 +38,7 @@ def panel_config(wildcards):
 wildcard_constraints:
     kind="inferred|true",
     af_cutoff="|".join(re.escape(str(value)) for value in af_cutoffs),
-    min_focal_region_size="|".join(str(value) for value in min_focal_region_sizes),
+    min_region_size_kb="|".join(re.escape(str(value)) for value in min_region_sizes_kb),
 
 
 inventory = diagnostics.inventory(config)
@@ -219,7 +219,7 @@ rule match_stitched_samples:
         trees=greedy_dir / "{name}_inferred_greedy_samples_raw.trees",
     params:
         af_cutoff=lambda wildcards: float(wildcards.af_cutoff),
-        min_focal_region_size=lambda wildcards: int(wildcards.min_focal_region_size),
+        min_region_size_kb=lambda wildcards: float(wildcards.min_region_size_kb),
         focal_choice=focal_choice,
         workers=config["matching_threads"],
         sample_prefetch_chunks=config["sample_prefetch_chunks"],
@@ -236,7 +236,7 @@ rule match_stitched_samples:
             raise ValueError(f"Greedy matching needs {required} CPUs including helpers; got {threads}")
         matching.match_stitched_samples(
             pathlib.Path(input.config), pathlib.Path(input.reference), pathlib.Path(output.trees),
-            af_cutoff=params.af_cutoff, min_focal_region_size=params.min_focal_region_size,
+            af_cutoff=params.af_cutoff, min_region_size_kb=params.min_region_size_kb,
             focal_choice=params.focal_choice, workers=params.workers,
             sample_prefetch_chunks=params.sample_prefetch_chunks,
             max_pending_haplotypes=params.max_pending_haplotypes,

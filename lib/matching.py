@@ -529,7 +529,7 @@ def match_stitched_samples(
     output_path: pathlib.Path,
     *,
     af_cutoff: float,
-    min_focal_region_size: int,
+    min_region_size_kb: float,
     workers: int,
     sample_prefetch_chunks: int,
     max_pending_haplotypes: int | None,
@@ -571,8 +571,26 @@ def match_stitched_samples(
         jobs.sort(key=lambda job: job.haplotype_index)
         if len(jobs) == 0 or reference.num_sites == 0:
             raise ValueError("Matching requires samples and reference sites")
+        min_focal_region_size = utils.min_region_size_sites(
+            reference.sites_position, min_region_size_kb
+        )
+        logger.info(
+            "Minimum connected focal region: %s kb resolves to %d inference sites",
+            min_region_size_kb,
+            min_focal_region_size,
+        )
         samples = haplotypes.prepare_samples(cfg.sources["samples"], reference, jobs)
         tables = reference.dump_tables()
+        metadata = tables.metadata
+        metadata["match_eval"] = {
+            "af_cutoff": af_cutoff,
+            "min_region_size_kb": min_region_size_kb,
+            "min_focal_region_size": min_focal_region_size,
+            "focal_choice": focal_choice,
+        }
+        tables.metadata = metadata
+        if collector is not None:
+            collector.count(min_focal_region_size=min_focal_region_size)
         if [row.metadata for row in tables.individuals] != individuals:
             raise ValueError(
                 "Reference individuals disagree with selected sample metadata"

@@ -39,9 +39,10 @@ class Run:
 
     dataset: str
     af_cutoff: float
-    min_focal_region_size: int
+    min_region_size_kb: float
     stitched: pathlib.Path
     mask: pathlib.Path
+    min_focal_region_size: int | None = None
 
 
 @dataclasses.dataclass
@@ -68,8 +69,8 @@ def inventory(config):
         full.append(root / "matches" / f"{name}_inferred_samples_raw.trees")
         sites.append(directory / f"{name}_sites.npz")
         for af in utils.parameter_values(config["af_cutoff"]):
-            for minimum in utils.parameter_values(config["min_focal_region_size"]):
-                parameters = pathlib.Path(f"af_{af}") / f"min_region_{minimum}"
+            for minimum in utils.parameter_values(config["min_region_size_kb"]):
+                parameters = pathlib.Path(f"af_{af}") / f"min_region_kb_{minimum}"
                 stitched = root / "matches" / parameters
                 mask = root / "focal_masks" / parameters
                 runs.append(
@@ -218,6 +219,7 @@ class FocalMask:
     domain_end: np.ndarray
     num_sites: int
     af_cutoff: float
+    min_region_size_kb: float
     min_focal_region_size: int
     focal_choice: str
 
@@ -666,13 +668,13 @@ class WorkerData:
     labels: list[dict]
     runs: list[Run]
     full: IndexedPaths
-    stitched: dict[int, IndexedPaths]
+    stitched: dict[float, IndexedPaths]
 
 
 @dataclasses.dataclass
 class HaplotypeDiagnostic:
     index: int
-    minimum: int
+    min_region_size_kb: float
     mask: MaskRuns
     row: dict
     regions: list[dict]
@@ -751,7 +753,7 @@ def _analyse_haplotype(task):
         for run in state.runs:
             minimum = run.min_focal_region_size
             mask = mask_runs(state.exact, order, minimum, start, end)
-            stitched_path = state.stitched[minimum][index]
+            stitched_path = state.stitched[run.min_region_size_kb][index]
             stitched = stitched_path.parents_at_sites(state.axis.positions)
             analysis = comparison_metrics(
                 full, stitched, full_support, stitched_path, mask, state.axis
@@ -759,6 +761,7 @@ def _analyse_haplotype(task):
             identity = {
                 "dataset": run.dataset,
                 "af_cutoff": run.af_cutoff,
+                "min_region_size_kb": run.min_region_size_kb,
                 "min_focal_region_size": minimum,
                 "source": label["source"],
                 "sample_id": label["sample_id"],
@@ -768,7 +771,7 @@ def _analyse_haplotype(task):
             results.append(
                 HaplotypeDiagnostic(
                     index,
-                    minimum,
+                    run.min_region_size_kb,
                     mask,
                     {**identity, **analysis.metrics},
                     [{**identity, **region} for region in analysis.regions],
@@ -811,6 +814,7 @@ def _save_mask(path, results, jobs, num_sites, run, focal_choice):
         np.asarray([mask.end for mask in masks], dtype=np.int64),
         num_sites,
         run.af_cutoff,
+        run.min_region_size_kb,
         run.min_focal_region_size,
         focal_choice,
     )
@@ -822,7 +826,13 @@ def _summary(rows):
     frame = pd.DataFrame(rows)
     first = rows[0]
     result = {
-        key: first[key] for key in ("dataset", "af_cutoff", "min_focal_region_size")
+        key: first[key]
+        for key in (
+            "dataset",
+            "af_cutoff",
+            "min_region_size_kb",
+            "min_focal_region_size",
+        )
     }
     result["num_haplotypes"] = len(rows)
     result["num_samples"] = len(frame[["source", "sample_id"]].drop_duplicates())
@@ -833,6 +843,7 @@ def _summary(rows):
     identity_fields = {
         "dataset",
         "af_cutoff",
+        "min_region_size_kb",
         "min_focal_region_size",
         "source",
         "sample_id",
@@ -1002,6 +1013,7 @@ def _archive_manifest(config, products, datasets, workers):
                 entry["runs"].append(
                     {
                         "af_cutoff": run.af_cutoff,
+                        "min_region_size_kb": run.min_region_size_kb,
                         "min_focal_region_size": run.min_focal_region_size,
                         "stitched": add(run.stitched, relative.as_posix(), True),
                         "mask": add(run.mask, relative_mask.as_posix()),
@@ -1062,6 +1074,7 @@ def _compress_tree(task):
 
 def package_archive(files, archive, workers, helpers):
     """Stage unique tszipped trees, then stream tar through level-1 pigz."""
+    started = time.perf_counter()
     pigz = shutil.which("pigz")
     if pigz is None:
         raise RuntimeError(
@@ -1075,14 +1088,38 @@ def package_archive(files, archive, workers, helpers):
             trees = [
                 (item.source, staging / item.archive) for item in files if item.tree
             ]
+            logger.info(
+                "Compressing %d unique trees with tszip using up to %d workers",
+                len(trees),
+                workers,
+            )
             with cf.ProcessPoolExecutor(
                 max_workers=workers,
                 mp_context=mp.get_context("spawn"),
                 initializer=_serial_helpers,
                 initargs=(helpers,),
             ) as pool:
-                for _ in pool.map(_compress_tree, trees):
-                    pass
+                futures = {
+                    pool.submit(_compress_tree, task): task[1].relative_to(staging)
+                    for task in trees
+                }
+                completed = 0
+                for future in cf.as_completed(futures):
+                    future.result()
+                    completed += 1
+                    logger.info(
+                        "Tree compression %d/%d complete: %s",
+                        completed,
+                        len(trees),
+                        futures[future],
+                    )
+            logger.info(
+                "Tree compression complete; streaming %d files through pigz "
+                "(%d threads, level 1) into %s",
+                len(files),
+                workers,
+                archive,
+            )
             with temporary.open("wb") as output, tempfile.TemporaryFile() as errors:
                 with subprocess.Popen(
                     [pigz, "-p", str(workers), "-1"],
@@ -1093,9 +1130,16 @@ def package_archive(files, archive, workers, helpers):
                     pipe_error = None
                     try:
                         with tarfile.open(fileobj=compressor.stdin, mode="w|") as tar:
-                            for item in files:
+                            for index, item in enumerate(files, start=1):
                                 source = (
                                     staging / item.archive if item.tree else item.source
+                                )
+                                logger.info(
+                                    "Archiving file %d/%d: %s (%d bytes)",
+                                    index,
+                                    len(files),
+                                    item.archive,
+                                    source.stat().st_size,
                                 )
                                 tar.add(source, arcname=item.archive, recursive=False)
                     except BrokenPipeError as error:
@@ -1105,6 +1149,7 @@ def package_archive(files, archive, workers, helpers):
                             compressor.stdin.close()
                         except BrokenPipeError as error:
                             pipe_error = error
+                    logger.info("Tar stream written; waiting for pigz to finish")
                     status = compressor.wait()
                     if status != 0:
                         errors.seek(0)
@@ -1112,7 +1157,14 @@ def package_archive(files, archive, workers, helpers):
                         raise RuntimeError(f"pigz exited {status}: {message}")
                     if pipe_error is not None:
                         raise pipe_error
+            logger.info("Tar/pigz finished; removing staged tszip files")
         temporary.replace(archive)
+        logger.info(
+            "Archive complete: %s (%d bytes), compression/packaging took %.1fs",
+            archive,
+            archive.stat().st_size,
+            time.perf_counter() - started,
+        )
     finally:
         temporary.unlink(missing_ok=True)
 
@@ -1143,6 +1195,11 @@ def run(config, workers):
         cfg = matching._sample_config(inputs.config, inputs.reference, full_path)
         reference = tskit.load(inputs.reference)
         axis = SiteAxis.from_reference(reference)
+        for item in products.runs:
+            if item.dataset == dataset["name"]:
+                item.min_focal_region_size = utils.min_region_size_sites(
+                    axis.positions, item.min_region_size_kb
+                )
         jobs, _, _ = tsinfer.pipeline._build_jobs_with_metadata(
             cfg, axis.positions.astype(np.int32)
         )
@@ -1196,11 +1253,11 @@ def run(config, workers):
                 ) as temporary:
                     directory = pathlib.Path(temporary)
                     stitched_indexes = {
-                        item.min_focal_region_size: prepare_paths(
+                        item.min_region_size_kb: prepare_paths(
                             item.stitched,
                             reference,
                             identities,
-                            directory / f"stitched_{item.min_focal_region_size}",
+                            directory / f"stitched_kb_{item.min_region_size_kb}",
                         )
                         for item in runs
                     }
@@ -1214,7 +1271,7 @@ def run(config, workers):
                         directory,
                     )
                     results = {
-                        item.min_focal_region_size: [None] * len(jobs) for item in runs
+                        item.min_region_size_kb: [None] * len(jobs) for item in runs
                     }
                     decoding_s = 0.0
                     analysis_s = 0.0
@@ -1261,7 +1318,8 @@ def run(config, workers):
                                 _analyse_haplotype, tasks, chunksize=1
                             ):
                                 for result in haplotype_results:
-                                    results[result.minimum][result.index] = result
+                                    minimum_results = results[result.min_region_size_kb]
+                                    minimum_results[result.index] = result
                             analysis_s += time.perf_counter() - started
                             for slab in slabs:
                                 slab.calls.path.unlink()
@@ -1275,7 +1333,7 @@ def run(config, workers):
                     writing_started = time.perf_counter()
                     rows, lengths, summaries = [], [], []
                     for item in runs:
-                        selected = results[item.min_focal_region_size]
+                        selected = results[item.min_region_size_kb]
                         if any(result is None for result in selected):
                             raise RuntimeError(
                                 "Diagnostics did not return every selected haplotype"
@@ -1297,6 +1355,7 @@ def run(config, workers):
                     region_fields = [
                         "dataset",
                         "af_cutoff",
+                        "min_region_size_kb",
                         "min_focal_region_size",
                         "source",
                         "sample_id",

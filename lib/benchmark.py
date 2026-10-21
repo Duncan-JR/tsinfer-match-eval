@@ -75,7 +75,7 @@ def required_allocation(config):
 def validate_config(config, allocation):
     """Validate performance settings at the suite entry point."""
     utils.validate_config(config)
-    for name in ("af_cutoff", "min_focal_region_size"):
+    for name in ("af_cutoff", "min_region_size_kb"):
         if isinstance(config[name], list):
             raise ValueError(f"Performance trials require a scalar {name}")
     settings = config["performance"]
@@ -265,7 +265,7 @@ def trial(spec_path):
             temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
             kwargs = {
                 "af_cutoff": config["af_cutoff"],
-                "min_focal_region_size": config["min_focal_region_size"],
+                "min_region_size_kb": config["min_region_size_kb"],
                 "focal_choice": config.get("focal_choice", "left"),
                 "workers": workers,
                 "helper_threads": config["helper_threads"],

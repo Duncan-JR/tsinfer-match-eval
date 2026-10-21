@@ -169,8 +169,28 @@ def parameter_values(value):
     return value if isinstance(value, list) else [value]
 
 
+def min_region_size_sites(sites_position, min_region_size_kb):
+    """Convert kb to a rounded mean inference-site count, with a minimum of one.
+
+    Use the observed first-to-last site span rather than the retained chromosome
+    length. The exact-cover implementation still filters connected unions in
+    site units; this is a genome-wide mean conversion, not a local bp filter.
+    """
+    if len(sites_position) < 2:
+        raise ValueError("Converting min_region_size_kb requires at least two sites")
+    span_bp = float(sites_position[-1] - sites_position[0])
+    sites_per_kb = len(sites_position) * 1000 / span_bp
+    minimum = round(min_region_size_kb * sites_per_kb)
+    return max(1, minimum)
+
+
 def validate_config(config):
     """Validate workflow settings and optional parameter grid axes."""
+    if "min_focal_region_size" in config:
+        raise ValueError(
+            "Replace min_focal_region_size with min_region_size_kb; "
+            "the configured minimum is now in kb, not inference sites"
+        )
     config_name = config["config_name"]
     if (
         not isinstance(config_name, str)
@@ -181,7 +201,7 @@ def validate_config(config):
         )
     if config.get("focal_choice", "left") not in ("left", "right"):
         raise ValueError("focal_choice must be left or right")
-    for name in ("af_cutoff", "min_focal_region_size"):
+    for name in ("af_cutoff", "min_region_size_kb"):
         values = parameter_values(config[name])
         if len(values) == 0:
             raise ValueError(f"{name} must contain at least one value")
@@ -189,9 +209,9 @@ def validate_config(config):
             if name == "af_cutoff":
                 if type(value) not in (int, float) or not 0 <= value <= 1:
                     raise ValueError("af_cutoff values must be numbers between 0 and 1")
-            elif type(value) is not int or value < 1:
+            elif type(value) not in (int, float) or not np.isfinite(value) or value < 0:
                 raise ValueError(
-                    "min_focal_region_size values must be positive integers"
+                    "min_region_size_kb values must be finite nonnegative numbers"
                 )
         if len(set(values)) != len(values):
             raise ValueError(f"{name} must not contain duplicates")

@@ -18,7 +18,7 @@ uv run snakemake --dry-run --cores all
 uv run snakemake --cores all
 ```
 
-`af_cutoff` and `min_focal_region_size` accept a scalar or a list. The default
+`af_cutoff` and `min_region_size_kb` accept a scalar or a list. The default
 target runs their Cartesian product, sharing annotated samples, ancestor panels,
 references and one full-HMM baseline per dataset. Use separate output directories
 when changing inputs or HMM settings. Logs record the actual tsinfer revision.
@@ -39,10 +39,14 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    Each worker matches one complete haplotype. A derived sample seed activates
    its ancestor; extend exactly in both directions until mismatch, missing call,
    support end or inference boundary. Different ancestors may share a seed.
-6. Stable-sort intervals by left bound and repeatedly copy the interval reaching
-   furthest from the current cursor. Filter complete connected unions by their
-   inference-site count, including touching intervals. Short intervals can bridge
-   a retained union. Equal reaches keep the first interval in stable panel order.
+6. Convert `min_region_size_kb` once per matching run to a rounded mean site
+   count: `max(1, round(kb * 1000 * num_sites / (last_position - first_position)))`,
+   using the reference's `sites_position` array. Stable-sort intervals by left
+   bound and repeatedly copy the interval reaching furthest from the current
+   cursor. Filter complete connected unions by that site count, including
+   touching intervals. Short intervals can bridge a retained union. Equal
+   reaches keep the first interval in stable panel order. This wrapper uses
+   genome-wide mean density, rather than checking each union's physical length.
 7. Match uncovered gaps independently with the full HMM, splitting calls at
    inference boundaries. Append completed results immediately, squash adjacent
    equal-parent/child edges once, then finalise and sort tables.
@@ -73,7 +77,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
 | `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
-| `min_focal_region_size` | Positive integer or nonempty list of distinct positive integers; minimum inference sites in a complete touching union. `1` keeps all. These are site counts, not base pairs. |
+| `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. Replace the old `min_focal_region_size` config key rather than reusing its site-count values as kb. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.mismatch` | HMM mismatch probability, strictly between 0 and 1. Exact focal copying always allows zero mismatches. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
@@ -116,22 +120,22 @@ Coordinates remain absolute when selecting a region. Main products are:
 - `configs/{name}_ancestor_inference.toml`: native inference/matching config.
 - `ancestors/{name}_inferred_ancestors.zarr` and `.trees`: panel and raw reference.
 - `matches/{name}_inferred_samples_raw.trees`: native full-HMM baseline.
-- `matches/af_{af_cutoff}/min_region_{min_focal_region_size}/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples for each parameter pair.
+- `matches/af_{af_cutoff}/min_region_kb_{min_region_size_kb}/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples for each parameter pair.
 
-`config.yaml.hpc_params1` selects the 10 Mb simulated n=300 and n=3000 cohorts
-from `../tsinfer-anc-eval/config.yaml.matching`. It runs AF cutoffs
-`[0.01, 0.03, 0.05]` and minimum sizes `[1, 100, 300, 1000]`: 24 greedy outputs
-plus two full-HMM baselines. With `TMPDIR` set to node-local scratch inside the
-196-CPU, 1024-GB allocation, run:
+Each greedy tree stores the requested kb minimum and resolved site count in
+`ts.metadata["match_eval"]["min_region_size_kb"]` and
+`ts.metadata["match_eval"]["min_focal_region_size"]`, alongside AF and focal
+choice. Logs and greedy benchmark workload records also report the site count.
 
-```sh
-uv run snakemake all --configfile config.yaml.hpc_params1 --cores 196
+For a parameter search, configure for example:
+
+```yaml
+af_cutoff: [0.01, 0.03, 0.05]
+min_region_size_kb: [0, 50, 100, 200]
 ```
 
-It uses 48 matching workers per job, allowing two greedy jobs to run concurrently
-within their helper-inclusive CPU reservations. `performance: null` disables the
-benchmark target, including any performance settings inherited from `config.yaml`.
-Ordinary matching does not collect benchmark timings or memory samples.
+`performance: null` disables the benchmark target. Ordinary matching does not
+collect benchmark timings or memory samples.
 
 ## Diagnostics
 
@@ -139,7 +143,7 @@ Ordinary matching writes raw trees only. Reconstruct focal masks and compare raw
 copying parents across the configured dataset/AF/minimum grid explicitly:
 
 ```sh
-uv run snakemake diagnostics --configfile config.yaml.hpc_params1 --cores 196
+uv run snakemake diagnostics --cores all
 ```
 
 Install `pigz` on PATH and sync the Python dependencies (including `tszip`). The
@@ -157,7 +161,7 @@ Outputs under `{data_dir}/diagnostics/{config_name}/` are:
 
 | File | Schema/content |
 | --- | --- |
-| `haplotype_results.csv` | Keys `dataset, af_cutoff, min_focal_region_size, source, sample_id, ploidy_index`; original `population`; domain/evaluated/excluded/unmatched site counts; full/stitched total and focal/gap/seam switches; disagreement counts, agreement percentages and `parents_identical`; focal/gap/unmatched bp spans and coverage percentages. |
+| `haplotype_results.csv` | Keys `dataset, af_cutoff, min_region_size_kb, source, sample_id, ploidy_index`; resolved integer `min_focal_region_size`; original `population`; domain/evaluated/excluded/unmatched site counts; full/stitched total and focal/gap/seam switches; disagreement counts, agreement percentages and `parents_identical`; focal/gap/unmatched bp spans and coverage percentages. |
 | `region_lengths.csv` | The same keys/population, mask `region_index`, `is_gap`, half-open site-index bounds, `num_sites`, clipped `left_bp`, `right_bp`, and `span_bp`. Regions split at excluded or unmatched physical intervals. |
 | `run_summary.csv` | One row per grid run: sample/haplotype and empty-region counts; per-haplotype metric `_mean`, `_sem`, `_count`; explicit `_undefined_count` for percentages/fractions. |
 | `sample_populations.csv` | Selected roster keyed by dataset/source/sample/ploidy, original population, and available `truth_node_id`, `truth_individual_id`, `population_id`. |
@@ -165,10 +169,11 @@ Outputs under `{data_dir}/diagnostics/{config_name}/` are:
 | `config.yaml`, `manifest.json` | Effective config, run/file map, cohort and population provenance, observed extents, and explicitly labelled diagnostics-time versions/revisions. |
 
 Masks are ordinary NPZ files at
-`focal_masks/af_{af_cutoff}/min_region_{min_focal_region_size}/{name}_focal_mask.npz`.
+`focal_masks/af_{af_cutoff}/min_region_kb_{min_region_size_kb}/{name}_focal_mask.npz`.
 Each contains canonical `source`, `sample_id`, `ploidy_index`, ragged `offsets`,
 flat `left_site_index`, `right_site_index`, `is_gap`, per-haplotype `domain_start`
-and `domain_end`, plus `num_sites`, `af_cutoff`, `min_focal_region_size` and
+and `domain_end`, plus `num_sites`, `af_cutoff`, `min_region_size_kb`, the resolved
+`min_focal_region_size` and
 `focal_choice`. Bounds are half-open on the original inference-site axis;
 `is_gap=True` excludes focal coverage. Load NPZs with `allow_pickle=False`.
 
