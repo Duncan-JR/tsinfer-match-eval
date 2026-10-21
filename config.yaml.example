@@ -1,9 +1,9 @@
+config_name: example
 data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
 af_cutoff: 0.03
 min_focal_region_size: 1
-path_output: false
 hmm:
   recombination: 0.01
   mismatch: 1.0e-20
@@ -12,12 +12,21 @@ datasets:
   - name: out_of_africa_n300_1mbp
     zarr_path: ../tsinfer-anc-eval/data/anc_eval/zarr_vcfs/OutOfAfrica_4J17-chr20-L0-R1e6-n300-s1-rep0-geno-0.0-phase0.0-mispol0.0.zarr
     ts_path: ../tsinfer-anc-eval/data/anc_eval/simulated/OutOfAfrica_4J17-chr20-L0-R1e6-n300-s1-rep0.trees
+    population:
+      source: ts
+      field: name
     ancestral_state:
       field: variant_ancestral_state
 
   - name: tgp_chr20_n100
     zarr_path: ~/work/dphil-analysis/data/zarr_vcfs/tgp/chr20/data.zarr
     ts_path: null
+    population:
+      source: csv
+      path: ~/work/dphil-analysis/data/misc/tgp_3202_pedigree.csv
+      zarr_id_field: sample_id
+      csv_id_field: sample_id
+      field: superpopulation
     ancestral_state:
       field: variant_ancestral_allele
     include: 'POS >= 1000000 & POS < 11000000'

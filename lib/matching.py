@@ -75,7 +75,6 @@ def match_samples(
     config_path: pathlib.Path,
     ancestors_ts_path: pathlib.Path,
     output_path: pathlib.Path,
-    match_file_path: pathlib.Path | None,
     threads: int,
     cache_size: int | None = None,
     read_workers: int | None = None,
@@ -83,22 +82,18 @@ def match_samples(
     """Match samples against the unmodified reference from :func:`match_ancestors`.
 
     Preserve source selection/order and individual metadata so recreated job
-    individual IDs correspond to the reference rows. Native JSONL has one record
-    per haplotype, keyed by (source, sample_id, ploidy_index); parent IDs are raw
-    TS node IDs, joined to panel IDs through node metadata.
+    individual IDs correspond to the reference rows. Raw parent IDs remain
+    available for comparisons through node metadata.
     """
     sample_cfg = _sample_config(config_path, ancestors_ts_path, output_path)
     ts = tsinfer.pipeline.match(
         sample_cfg,
         num_threads=threads,
-        match_file=match_file_path,
         cache_size=cache_size,
         read_workers=read_workers,
     )
     ts.dump(output_path)
-    logger.info(
-        "Wrote raw samples to %s and matches to %s", output_path, match_file_path
-    )
+    logger.info("Wrote raw samples to %s", output_path)
 
 
 @dataclasses.dataclass
@@ -153,26 +148,17 @@ class HaplotypeTask:
 class Worker:
     """One private HMM and reusable numeric scratch per matching process."""
 
-    catalog: haplotypes.ReferenceCatalog
-    packed: np.ndarray
+    exact: greedy.ExactState
     positions: np.ndarray
     sequence_length: float
     boundaries: np.ndarray
     indexes: tsinfer.matching.MatcherIndexes
     matcher: tsinfer.matching.AncestorMatcher
     match_out: np.ndarray
-    candidate_left: np.ndarray
-    candidate_right: np.ndarray
-    candidate_ids: np.ndarray
-    run_left: np.ndarray
-    run_right: np.ndarray
-    run_ids: np.ndarray
 
 
 def make_worker(reference, catalog, num_alleles, parameters):
     """Build native state once and warm the actual read-only Numba signatures."""
-    catalog.make_readonly()
-    packed = catalog.packed.open()
     positions = reference.sites_position.astype(np.int32)
     intervals = np.asarray(reference.metadata["sequence_intervals"])
     boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
@@ -185,22 +171,14 @@ def make_worker(reference, catalog, num_alleles, parameters):
         np.full(len(positions), parameters.mismatch),
         reuse_topology=True,
     )
-    capacity = len(catalog.seeds)
     worker = Worker(
-        catalog,
-        packed,
+        greedy.make_state(catalog),
         positions,
         reference.sequence_length,
         boundaries,
         indexes,
         matcher,
         np.empty(len(positions), dtype=np.int8),
-        np.empty(capacity, dtype=np.int64),
-        np.empty(capacity, dtype=np.int64),
-        np.empty(capacity, dtype=np.int64),
-        np.empty(capacity, dtype=np.int64),
-        np.empty(capacity, dtype=np.int64),
-        np.empty(capacity, dtype=np.int64),
     )
     dummy = np.full(len(positions), -1, dtype=np.int8)
     dummy.flags.writeable = False
@@ -214,33 +192,13 @@ def focal_runs(haplotype, worker, minimum):
     Returned views are consumed within :func:`match_stitched_haplotype`; result
     ownership changes only when the final path is assembled.
     """
-    catalog = worker.catalog
-    count = greedy.extend_exact(
-        haplotype,
-        worker.packed,
-        catalog.seeds,
-        catalog.starts,
-        catalog.stops,
-        catalog.offsets,
-        worker.candidate_left,
-        worker.candidate_right,
-        worker.candidate_ids,
-    )
-    order = np.argsort(worker.candidate_left[:count], kind="stable")
-    written = greedy.cover_components(
-        worker.candidate_left,
-        worker.candidate_right,
-        worker.candidate_ids,
-        order,
-        minimum,
-        worker.run_left,
-        worker.run_right,
-        worker.run_ids,
-    )
+    state = worker.exact
+    order = greedy.candidates(haplotype, state)
+    written = greedy.cover(state, order, minimum)
     return CopyingRuns(
-        worker.run_left[:written],
-        worker.run_right[:written],
-        catalog.parents[worker.run_ids[:written]],
+        state.run_left[:written],
+        state.run_right[:written],
+        state.catalog.parents[state.run_ids[:written]],
     )
 
 
@@ -276,28 +234,15 @@ def _match_gap(haplotype, worker, start, end, blocks, mutations):
 
 
 def _assemble_result(job_index, blocks, mutation_blocks, haplotype, worker, collector):
-    """Merge equal-parent seams and apply the existing site-to-BP conventions."""
+    """Concatenate owned segments and apply the existing site-to-BP conventions."""
     left = np.concatenate([block.left for block in blocks])
     right = np.concatenate([block.right for block in blocks])
     parents = np.concatenate([block.parent for block in blocks])
-    written = 0
-    for current in range(len(parents)):
-        if (
-            written > 0
-            and left[current] == right[written - 1]
-            and parents[current] == parents[written - 1]
-        ):
-            right[written - 1] = right[current]
-        else:
-            left[written] = left[current]
-            right[written] = right[current]
-            parents[written] = parents[current]
-            written += 1
-    bp_left = worker.positions[left[:written]].astype(float)
-    bp_left[left[:written] == 0] = 0
-    bp_right = np.full(written, worker.sequence_length)
-    internal = right[:written] < len(worker.positions)
-    bp_right[internal] = worker.positions[right[:written][internal]]
+    bp_left = worker.positions[left].astype(float)
+    bp_left[left == 0] = 0
+    bp_right = np.full(len(right), worker.sequence_length)
+    internal = right < len(worker.positions)
+    bp_right[internal] = worker.positions[right[internal]]
     sites = np.empty(0, dtype=np.int64)
     if len(mutation_blocks) > 0:
         sites = np.concatenate(mutation_blocks)
@@ -305,7 +250,7 @@ def _assemble_result(job_index, blocks, mutation_blocks, haplotype, worker, coll
         job_index,
         bp_left,
         bp_right,
-        parents[:written].copy(),
+        parents,
         sites,
         haplotype[sites],
         collector,
@@ -426,7 +371,7 @@ def _worker_main(
         events.put(("error", traceback.format_exc()))
     finally:
         if worker is not None:
-            haplotypes.close_mapping(worker.packed)
+            haplotypes.close_mapping(worker.exact.packed)
 
 
 def _watch_workers(processes, events, stopping):
@@ -517,31 +462,6 @@ def append_result(tables, child, result, allele_mapper):
         tables.mutations.add_row(site=int(site), node=child, derived_state=state)
 
 
-def write_result(output, job, result, positions):
-    """Build optional native-shaped JSON only in the output owner."""
-    record = {
-        "group": job.group,
-        "haplotype_index": job.haplotype_index,
-        "source": job.source,
-        "sample_id": job.sample_id,
-        "ploidy_index": job.ploidy_index,
-        "time": job.time,
-        "path": [
-            {"left": float(left), "right": float(right), "parent": int(parent)}
-            for left, right, parent in zip(
-                result.left, result.right, result.parent, strict=True
-            )
-        ],
-        "mutations": [
-            {"position": float(positions[site]), "derived_state": int(code)}
-            for site, code in zip(
-                result.mutation_site, result.mutation_code, strict=True
-            )
-        ],
-    }
-    output.write(json.dumps(record) + "\n")
-
-
 def _coordinate(
     work,
     events,
@@ -549,8 +469,6 @@ def _coordinate(
     tables,
     nodes,
     samples,
-    match_file,
-    positions,
     cap,
     slots,
     collector,
@@ -602,8 +520,6 @@ def _coordinate(
                 append_result(
                     tables, nodes[result.job_index], result, samples.allele_mapper
                 )
-                if match_file is not None:
-                    write_result(match_file, jobs[result.job_index], result, positions)
             if collector is not None and result.measurements is not None:
                 collector.merge(result.measurements)
             pending -= 1
@@ -630,7 +546,6 @@ def match_stitched_samples(
     helper_threads: dict,
     focal_choice: str = "left",
     temp_dir: pathlib.Path | None = None,
-    match_file_path: pathlib.Path | None = None,
     collector: performance.Collector | None = None,
     resident: bool = False,
     window: performance.Window | None = None,
@@ -773,13 +688,7 @@ def match_stitched_samples(
                     args=(samples, directory, slots, stopping, events),
                 )
                 loader.start()
-            with contextlib.ExitStack() as stack:
-                match_file = None
-                if match_file_path is not None:
-                    match_file_path.parent.mkdir(parents=True, exist_ok=True)
-                    match_file = stack.enter_context(match_file_path.open("w"))
-                if window is not None:
-                    stack.enter_context(window)
+            with window if window is not None else contextlib.nullcontext():
                 start_matching.set()
                 _coordinate(
                     work,
@@ -788,14 +697,13 @@ def match_stitched_samples(
                     tables,
                     nodes,
                     samples,
-                    match_file,
-                    positions,
                     max_pending_haplotypes,
                     slots,
                     collector,
                     resident_slabs,
                 )
             with performance.measure(collector, "finalise_output"):
+                tables.edges.squash()
                 ts = tsinfer.matching.finalise_match_tables(tables)
                 ts.dump(output_path)
             success = True

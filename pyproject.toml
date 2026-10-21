@@ -16,6 +16,7 @@ dependencies = [
     "tskit>=1",
     "zarr>=3",
     "numba",
+    "tszip>=0.3.1",
 ]
 
 

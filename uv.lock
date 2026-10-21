@@ -1982,6 +1982,7 @@ dependencies = [
     { name = "tomli-w" },
     { name = "tsinfer" },
     { name = "tskit" },
+    { name = "tszip" },
     { name = "zarr", version = "3.1.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
     { name = "zarr", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
 ]
@@ -2003,6 +2004,7 @@ requires-dist = [
     { name = "tomli-w" },
     { name = "tsinfer", editable = "../tsinfer" },
     { name = "tskit", specifier = ">=1" },
+    { name = "tszip", specifier = ">=0.3.1" },
     { name = "zarr", specifier = ">=3" },
 ]
 
@@ -2044,6 +2046,23 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/6e/5a/b05eab4a4a32bce6a51f991033ed460a836aafc1f406eebc624831558d9b/tskit-1.0.3-cp314-cp314-musllinux_1_2_x86_64.whl", hash = "sha256:2170cacd8ade47fd8f1510aca78549e09e9ba875c25496f0ccfb755e09c0b06b", size = 1377477, upload-time = "2026-05-14T18:20:12.649Z" },
     { url = "https://files.pythonhosted.org/packages/ea/c5/116419617468dc06428e507001d0a7b212116e9e8d336bd8c05a6531b2a0/tskit-1.0.3-cp314-cp314-win32.whl", hash = "sha256:24f8fffc1e1dd4154654e91bb7bac22078b3cadd9837e5c490225aa5c313b819", size = 455586, upload-time = "2026-05-14T18:20:14.165Z" },
     { url = "https://files.pythonhosted.org/packages/6e/7f/61818ed922629178abb07e45439d0af3bb5867b629fe392e9864df58ce5c/tskit-1.0.3-cp314-cp314-win_amd64.whl", hash = "sha256:cbe791757cbd4d060a9c06c270bbcacc932f60ce1d77e98dcea35c931d0b0aa9", size = 505409, upload-time = "2026-05-14T18:20:15.527Z" },
+]
+
+[[package]]
+name = "tszip"
+version = "0.3.1"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "humanize" },
+    { name = "numpy", version = "2.4.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "numpy", version = "2.5.3", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+    { name = "tskit" },
+    { name = "zarr", version = "3.1.6", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version < '3.12'" },
+    { name = "zarr", version = "3.4.0", source = { registry = "https://pypi.org/simple" }, marker = "python_full_version >= '3.12'" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/c1/e0/3a8a016bd344b32542e8f5a0c3c7add4d383c55a3b8f6cc4b5bed253e877/tszip-0.3.1.tar.gz", hash = "sha256:13b847b24a7ac4ce32eac84dcbddbad66cf4ffef83f66a7fa72882383e9e76d8", size = 170688, upload-time = "2026-03-05T09:37:22.744Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/ac/cf/046c626d9d4acc9af08ea2492d9b4ba221a15983abee5db5da2f5d192295/tszip-0.3.1-py3-none-any.whl", hash = "sha256:459ea5d2cf456840c86b6a119f2da7b6e41b09d302169a9ea000ec5bbf6037b2", size = 15591, upload-time = "2026-03-05T09:37:21.161Z" },
 ]
 
 [[package]]

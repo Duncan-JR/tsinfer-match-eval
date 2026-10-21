@@ -3,6 +3,7 @@
 import logging
 import os
 import pathlib
+import re
 import shutil
 import subprocess
 
@@ -170,6 +171,14 @@ def parameter_values(value):
 
 def validate_config(config):
     """Validate workflow settings and optional parameter grid axes."""
+    config_name = config["config_name"]
+    if (
+        not isinstance(config_name, str)
+        or re.fullmatch(r"[a-z0-9]+(?:_[a-z0-9]+)*", config_name) is None
+    ):
+        raise ValueError(
+            "config_name must use lowercase letters, digits and underscores"
+        )
     if config.get("focal_choice", "left") not in ("left", "right"):
         raise ValueError("focal_choice must be left or right")
     for name in ("af_cutoff", "min_focal_region_size"):
@@ -210,8 +219,6 @@ def validate_config(config):
         value = config["helper_threads"][name]
         if type(value) is not int or value < 1:
             raise ValueError(f"helper_threads.{name} must be a positive integer")
-    if type(config["path_output"]) is not bool:
-        raise ValueError("path_output must be a boolean")
     names = [dataset["name"] for dataset in config["datasets"]]
     if len(names) == 0 or len(set(names)) != len(names):
         raise ValueError("datasets must have distinct names")

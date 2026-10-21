@@ -2,7 +2,6 @@
 
 import argparse
 import concurrent.futures as cf
-import contextlib
 import csv
 import dataclasses
 import hashlib
@@ -56,6 +55,15 @@ def prepared_inputs(config, dataset):
 
 def output_directory(config):
     return pathlib.Path("data/performance") / config["performance"]["experiment_id"]
+
+
+def final_products(config):
+    """The suite's declared completion products, shared with diagnostics."""
+    products = ["manifest.json", "runs.csv", "stages.csv", "complete.json"]
+    if config["performance"]["quality_checks"]:
+        products.append("quality.json")
+    directory = output_directory(config)
+    return [directory / product for product in products]
 
 
 def required_allocation(config):
@@ -159,7 +167,7 @@ def _native_reader(cfg, reference, jobs, cache_size, workers):
     )
 
 
-def _resident_full_hmm(paths, dataset, output, matches, workers, window):
+def _resident_full_hmm(paths, dataset, output, workers, window):
     """Native HMM baseline with decoded input and indexes outside its window."""
     cfg = matching._sample_config(paths.config, paths.reference, output)
     reference = tskit.load(paths.reference)
@@ -222,16 +230,8 @@ def _resident_full_hmm(paths, dataset, output, matches, workers, window):
             results = [result for future in futures for result in future.result()]
     tables = reference.dump_tables()
     nodes = matching._create_sample_nodes(tables, jobs)
-    with contextlib.ExitStack() as stack:
-        match_file = (
-            stack.enter_context(matches.open("w")) if matches is not None else None
-        )
-        for result in results:
-            matching.append_result(tables, nodes[result.job_index], result, mapper)
-            if match_file is not None:
-                matching.write_result(
-                    match_file, jobs[result.job_index], result, reference.sites_position
-                )
+    for result in results:
+        matching.append_result(tables, nodes[result.job_index], result, mapper)
     tsinfer.matching.finalise_match_tables(tables).dump(output)
 
 
@@ -250,7 +250,6 @@ def trial(spec_path):
         )
         paths = prepared_inputs(config, dataset)
         output = folder / "samples_raw.trees"
-        matches = folder / "samples_matches.jsonl" if config["path_output"] else None
         workers = run["requested_workers"]
         if run["mode"] == "resident_match":
             cfg = matching._sample_config(paths.config, paths.reference, output)
@@ -275,7 +274,6 @@ def trial(spec_path):
                 "temp_dir": None
                 if temp_parent is None
                 else pathlib.Path(temp_parent).expanduser(),
-                "match_file_path": matches,
                 "collector": collector,
             }
             if run["mode"] == "from_reference":
@@ -298,13 +296,12 @@ def trial(spec_path):
                     paths.config,
                     paths.reference,
                     output,
-                    matches,
                     workers,
                     dataset.get("matching_cache_size"),
                     read_workers=1,
                 )
         else:
-            _resident_full_hmm(paths, dataset, output, matches, workers, window)
+            _resident_full_hmm(paths, dataset, output, workers, window)
         if run["method"] == "full_hmm":
             matched_ts = tskit.load(output)
             reference = tskit.load(paths.reference)
@@ -674,7 +671,7 @@ def _write_csv(path, rows, default_fields=None):
 
 
 def quality_check(config, dataset_name, folder):
-    """Untimed identity, native-shaped path and called-allele reconstruction checks."""
+    """Untimed sample/reference identity and called-allele reconstruction checks."""
     dataset = next(item for item in config["datasets"] if item["name"] == dataset_name)
     paths = prepared_inputs(config, dataset)
     reference = tskit.load(paths.reference)
@@ -724,38 +721,6 @@ def quality_check(config, dataset_name, folder):
         errors += int(np.count_nonzero(expected != actual))
     if errors > 0:
         raise ValueError(f"{errors} called alleles differ")
-    matches = folder / "samples_matches.jsonl"
-    if matches.exists():
-        records = [json.loads(line) for line in matches.read_text().splitlines()]
-        records.sort(key=lambda record: record["haplotype_index"])
-        if len(records) != len(jobs):
-            raise ValueError("JSONL haplotype count differs")
-        paths_by_node = {node: [] for node in sample_nodes}
-        mutations_by_node = {node: [] for node in sample_nodes}
-        for edge in output.edges():
-            if edge.child in paths_by_node:
-                paths_by_node[edge.child].append(
-                    {"left": edge.left, "right": edge.right, "parent": edge.parent}
-                )
-        for mutation in output.mutations():
-            if mutation.node in mutations_by_node:
-                code = mapper.lookup(mutation.site, mutation.derived_state)
-                position = output.site(mutation.site).position
-                mutations_by_node[mutation.node].append(
-                    {"position": position, "derived_state": code}
-                )
-        for job, node_id, record in zip(jobs, sample_nodes, records, strict=True):
-            identity = (record["source"], record["sample_id"], record["ploidy_index"])
-            if identity != (job.source, job.sample_id, job.ploidy_index):
-                raise ValueError("JSONL identity differs")
-            path = paths_by_node[node_id]
-            if sorted(path, key=lambda segment: segment["left"]) != sorted(
-                record["path"], key=lambda segment: segment["left"]
-            ):
-                raise ValueError("JSONL and tree paths differ")
-            mutations = mutations_by_node[node_id]
-            if mutations != record["mutations"]:
-                raise ValueError("JSONL and tree mutations differ")
     return {
         "called_allele_errors": errors,
         "haplotypes": len(jobs),

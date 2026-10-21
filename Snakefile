@@ -2,7 +2,7 @@ import csv
 import pathlib
 import re
 
-from lib import ancestors, benchmark, matching, utils
+from lib import ancestors, benchmark, diagnostics, matching, utils
 
 
 configfile: "config.yaml"
@@ -16,7 +16,7 @@ utils.configure_helpers(helpers)
 
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
-datasets = {dataset["name"]: dataset for dataset in config["datasets"]}
+datasets = {dataset["name"]: dict(dataset) for dataset in config["datasets"]}
 for dataset in datasets.values():
     dataset["samples"] = None
     sample_list = dataset.get("sample_list")
@@ -41,16 +41,50 @@ wildcard_constraints:
     min_focal_region_size="|".join(str(value) for value in min_focal_region_sizes),
 
 
+inventory = diagnostics.inventory(config)
+full_outputs = inventory.full
+stitched_outputs = [run.stitched for run in inventory.runs]
+performance_outputs = (
+    benchmark.final_products(config) if config.get("performance") is not None else []
+)
+
+
 rule all:
     input:
-        expand(data_dir / "matches" / "{name}_inferred_samples_raw.trees", name=names),
-        expand(greedy_dir / "{name}_inferred_greedy_samples_raw.trees", name=names,
-               af_cutoff=af_cutoffs, min_focal_region_size=min_focal_region_sizes),
-        (expand(data_dir / "matches" / "{name}_inferred_samples_matches.jsonl", name=names)
-         if config["path_output"] else []),
-        (expand(greedy_dir / "{name}_inferred_greedy_samples_matches.jsonl", name=names,
-                af_cutoff=af_cutoffs, min_focal_region_size=min_focal_region_sizes)
-         if config["path_output"] else []),
+        full_outputs,
+        stitched_outputs,
+
+
+rule diagnostics:
+    input:
+        inventory.archive,
+
+
+rule make_diagnostics:
+    input:
+        full=full_outputs,
+        stitched=stitched_outputs,
+        samples=expand(data_dir / "samples" / "{name}_samples_masked.zarr", name=names),
+        panels=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=names),
+        references=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=names),
+        configs=expand(data_dir / "configs" / "{name}_ancestor_inference.toml", name=names),
+        population=lambda wildcards: diagnostics.population_sources(config),
+        performance=performance_outputs,
+    output:
+        archive=inventory.archive,
+        masks=[run.mask for run in inventory.runs],
+        tables=inventory.tables,
+        sites=inventory.sites,
+        snapshot=inventory.directory / "config.yaml",
+        manifest=inventory.directory / "manifest.json",
+    params:
+        effective_config=config,
+    threads: config["inference_threads"]
+    log:
+        progress_dir / "diagnostics" / f"{config['config_name']}.log",
+    run:
+        utils.setup_log(pathlib.Path(log[0]))
+        diagnostics.run(params.effective_config, threads)
 
 
 rule annotate_derived_counts:
@@ -183,8 +217,6 @@ rule match_stitched_samples:
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",
     output:
         trees=greedy_dir / "{name}_inferred_greedy_samples_raw.trees",
-        matches=([greedy_dir / "{name}_inferred_greedy_samples_matches.jsonl"]
-                 if config["path_output"] else []),
     params:
         af_cutoff=lambda wildcards: float(wildcards.af_cutoff),
         min_focal_region_size=lambda wildcards: int(wildcards.min_focal_region_size),
@@ -210,7 +242,6 @@ rule match_stitched_samples:
             max_pending_haplotypes=params.max_pending_haplotypes,
             temp_dir=None if params.temp_dir is None else pathlib.Path(params.temp_dir).expanduser(),
             helper_threads=params.helper_threads,
-            match_file_path=pathlib.Path(output.matches[0]) if output.matches else None,
         )
 
 
@@ -222,8 +253,6 @@ rule match_samples:
         config=panel_config,
     output:
         trees=data_dir / "matches" / "{name}_{kind}_samples_raw.trees",
-        matches=([data_dir / "matches" / "{name}_{kind}_samples_matches.jsonl"]
-                 if config["path_output"] else []),
     log:
         progress_dir / "match_samples" / "{name}_{kind}_match_samples.log",
     params:
@@ -235,22 +264,17 @@ rule match_samples:
             pathlib.Path(input.config),
             pathlib.Path(input.reference),
             pathlib.Path(output.trees),
-            pathlib.Path(output.matches[0]) if output.matches else None,
             threads,
             params.cache_size,
         )
 
 
 if config.get("performance") is not None:
-    performance_dir = benchmark.output_directory(config)
-    performance_products = ["manifest.json", "runs.csv", "stages.csv", "complete.json"]
-    if config["performance"]["quality_checks"]:
-        performance_products.append("quality.json")
     performance_names = config["performance"]["datasets"]
 
     rule performance:
         input:
-            expand(performance_dir / "{product}", product=performance_products),
+            performance_outputs,
 
     rule performance_suite:
         input:
@@ -259,7 +283,7 @@ if config.get("performance") is not None:
             panels=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=performance_names),
             references=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=performance_names),
         output:
-            protected(expand(performance_dir / "{product}", product=performance_products)),
+            protected(performance_outputs),
         threads: benchmark.required_allocation(config)
         log:
             progress_dir / "performance" / f"{config['performance']['experiment_id']}.log",

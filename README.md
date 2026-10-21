@@ -44,8 +44,8 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    inference-site count, including touching intervals. Short intervals can bridge
    a retained union. Equal reaches keep the first interval in stable panel order.
 7. Match uncovered gaps independently with the full HMM, splitting calls at
-   inference boundaries. Merge touching final runs with equal parents, append
-   completed results immediately, then finalise tables once.
+   inference boundaries. Append completed results immediately, squash adjacent
+   equal-parent/child edges once, then finalise and sort tables.
 
 The greedy cover minimises copying runs within each retained exact union.
 Gap matches start independent likelihoods; this does not optimise global HMM
@@ -68,6 +68,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 
 | Option | Meaning |
 | --- | --- |
+| `config_name` | Lowercase experiment label using letters, digits and underscores. Distinct names keep diagnostic tables and archives separate. |
 | `data_dir` | Ordinary output root. Use a separate directory for each biological configuration. |
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
@@ -75,9 +76,8 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `min_focal_region_size` | Positive integer or nonempty list of distinct positive integers; minimum inference sites in a complete touching union. `1` keeps all. These are site counts, not base pairs. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.mismatch` | HMM mismatch probability, strictly between 0 and 1. Exact focal copying always allows zero mismatches. |
-| `path_output` | Write optional native-shaped JSONL paths/mutations for both runners. Greedy records may be in completion order; use `haplotype_index` for canonical order. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
-| `inference_threads` | Native ancestor inference workers. |
+| `inference_threads` | Native ancestor inference workers and requested diagnostics CPU budget. Diagnostics uses the actual Snakemake-granted threads. |
 | `matching_threads` | Native ancestor/baseline threads and greedy process workers. |
 | `sample_prefetch_chunks` | Maximum live decoded sample slabs; start with `2`. |
 | `max_pending_haplotypes` | Maximum queued, running and completed-but-unappended haplotype jobs; also bounds preparation admission. `null` uses the requested worker count. An explicit limit must be at least that count. |
@@ -97,12 +97,17 @@ Each `datasets` entry has:
 | --- | --- |
 | `name` | Unique lowercase label with underscores, used in filenames. |
 | `zarr_path` | Input VCZ store. |
-| `ts_path` | Truth tree sequence for explicit true-ancestor extraction; otherwise `null`. |
+| `ts_path` | Optional truth tree sequence, used for explicit true-ancestor extraction, configured population joins and archive inclusion; otherwise `null`. |
 | `ancestral_state.field` | Array of ancestral allele strings. |
 | `ancestral_state.is_reference` | Alternative to `field`: `true` treats REF as ancestral. |
 | `include` | Optional native site filter, e.g. `'POS >= 1000000 & POS < 11000000'`. |
 | `exclude` | Alternative to `include`. Singleton exclusion is added automatically. |
-| `sample_list` | Optional headerless CSV of sample IDs. The same cohort is used for annotation, inference and matching; both ploidies are retained. |
+| `sample_list` | Optional headerless CSV of sample IDs. The same cohort is used for annotation, inference and matching; all ploidy indices are retained. |
+| `population.source` | Required only for diagnostics: `ts` joins names/ploidy through `ts_path.map_to_vcf_model()`; `csv` joins selected Zarr identifiers to a CSV. |
+| `population.field` | Original population metadata field (`ts`) or label column (`csv`). Labels are exported without regrouping. |
+| `population.path` | Population CSV path when `source: csv`. |
+| `population.zarr_id_field` | Sample-dimensioned Zarr join identifier when `source: csv`, e.g. `sample_id`. |
+| `population.csv_id_field` | CSV identifier column when `source: csv`, e.g. `sample_id`. Selected identifiers and labels must exist and be unique. |
 | `matching_cache_size` | Native ancestor/full-HMM reader cache in MiB; `null` uses tsinfer's default. Greedy uses its slab bound instead. |
 
 Coordinates remain absolute when selecting a region. Main products are:
@@ -112,7 +117,6 @@ Coordinates remain absolute when selecting a region. Main products are:
 - `ancestors/{name}_inferred_ancestors.zarr` and `.trees`: panel and raw reference.
 - `matches/{name}_inferred_samples_raw.trees`: native full-HMM baseline.
 - `matches/af_{af_cutoff}/min_region_{min_focal_region_size}/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples for each parameter pair.
-- Corresponding `*_samples_matches.jsonl` when `path_output` is enabled.
 
 `config.yaml.hpc_params1` selects the 10 Mb simulated n=300 and n=3000 cohorts
 from `../tsinfer-anc-eval/config.yaml.matching`. It runs AF cutoffs
@@ -128,6 +132,67 @@ It uses 48 matching workers per job, allowing two greedy jobs to run concurrentl
 within their helper-inclusive CPU reservations. `performance: null` disables the
 benchmark target, including any performance settings inherited from `config.yaml`.
 Ordinary matching does not collect benchmark timings or memory samples.
+
+## Diagnostics
+
+Ordinary matching writes raw trees only. Reconstruct focal masks and compare raw
+copying parents across the configured dataset/AF/minimum grid explicitly:
+
+```sh
+uv run snakemake diagnostics --configfile config.yaml.hpc_params1 --cores 196
+```
+
+Install `pigz` on PATH and sync the Python dependencies (including `tszip`). The
+driver uses spawn workers to read physical sample chunks, sharing exact extension
+and sorting across minimum sizes. It does not run HMM matching. Numerical/codec
+helpers are serial; tree compression and level-1 pigz run after analysis workers
+exit, within the granted CPU budget. An enabled `performance` suite is a required
+dependency and is included in full. `performance: null` schedules and includes no
+benchmarks, regardless of other experiments on disk. The archived `config.yaml`
+is the effective merged Snakemake configuration, including command-line overrides.
+
+Outputs under `{data_dir}/diagnostics/{config_name}/` are:
+
+| File | Schema/content |
+| --- | --- |
+| `haplotype_results.csv` | Keys `dataset, af_cutoff, min_focal_region_size, source, sample_id, ploidy_index`; original `population`; domain/evaluated/excluded/unmatched site counts; full/stitched total and focal/gap/seam switches; disagreement counts, agreement percentages and `parents_identical`; focal/gap/unmatched bp spans and coverage percentages. |
+| `region_lengths.csv` | The same keys/population, mask `region_index`, `is_gap`, half-open site-index bounds, `num_sites`, clipped `left_bp`, `right_bp`, and `span_bp`. Regions split at excluded or unmatched physical intervals. |
+| `run_summary.csv` | One row per grid run: sample/haplotype and empty-region counts; per-haplotype metric `_mean`, `_sem`, `_count`; explicit `_undefined_count` for percentages/fractions. |
+| `sample_populations.csv` | Selected roster keyed by dataset/source/sample/ploidy, original population, and available `truth_node_id`, `truth_individual_id`, `population_id`. |
+| `{name}_sites.npz` | Shared `positions`, reference `inference_intervals`, clipped `analysis_intervals`, observed `analysis_start`/`analysis_end`, and `sequence_length` for interpreting matcher endpoints. |
+| `config.yaml`, `manifest.json` | Effective config, run/file map, cohort and population provenance, observed extents, and explicitly labelled diagnostics-time versions/revisions. |
+
+Masks are ordinary NPZ files at
+`focal_masks/af_{af_cutoff}/min_region_{min_focal_region_size}/{name}_focal_mask.npz`.
+Each contains canonical `source`, `sample_id`, `ploidy_index`, ragged `offsets`,
+flat `left_site_index`, `right_site_index`, `is_gap`, per-haplotype `domain_start`
+and `domain_end`, plus `num_sites`, `af_cutoff`, `min_focal_region_size` and
+`focal_choice`. Bounds are half-open on the original inference-site axis;
+`is_gap=True` excludes focal coverage. Load NPZs with `allow_pickle=False`.
+
+Site comparisons include both observed endpoint sites and require a parent in
+both paths within the matched domain. Switches are adjacent valid parent changes,
+partitioned by the same focal mask; excluded inference intervals break adjacency.
+`num_extra_switches = stitched_switches - full_switches`;
+`switch_increase_percentage` divides by full switches, while
+`extra_switch_fraction` divides by stitched switches. Region agreement uses that
+region's evaluated site count. Undefined ratios are CSV `nan` (and counted in
+summaries); an unevaluated `parents_identical` is blank. Physical coverage uses
+the span between observed endpoint positions intersected with inference intervals,
+not chromosome length. Focal, gap and unmatched spans reconcile to that denominator.
+Summary means weight haplotypes equally; SEM describes haplotype variability and
+does not account for within-individual dependence.
+
+The final `{data_dir}/diagnostics/{config_name}_diagnostics.tar.gz` contains
+`config.yaml`, `manifest.json`, native `configs/`, `matches/`, raw reference
+`ancestors/`, optional `truth/`, `focal_masks/`, `diagnostics/`, and the configured
+`performance/` experiment. Trees are losslessly tszipped `.trees.tsz` copies;
+original raw outputs remain. The manifest maps source filenames to portable
+archive paths, deduplicating shared baselines/references/truth without merging
+benchmark trial identities. No Zarr stores or temporary mapped inputs are included.
+Use `tszip.decompress(path)` to load trees after extraction. The archive supports
+path, region, population and tree analysis without Zarr; regenerating exact masks
+or restoring omitted/non-inference sites for fresh dating requires original stores.
 
 ## Performance
 
@@ -183,7 +248,7 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
 | `collect_stages` | Enable diagnostic aggregate setup, packing, loading, numeric matching, gap/assembly and output timings. Use `false` for headline totals. |
-| `quality_checks` | Untimed metadata, called-allele reconstruction and optional tree/JSONL agreement checks. |
+| `quality_checks` | Untimed reference/sample metadata and called-allele reconstruction checks. |
 | `resident_max_matrix_mib` | Maximum decoded sample matrix for resident trials. |
 | `resident_max_private_mib` | Maximum summed private process-tree memory for resident trials. |
 

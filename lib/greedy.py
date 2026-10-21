@@ -4,7 +4,65 @@ Catalog arrays are validated by :mod:`lib.haplotypes`. Kernels use worker-owned
 scratch; callers stable-sort candidate indices between extension and covering.
 """
 
+import dataclasses
+
 import numba
+import numpy as np
+
+from . import haplotypes
+
+
+@dataclasses.dataclass
+class ExactState:
+    """Exact-only mapped input and private scratch, shared by both callers."""
+
+    catalog: haplotypes.ReferenceCatalog
+    packed: np.ndarray
+    candidate_left: np.ndarray
+    candidate_right: np.ndarray
+    candidate_ids: np.ndarray
+    run_left: np.ndarray
+    run_right: np.ndarray
+    run_ids: np.ndarray
+
+
+def make_state(catalog):
+    """Open the shared packed reference and allocate process-local scratch."""
+    catalog.make_readonly()
+    capacity = len(catalog.seeds)
+    scratch = [np.empty(capacity, dtype=np.int64) for _ in range(6)]
+    return ExactState(catalog, catalog.packed.open(), *scratch)
+
+
+def candidates(haplotype, state):
+    """Extend and stable-sort once, before covering one or several minima."""
+    catalog = state.catalog
+    count = extend_exact(
+        haplotype,
+        state.packed,
+        catalog.seeds,
+        catalog.starts,
+        catalog.stops,
+        catalog.offsets,
+        state.candidate_left,
+        state.candidate_right,
+        state.candidate_ids,
+    )
+    return np.argsort(state.candidate_left[:count], kind="stable")
+
+
+def cover(state, order, minimum):
+    """Write a cover into reusable scratch, returning its number of runs."""
+    return cover_components(
+        state.candidate_left,
+        state.candidate_right,
+        state.candidate_ids,
+        order,
+        minimum,
+        state.run_left,
+        state.run_right,
+        state.run_ids,
+    )
 
 
 @numba.njit(cache=True, nogil=True)
