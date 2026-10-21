@@ -8,7 +8,7 @@ belongs in separate notebooks.
 
 Use phased, biallelic, single-contig VCF Zarr inputs and the editable tsinfer
 checkout at `../tsinfer`. The runner uses its regional `AncestorMatcher`,
-`reset_topology()` and raw table APIs directly.
+retaining reference topology across independent gap calls, and raw table APIs.
 
 ```sh
 cp config.yaml.example config.yaml

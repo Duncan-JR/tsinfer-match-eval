@@ -264,33 +264,23 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
     Their touching unions are filtered before taking the complement. Each gap
     starts fresh HMM likelihoods; topology reuse supplies no boundary condition.
     """
-    worker.matcher.reset_topology()
     called = np.flatnonzero(haplotype >= 0)
     start, end = 0, len(haplotype)
     if len(called) > 0:
         start, end = int(called[0]), int(called[-1]) + 1
     with performance.measure(collector, "candidate_extension_cover", "thread"):
         focal = focal_runs(haplotype, worker, minimum)
-    blocks = []
+    blocks = [focal]
     mutations = []
     cursor = start
     focal_sites = 0
     gap_calls = 0
     with performance.measure(collector, "gap_matching_assembly", "thread"):
-        for left, right, parent in zip(
-            focal.left, focal.right, focal.parent, strict=True
-        ):
+        for left, right in zip(focal.left, focal.right, strict=True):
             if cursor < left:
                 gap_calls += _match_gap(
                     haplotype, worker, cursor, int(left), blocks, mutations
                 )
-            blocks.append(
-                CopyingRuns(
-                    np.asarray([left]),
-                    np.asarray([right]),
-                    np.asarray([parent]),
-                )
-            )
             focal_sites += int(right - left)
             cursor = int(right)
         if cursor < end:
