@@ -75,9 +75,8 @@ def required_allocation(config):
 def validate_config(config, allocation):
     """Validate performance settings at the suite entry point."""
     utils.validate_config(config)
-    for name in ("af_cutoff", "min_region_size_kb"):
-        if isinstance(config[name], list):
-            raise ValueError(f"Performance trials require a scalar {name}")
+    if isinstance(config["min_region_size_kb"], list):
+        raise ValueError("Performance trials require a scalar min_region_size_kb")
     settings = config["performance"]
     if not settings["methods"] or not set(settings["methods"]) <= {"full_hmm", "greedy"}:
         raise ValueError("performance.methods: choose full_hmm and/or greedy")
@@ -264,8 +263,8 @@ def trial(spec_path):
         if run["method"] == "greedy":
             temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
             kwargs = {
-                "af_cutoff": config["af_cutoff"],
-                "min_region_size_kb": config["min_region_size_kb"],
+                "af_cutoff": run["af_cutoff"],
+                "min_region_size_kb": run["min_region_size_kb"],
                 "focal_choice": config.get("focal_choice", "left"),
                 "workers": workers,
                 "helper_threads": config["helper_threads"],
@@ -570,7 +569,7 @@ def _manifest(config, allocation):
 
 
 def run_suite(config, allocation, config_paths=None):
-    """Run worker-count/repeat loops at one scalar biological configuration."""
+    """Measure each greedy AF cutoff, sharing Full HMM trials across cutoffs."""
     validate_config(config, allocation)
     folder = output_directory(config).resolve()
     folder.mkdir(parents=True, exist_ok=True)
@@ -592,12 +591,21 @@ def run_suite(config, allocation, config_paths=None):
     for repeat, dataset, mode in itertools.product(
         range(settings["repeats"]), settings["datasets"], settings["modes"]
     ):
-        combinations = list(
-            itertools.product(settings["methods"], settings["worker_counts"])
-        )
+        combinations = []
+        for method, workers in itertools.product(
+            settings["methods"], settings["worker_counts"]
+        ):
+            cutoffs = (
+                utils.parameter_values(config["af_cutoff"])
+                if method == "greedy"
+                else [None]
+            )
+            for cutoff in cutoffs:
+                combinations.append((method, workers, cutoff))
         rng.shuffle(combinations)
-        for order, (method, workers) in enumerate(combinations):
-            run_id = f"{dataset}_{mode}_{method}_w{workers}_r{repeat}_o{order}"
+        for order, (method, workers, cutoff) in enumerate(combinations):
+            suffix = f"_af{cutoff}" if method == "greedy" else ""
+            run_id = f"{dataset}_{mode}_{method}{suffix}_w{workers}_r{repeat}_o{order}"
             trial_folder = folder / run_id
             trial_folder.mkdir()
             run = {
@@ -605,6 +613,10 @@ def run_suite(config, allocation, config_paths=None):
                 "dataset": dataset,
                 "mode": mode,
                 "method": method,
+                "af_cutoff": cutoff,
+                "min_region_size_kb": (
+                    config["min_region_size_kb"] if method == "greedy" else None
+                ),
                 "requested_workers": workers,
                 "repeat": repeat,
                 "order": order,

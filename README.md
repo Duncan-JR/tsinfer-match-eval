@@ -214,7 +214,11 @@ experiment directory must be empty. Output is under
 `data/performance/{experiment_id}/`: configuration and dependency/source
 manifest, `runs.csv`, `stages.csv`, optional `quality.json`, trial logs,
 process-tree memory samples and matched trees.
-Performance trials require scalar `af_cutoff` and `min_focal_region_size` settings.
+Performance trials accept scalar or list `af_cutoff` and require scalar
+`min_region_size_kb`. Each greedy cutoff gets a separate trial; Full HMM runs
+once per dataset/mode/worker/repeat and supplies the baseline for all cutoffs.
+`runs.csv` records each greedy trial's AF and kb setting, plus its resolved
+`min_focal_region_size` in sites. AF and kb are blank for Full HMM trials.
 
 Worker counts are never silently reduced. Every dataset must have at least as
 many haplotypes as the largest requested worker count. The suite checks its CPU
@@ -222,9 +226,10 @@ reservation against the process's effective CPU affinity on Linux. Its manifest
 records host CPU/memory information, allowed CPU/core/socket/NUMA topology and
 selected scheduler allocation and binding variables.
 
-For the five simulated cohorts in `../tsinfer-anc-eval/config.yaml.matching`,
-`config.yaml.hpc_perf1` runs both methods once at 32 workers, using identical references
-and settings. Generate just their inputs from the `tsinfer-anc-eval` directory:
+For the 100, 1,000 and 10,000-individual simulated cohorts in
+`../tsinfer-anc-eval/config.yaml.matching`, `config.yaml.hpc_perf1` measures greedy
+AF cutoffs 0.01 and 0.1 at 150 kb, plus one Full HMM baseline, at 32 workers
+(nine trials). Generate their inputs from the `tsinfer-anc-eval` directory:
 
 ```sh
 uv run snakemake --configfile config.yaml.matching --cores 196 \
