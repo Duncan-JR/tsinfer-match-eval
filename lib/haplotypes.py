@@ -141,6 +141,17 @@ def prepare_samples(source, reference, jobs):
         local_columns = columns[selected] - block * genotypes.chunks[1]
         job_indices = selected[:, None] * ploidy + np.arange(ploidy)
         chunks.append(SampleChunk(int(block), local_columns, job_indices.ravel()))
+    widths = [len(chunk.job_indices) for chunk in chunks]
+    logger.info(
+        "Prepared %d haplotypes at %d sites from %d physical sample chunks "
+        "(genotype chunk shape %s; selected haplotypes per chunk %d–%d)",
+        len(jobs),
+        len(rows),
+        len(chunks),
+        genotypes.chunks,
+        min(widths),
+        max(widths),
+    )
     return SampleInput(source.path, blocks, chunks, remap, mapper, len(rows), rows)
 
 
@@ -168,7 +179,6 @@ def load_sample_chunk(inputs, chunk, directory):
             selected = encoded.reshape(len(remap), -1)
             slab[:, block.output_rows] = selected.T
             blocks_read += genotypes.cdata_shape[2]
-        slab.flush()
     finally:
         close_mapping(slab)
     elapsed = time.perf_counter() - started
@@ -276,7 +286,6 @@ def pack_reference_chunk(panel_path, catalog, chunk):
             seed_offset = catalog.seeds[ancestor] - catalog.starts[ancestor]
             if packed[offset + seed_offset] != 1:
                 raise ValueError("An eligible ancestor seed is not called and derived")
-        packed.flush()
     finally:
         close_mapping(packed)
     return len(required)

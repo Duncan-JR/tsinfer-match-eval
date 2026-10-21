@@ -551,7 +551,7 @@ def region_rows(mask, axis, common, valid):
     return rows
 
 
-def comparison_metrics(full, stitched, full_path, stitched_path, mask, axis):
+def comparison_metrics(full, stitched, full_support, stitched_path, mask, axis):
     """Compare adjacent valid parents, with a shared mask and physical domain."""
     domain = np.zeros(len(full), dtype=bool)
     domain[mask.start : mask.end] = True
@@ -562,7 +562,7 @@ def comparison_metrics(full, stitched, full_path, stitched_path, mask, axis):
         mask.left[~mask.is_gap], mask.right[~mask.is_gap], strict=True
     ):
         focal[left:right] = True
-    common = intersect_intervals(full_path.support(), stitched_path.support())
+    common = intersect_intervals(full_support, stitched_path.support())
     continuity = np.zeros(len(full) - 1, dtype=bool)
     if len(common) > 0:
         index = np.searchsorted(common[:, 0], axis.positions, side="right") - 1
@@ -678,6 +678,15 @@ class HaplotypeDiagnostic:
     regions: list[dict]
 
 
+@dataclasses.dataclass
+class HaplotypeTask:
+    """One diagnostic job referencing a complete row in a shared sample slab."""
+
+    slab: haplotypes.MappedCalls
+    row: int
+    job_index: int
+
+
 _worker: WorkerData
 
 
@@ -718,56 +727,72 @@ def _pack_chunk(chunk):
     )
 
 
-def _analyse_chunk(chunk):
-    """Read once, extend/sort once per haplotype, and reuse across all minima."""
+def _decode_chunk(chunk):
+    return haplotypes.load_sample_chunk(_worker.samples, chunk, _worker.directory)
+
+
+def _analyse_haplotype(task):
+    """Extend, sort and prepare baseline support once for all this row's minima."""
     state = _worker
-    slab = haplotypes.load_sample_chunk(state.samples, chunk, state.directory)
-    calls = slab.calls.open()
+    calls = task.slab.open()
+    haplotype = calls[task.row]
     results = []
     try:
-        for row, job_index in enumerate(slab.job_indices):
-            index = int(job_index)
-            haplotype = calls[row]
-            called = np.flatnonzero(haplotype >= 0)
-            start, end = 0, len(haplotype)
-            if len(called) > 0:
-                start, end = int(called[0]), int(called[-1]) + 1
-            order = greedy.candidates(haplotype, state.exact)
-            label = state.labels[index]
-            key = (label["source"], label["sample_id"], label["ploidy_index"])
-            full_path = state.full[index]
-            full = full_path.parents_at_sites(state.axis.positions)
-            for run in state.runs:
-                minimum = run.min_focal_region_size
-                mask = mask_runs(state.exact, order, minimum, start, end)
-                stitched_path = state.stitched[minimum][index]
-                stitched = stitched_path.parents_at_sites(state.axis.positions)
-                analysis = comparison_metrics(
-                    full, stitched, full_path, stitched_path, mask, state.axis
+        index = task.job_index
+        called = np.flatnonzero(haplotype >= 0)
+        start, end = 0, len(haplotype)
+        if len(called) > 0:
+            start, end = int(called[0]), int(called[-1]) + 1
+        order = greedy.candidates(haplotype, state.exact)
+        label = state.labels[index]
+        full_path = state.full[index]
+        full = full_path.parents_at_sites(state.axis.positions)
+        full_support = full_path.support()
+        for run in state.runs:
+            minimum = run.min_focal_region_size
+            mask = mask_runs(state.exact, order, minimum, start, end)
+            stitched_path = state.stitched[minimum][index]
+            stitched = stitched_path.parents_at_sites(state.axis.positions)
+            analysis = comparison_metrics(
+                full, stitched, full_support, stitched_path, mask, state.axis
+            )
+            identity = {
+                "dataset": run.dataset,
+                "af_cutoff": run.af_cutoff,
+                "min_focal_region_size": minimum,
+                "source": label["source"],
+                "sample_id": label["sample_id"],
+                "ploidy_index": label["ploidy_index"],
+                "population": label["population"],
+            }
+            results.append(
+                HaplotypeDiagnostic(
+                    index,
+                    minimum,
+                    mask,
+                    {**identity, **analysis.metrics},
+                    [{**identity, **region} for region in analysis.regions],
                 )
-                identity = {
-                    "dataset": run.dataset,
-                    "af_cutoff": run.af_cutoff,
-                    "min_focal_region_size": minimum,
-                    "source": key[0],
-                    "sample_id": key[1],
-                    "ploidy_index": key[2],
-                    "population": label["population"],
-                }
-                results.append(
-                    HaplotypeDiagnostic(
-                        index,
-                        minimum,
-                        mask,
-                        {**identity, **analysis.metrics},
-                        [{**identity, **region} for region in analysis.regions],
-                    )
-                )
-            del haplotype
+            )
     finally:
+        del haplotype
         haplotypes.close_mapping(calls)
-        slab.calls.path.unlink()
     return results
+
+
+def _sample_waves(chunks, workers):
+    """Admit complete physical chunks until at least one row per worker is ready."""
+    wave = []
+    count = 0
+    for chunk in chunks:
+        wave.append(chunk)
+        count += len(chunk.job_indices)
+        if count >= workers:
+            yield wave
+            wave = []
+            count = 0
+    if wave:
+        yield wave
 
 
 def _save_mask(path, results, jobs, num_sites, run, focal_choice):
@@ -1157,7 +1182,14 @@ def run(config, workers):
                     if item.dataset == dataset["name"] and item.af_cutoff == af
                 ]
                 logger.info(
-                    "Diagnostics %s AF=%s with %d workers", dataset["name"], af, workers
+                    "Diagnostics %s AF=%s: %d haplotypes, %d physical sample chunks, "
+                    "%d workers, %d analysis tasks",
+                    dataset["name"],
+                    af,
+                    len(jobs),
+                    len(samples.chunks),
+                    workers,
+                    len(jobs),
                 )
                 with tempfile.TemporaryDirectory(
                     dir=dataset_directory, prefix="diagnostics_af_"
@@ -1172,6 +1204,7 @@ def run(config, workers):
                         )
                         for item in runs
                     }
+                    packing_started = time.perf_counter()
                     catalog = haplotypes.prepare_reference(
                         native.ancestors[0].path,
                         samples,
@@ -1183,6 +1216,9 @@ def run(config, workers):
                     results = {
                         item.min_focal_region_size: [None] * len(jobs) for item in runs
                     }
+                    decoding_s = 0.0
+                    analysis_s = 0.0
+                    blocks_read = 0
                     with cf.ProcessPoolExecutor(
                         max_workers=workers,
                         mp_context=mp.get_context("spawn"),
@@ -1205,9 +1241,38 @@ def run(config, workers):
                         )
                         for _ in pool.map(_pack_chunk, chunks):
                             pass
-                        for chunk_results in pool.map(_analyse_chunk, samples.chunks):
-                            for result in chunk_results:
-                                results[result.minimum][result.index] = result
+                        logger.info(
+                            "Diagnostic reference preparation/packing "
+                            "(including worker startup): %.3fs",
+                            time.perf_counter() - packing_started,
+                        )
+                        for wave in _sample_waves(samples.chunks, workers):
+                            started = time.perf_counter()
+                            slabs = list(pool.map(_decode_chunk, wave))
+                            decoding_s += time.perf_counter() - started
+                            blocks_read += sum(slab.blocks_read for slab in slabs)
+                            tasks = [
+                                HaplotypeTask(slab.calls, row, int(index))
+                                for slab in slabs
+                                for row, index in enumerate(slab.job_indices)
+                            ]
+                            started = time.perf_counter()
+                            for haplotype_results in pool.map(
+                                _analyse_haplotype, tasks, chunksize=1
+                            ):
+                                for result in haplotype_results:
+                                    results[result.minimum][result.index] = result
+                            analysis_s += time.perf_counter() - started
+                            for slab in slabs:
+                                slab.calls.path.unlink()
+                    logger.info(
+                        "Diagnostic sample decoding: %.3fs, %d genotype tiles; "
+                        "haplotype analysis: %.3fs",
+                        decoding_s,
+                        blocks_read,
+                        analysis_s,
+                    )
+                    writing_started = time.perf_counter()
                     rows, lengths, summaries = [], [], []
                     for item in runs:
                         selected = results[item.min_focal_region_size]
@@ -1255,6 +1320,10 @@ def run(config, workers):
                     )
                     first_pair = False
                     del results, selected, rows, lengths, summaries
+                    logger.info(
+                        "Diagnostic mask/table writing: %.3fs",
+                        time.perf_counter() - writing_started,
+                    )
     population_fields = [
         "dataset",
         "source",
@@ -1266,7 +1335,12 @@ def run(config, workers):
         "population_id",
     ]
     _write_rows(products.tables[3], population_rows, population_fields)
+    packaging_started = time.perf_counter()
     files = _archive_manifest(config, products, manifest_datasets, workers)
     package_archive(files, products.archive, workers, config["helper_threads"])
-    logger.info("Wrote %s", products.archive)
+    logger.info(
+        "Diagnostic archive compression/packaging: %.3fs; wrote %s",
+        time.perf_counter() - packaging_started,
+        products.archive,
+    )
     return products.archive

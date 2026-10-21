@@ -143,8 +143,10 @@ uv run snakemake diagnostics --configfile config.yaml.hpc_params1 --cores 196
 ```
 
 Install `pigz` on PATH and sync the Python dependencies (including `tszip`). The
-driver uses spawn workers to read physical sample chunks, sharing exact extension
-and sorting across minimum sizes. It does not run HMM matching. Numerical/codec
+driver prepares shared copying-path indexes once, then uses spawn workers to decode
+bounded waves of physical sample chunks and analyse individual haplotypes. Exact
+extension, sorting and baseline support are shared across minimum sizes. It does
+not run HMM matching. Numerical/codec
 helpers are serial; tree compression and level-1 pigz run after analysis workers
 exit, within the granted CPU budget. An enabled `performance` suite is a required
 dependency and is included in full. `performance: null` schedules and includes no
