@@ -1,13 +1,17 @@
 """Focused checks for plans/further_greedy_optimisations.md."""
 
+import concurrent.futures as cf
 import copy
 import csv
+import dataclasses
 import json
+import multiprocessing as mp
 
 import numpy as np
 import pytest
 import tsinfer
 import tskit
+import zarr
 
 from lib import benchmark, diagnostics, haplotypes, matching, utils
 from tests import smoke_helpers
@@ -316,3 +320,105 @@ class TestDerivedCounts:
             for sample in (0, 2, 3)
         ]
         assert reads == expected_reads
+
+
+class TestReferencePacking:
+    @pytest.mark.parametrize("selection", ["all", "sparse", "empty"])
+    def test_frozen_bytes_and_tile_reads(self, tiny, tmp_path, monkeypatch, selection):
+        reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
+        store = zarr.open_group(tiny.source, mode="a", use_consolidated=False)
+        frequencies = np.full(reference.num_sites, 0.9)
+        if selection != "empty":
+            frequencies[[1, 7]] = 0.1
+        if selection == "all":
+            frequencies[2] = 0.1
+        store["variant_match_eval_derived_af"][:] = frequencies
+        catalog = haplotypes.prepare_reference(
+            tiny.panel, samples, reference, 0.5, "left", tmp_path
+        )
+        snapshot = {
+            field.name: getattr(catalog, field.name).copy()
+            for field in dataclasses.fields(catalog)
+            if isinstance(getattr(catalog, field.name), np.ndarray)
+        }
+        frozen_calls = haplotypes.MappedCalls(
+            tmp_path / "frozen.bin", catalog.packed.shape
+        )
+        calls = frozen_calls.open("w+")
+        haplotypes.close_mapping(calls)
+        frozen = dataclasses.replace(catalog, packed=frozen_calls)
+        chunks = haplotypes.reference_chunks(tiny.panel, catalog)
+        expected_blocks = sum(
+            smoke_helpers.frozen_pack_reference(tiny.panel, frozen, chunk)
+            for chunk in chunks
+        )
+        array = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
+        block_type = type(array.blocks)
+        original = block_type.__getitem__
+        reads = []
+        searches = []
+        search = np.searchsorted
+
+        def read(indexer, key):
+            if indexer.array.path == "call_genotype":
+                reads.append(key)
+            return original(indexer, key)
+
+        def searchsorted(columns, value, *args, **kwargs):
+            searches.append(value)
+            assert columns is catalog.columns
+            return search(columns, value, *args, **kwargs)
+
+        monkeypatch.setattr(block_type, "__getitem__", read)
+        monkeypatch.setattr(haplotypes.np, "searchsorted", searchsorted)
+        offsets = smoke_helpers.TrackedOffsets(catalog.offsets)
+        catalog.offsets = offsets
+        actual_blocks = sum(
+            haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
+            for chunk in chunks
+        )
+        assert actual_blocks == expected_blocks == len(reads)
+        assert len(searches) == 2 * len(chunks)
+        assert len(set(reads)) == len(reads)
+        height = array.chunks[0]
+        overlaps = 0
+        for start, stop in zip(catalog.starts, catalog.stops, strict=True):
+            overlaps += (stop - 1) // height - start // height + 1
+        assert offsets.visits == overlaps + len(catalog.seeds)
+        actual = catalog.packed.open()
+        expected = frozen.packed.open()
+        np.testing.assert_array_equal(actual, expected)
+        haplotypes.close_mapping(actual)
+        haplotypes.close_mapping(expected)
+        for name, values in snapshot.items():
+            np.testing.assert_array_equal(getattr(catalog, name), values)
+
+    def test_invalid_derived_seed(self, tiny, tmp_path):
+        reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
+        catalog = haplotypes.prepare_reference(
+            tiny.panel, samples, reference, 1, "left", tmp_path
+        )
+        panel = zarr.open_group(tiny.panel, mode="a", use_consolidated=False)
+        panel["call_genotype"][catalog.seeds[0], catalog.columns[0], 0] = 0
+        with pytest.raises(ValueError, match="not called and derived"):
+            haplotypes.pack_reference_chunk(tiny.panel, catalog, 0)
+
+    def test_one_and_two_packing_workers(self, tiny, tmp_path):
+        reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
+        snapshots = []
+        for workers in (1, 2):
+            directory = tmp_path / f"w{workers}"
+            directory.mkdir()
+            catalog = haplotypes.prepare_reference(
+                tiny.panel, samples, reference, 1, "left", directory
+            )
+            chunks = haplotypes.reference_chunks(tiny.panel, catalog)
+            tasks = [(tiny.panel, catalog, chunk) for chunk in chunks]
+            with cf.ProcessPoolExecutor(
+                max_workers=workers, mp_context=mp.get_context("spawn")
+            ) as pool:
+                list(pool.map(smoke_helpers.pack_job, tasks))
+            calls = catalog.packed.open()
+            snapshots.append(calls.copy())
+            haplotypes.close_mapping(calls)
+        np.testing.assert_array_equal(*snapshots)

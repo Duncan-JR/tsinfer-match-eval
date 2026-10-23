@@ -256,11 +256,19 @@ def reference_chunks(panel_path, catalog):
 
 
 def pack_reference_chunk(panel_path, catalog, chunk):
-    """Copy disjoint ancestor spans, decoding each intersecting block once."""
+    """Copy disjoint spans in catalog order, decoding each required tile once.
+
+    Sorted columns bound each job by binary search; numeric support masks keep
+    Python copying proportional to actual ancestor/block overlaps.
+    """
     panel = tsinfer.vcz.open_store(panel_path)
     genotypes = panel["call_genotype"]
     height, width, _ = genotypes.chunks
-    ancestors = np.flatnonzero(catalog.columns // width == chunk)
+    first = np.searchsorted(catalog.columns, chunk * width)
+    last = np.searchsorted(catalog.columns, (chunk + 1) * width)
+    ancestors = np.arange(first, last)
+    starts = catalog.starts[first:last]
+    stops = catalog.stops[first:last]
     required = set()
     for ancestor in ancestors:
         first = catalog.starts[ancestor] // height
@@ -271,15 +279,16 @@ def pack_reference_chunk(panel_path, catalog, chunk):
         for block in sorted(required):
             tile = genotypes.blocks[block, chunk, 0]
             block_start = block * height
-            for ancestor in ancestors:
+            block_stop = block_start + tile.shape[0]
+            overlapping = (starts < block_stop) & (stops > block_start)
+            for ancestor in ancestors[overlapping]:
                 start = max(catalog.starts[ancestor], block_start)
-                stop = min(catalog.stops[ancestor], block_start + tile.shape[0])
-                if start < stop:
-                    column = catalog.columns[ancestor] - chunk * width
-                    offset = catalog.offsets[ancestor] + start - catalog.starts[ancestor]
-                    packed[offset : offset + stop - start] = tile[
-                        start - block_start : stop - block_start, column, 0
-                    ]
+                stop = min(catalog.stops[ancestor], block_stop)
+                column = catalog.columns[ancestor] - chunk * width
+                offset = catalog.offsets[ancestor] + start - catalog.starts[ancestor]
+                packed[offset : offset + stop - start] = tile[
+                    start - block_start : stop - block_start, column, 0
+                ]
             del tile
         for ancestor in ancestors:
             offset = catalog.offsets[ancestor]

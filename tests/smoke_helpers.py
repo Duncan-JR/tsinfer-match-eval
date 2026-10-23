@@ -121,7 +121,11 @@ def make_tiny(root, settings, hmm):
     for name, values in {
         "sample_time": [3, 2, 1],
         "sample_start_position": [10, 10, 10],
-        "sample_end_position": [int(positions[-1] + 10)] * 3,
+        "sample_end_position": [
+            int(positions[4]),
+            int(positions[-1] + 10),
+            int(positions[-1] + 10),
+        ],
     }.items():
         ancestors[name].resize((3,))
         ancestors[name][:] = values
@@ -199,3 +203,58 @@ def delayed_trial(spec_path, delay):
 
 if __name__ == "__main__":
     delayed_trial(pathlib.Path(sys.argv[1]), float(sys.argv[2]))
+
+
+def frozen_pack_reference(panel_path, catalog, chunk):
+    """Packing before the binary-search/overlap change, frozen for byte comparisons."""
+    panel = tsinfer.vcz.open_store(panel_path)
+    genotypes = panel["call_genotype"]
+    height, width, _ = genotypes.chunks
+    ancestors = np.flatnonzero(catalog.columns // width == chunk)
+    required = set()
+    for ancestor in ancestors:
+        first = catalog.starts[ancestor] // height
+        last = (catalog.stops[ancestor] - 1) // height
+        required.update(range(first, last + 1))
+    packed = catalog.packed.open("r+")
+    try:
+        for block in sorted(required):
+            tile = genotypes.blocks[block, chunk, 0]
+            block_start = block * height
+            for ancestor in ancestors:
+                start = max(catalog.starts[ancestor], block_start)
+                stop = min(catalog.stops[ancestor], block_start + tile.shape[0])
+                if start < stop:
+                    column = catalog.columns[ancestor] - chunk * width
+                    offset = catalog.offsets[ancestor] + start - catalog.starts[ancestor]
+                    packed[offset : offset + stop - start] = tile[
+                        start - block_start : stop - block_start, column, 0
+                    ]
+            del tile
+        for ancestor in ancestors:
+            offset = catalog.offsets[ancestor]
+            seed_offset = catalog.seeds[ancestor] - catalog.starts[ancestor]
+            if packed[offset + seed_offset] != 1:
+                raise ValueError("An eligible ancestor seed is not called and derived")
+    finally:
+        haplotypes.close_mapping(packed)
+    return len(required)
+
+
+def pack_job(task):
+    panel, catalog, chunk = task
+    return haplotypes.pack_reference_chunk(panel, catalog, chunk)
+
+
+class TrackedOffsets(np.ndarray):
+    """Count Python scalar copying/seed visits without timing instrumentation."""
+
+    def __new__(cls, values):
+        result = np.asarray(values).view(cls)
+        result.visits = 0
+        return result
+
+    def __getitem__(self, index):
+        if np.isscalar(index):
+            self.visits += 1
+        return super().__getitem__(index)
