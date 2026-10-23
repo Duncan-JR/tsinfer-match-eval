@@ -27,7 +27,7 @@ import tsinfer
 import tskit
 import yaml
 
-from . import matching, performance, utils
+from . import haplotypes, matching, performance, utils
 
 logger = logging.getLogger(__name__)
 
@@ -119,10 +119,11 @@ def validate_config(config, allocation):
     for name in (
         "rss_sample_interval_s",
         "trial_timeout_s",
+        "quality_max_matrix_mib",
         "resident_max_matrix_mib",
         "resident_max_private_mib",
     ):
-        if settings[name] <= 0:
+        if not np.isfinite(settings[name]) or settings[name] <= 0:
             raise ValueError(f"performance.{name} must be positive")
     if (
         not settings["experiment_id"]
@@ -265,6 +266,7 @@ def trial(spec_path):
             matrix_bytes = reference.num_sites * len(jobs)
             if matrix_bytes > config["performance"]["resident_max_matrix_mib"] * 1024**2:
                 raise ValueError("Resident sample calls exceed resident_max_matrix_mib")
+            del reference, cfg, jobs
         window = performance.Window()
         if run["method"] == "greedy":
             temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
@@ -314,6 +316,7 @@ def trial(spec_path):
             if workers > count:
                 raise ValueError("Requested workers exceed the matched haplotype count")
             collector.count(matched_haplotypes=count, full_calls=count)
+            del matched_ts, reference
         if workers != run["requested_workers"]:
             raise ValueError("Actual worker count differs from requested_workers")
         result = {
@@ -328,7 +331,22 @@ def trial(spec_path):
     except Exception:
         result = {"status": "failed", "error": traceback.format_exc()}
         logger.exception("Trial failed")
-    (folder / "result.json").write_text(json.dumps(result, indent=2) + "\n")
+    result_path = folder / "result.json"
+    # Preserve completed matching measurements even if validation is killed or fails.
+    result_path.write_text(json.dumps(result, indent=2) + "\n")
+    if result["status"] == "ok" and config["performance"]["quality_checks"]:
+        validation = performance.Window()
+        try:
+            with validation:
+                report = quality_check(config, run["dataset"], folder)
+            result["quality"] = {"status": "ok", **report}
+        except Exception:
+            result["status"] = "failed"
+            result["error"] = "Validation failed; see quality result"
+            result["quality"] = {"status": "failed", "error": traceback.format_exc()}
+            logger.exception("Validation failed")
+        result["validation_window"] = dataclasses.asdict(validation)
+        result_path.write_text(json.dumps(result, indent=2) + "\n")
     return result["status"] == "ok"
 
 
@@ -396,19 +414,16 @@ def _launch(spec_path, config):
         writer.writerow(["timestamp", "private_bytes"])
         writer.writerows(samples)
     result_path = spec_path.parent / "result.json"
-    if error or not result_path.exists() or child.returncode != 0:
-        result = {
-            "status": "failed",
-            "error": error or f"Trial exited {child.returncode}; see trial.log",
-        }
-        if result_path.exists() and not error:
-            result["error"] = json.loads(result_path.read_text()).get(
-                "error", result["error"]
-            )
-    else:
-        result = json.loads(result_path.read_text())
+    result = json.loads(result_path.read_text()) if result_path.exists() else {}
+    if error or not result or child.returncode != 0:
+        result["status"] = "failed"
+        result["error"] = error or result.get(
+            "error", f"Trial exited {child.returncode}; see trial.log"
+        )
+        if settings["quality_checks"] and "window" in result and "quality" not in result:
+            result["quality"] = {"status": "failed", "error": result["error"]}
     result["trial_peak_private_bytes"] = max((value for _, value in samples), default=0)
-    if result["status"] == "ok":
+    if "window" in result:
         window = result["window"]
         values = [
             value
@@ -569,7 +584,9 @@ def _manifest(config, allocation):
         "memory": (
             "Sampled sum of private process-tree USS; mapped input capacity "
             "reported separately. Shared mappings are not multiplied by worker "
-            "count; samples can miss short peaks."
+            "count; samples can miss short peaks. Whole-trial peaks include validation; "
+            "matching comparisons use window_peak_private_bytes. The quality matrix "
+            "budget excludes trees, one physical source tile and decoder scratch."
         ),
     }
 
@@ -637,7 +654,6 @@ def run_suite(config, allocation, config_paths=None):
     quality = []
     for run in trial_runs(config):
         run_id = run["run_id"]
-        dataset = run["dataset"]
         trial_folder = folder / run_id
         trial_folder.mkdir()
         spec = trial_folder / "trial.json"
@@ -650,7 +666,7 @@ def run_suite(config, allocation, config_paths=None):
             "error": result.get("error", ""),
             "trial_peak_private_bytes": result["trial_peak_private_bytes"],
         }
-        if result["status"] == "ok":
+        if "window" in result:
             row.update(
                 {key: result["window"][key] for key in ("wall_s", "user_s", "system_s")}
             )
@@ -660,18 +676,10 @@ def run_suite(config, allocation, config_paths=None):
             stage_rows.extend(
                 {"run_id": run_id, **record} for record in result["stages"]
             )
-            if settings["quality_checks"]:
-                try:
-                    report = quality_check(config, dataset, trial_folder)
-                    quality.append({"run_id": run_id, "status": "ok", **report})
-                except Exception:
-                    quality.append(
-                        {
-                            "run_id": run_id,
-                            "status": "failed",
-                            "error": traceback.format_exc(),
-                        }
-                    )
+        if "validation_window" in result:
+            row["validation_wall_s"] = result["validation_window"]["wall_s"]
+        if settings["quality_checks"] and "quality" in result:
+            quality.append({"run_id": run_id, **result["quality"]})
         rows.append(row)
         _write_csv(folder / "runs.csv", rows)
         _write_csv(folder / "stages.csv", stage_rows, ["run_id", "stage", "scope"])
@@ -697,7 +705,11 @@ def _write_csv(path, rows, default_fields=None):
 
 
 def quality_check(config, dataset_name, folder):
-    """Untimed sample/reference identity and called-allele reconstruction checks."""
+    """Exhaustively validate complete diplotypes in bounded physical-chunk batches.
+
+    The matrix budget bounds decoded source calls, not trees, the source tile,
+    remapping buffers or the output variant decoder's scratch.
+    """
     dataset = next(item for item in config["datasets"] if item["name"] == dataset_name)
     paths = prepared_inputs(config, dataset)
     reference = tskit.load(paths.reference)
@@ -732,23 +744,63 @@ def quality_check(config, dataset_name, folder):
             or (node.time, node.flags, node.individual, node.population) != assignments
         ):
             raise ValueError("Output sample metadata differs")
-    reader = _native_reader(cfg, reference, jobs, dataset.get("matching_cache_size"), 1)
-    try:
-        observed = np.stack([reader.read_haplotype(job) for job in jobs])
-        mapper = reader.allele_mapper
-    finally:
-        reader.shutdown()
+    if not np.array_equal(output.sites_position, reference.sites_position):
+        raise ValueError("Output changed reference sites")
+    inputs = haplotypes.prepare_samples(cfg.sources["samples"], reference, jobs)
+    store = tsinfer.vcz.open_store(inputs.path)
+    ploidy = store["call_genotype"].shape[2]
+    budget = config["performance"]["quality_max_matrix_mib"] * 1024**2
+    bytes_per_sample = reference.num_sites * ploidy * np.dtype(np.int8).itemsize
+    capacity = int(budget // bytes_per_sample)
+    if capacity < 1:
+        raise ValueError(
+            "performance.quality_max_matrix_mib cannot fit one complete sample "
+            f"({bytes_per_sample} bytes)"
+        )
     errors = 0
-    for variant in output.variants(samples=sample_nodes, isolated_as_missing=False):
-        site = variant.site.id
-        called = observed[:, site] >= 0
-        expected = mapper.forward_map()[site, observed[called, site]]
-        actual = np.asarray(variant.alleles, dtype=object)[variant.genotypes[called]]
-        errors += int(np.count_nonzero(expected != actual))
+    batches = 0
+    max_matrix_bytes = 0
+    mapper = inputs.allele_mapper.forward_map()
+    temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
+    if temp_parent is not None:
+        temp_parent = pathlib.Path(temp_parent).expanduser()
+        temp_parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=temp_parent, prefix="quality_") as temporary:
+        directory = pathlib.Path(temporary)
+        for chunk in inputs.chunks:
+            chunk_jobs = chunk.job_indices.reshape(-1, ploidy)
+            for start in range(0, len(chunk.columns), capacity):
+                stop = start + capacity
+                batch = haplotypes.SampleChunk(
+                    chunk.block,
+                    chunk.columns[start:stop],
+                    chunk_jobs[start:stop].ravel(),
+                )
+                slab = haplotypes.load_sample_chunk(inputs, batch, directory)
+                observed = slab.calls.open()
+                try:
+                    nodes = sample_nodes[batch.job_indices]
+                    for variant in output.variants(
+                        samples=nodes, isolated_as_missing=False
+                    ):
+                        site = variant.site.id
+                        called = observed[:, site] >= 0
+                        expected = mapper[site, observed[called, site]]
+                        actual = np.asarray(variant.alleles, dtype=object)[
+                            variant.genotypes[called]
+                        ]
+                        errors += int(np.count_nonzero(expected != actual))
+                    max_matrix_bytes = max(max_matrix_bytes, observed.nbytes)
+                    batches += 1
+                finally:
+                    haplotypes.close_mapping(observed)
+                    slab.calls.path.unlink()
     if errors > 0:
         raise ValueError(f"{errors} called alleles differ")
     return {
         "called_allele_errors": errors,
+        "batches": batches,
+        "max_matrix_bytes": max_matrix_bytes,
         "haplotypes": len(jobs),
         "sample_edges": int(np.count_nonzero(output.edges_child >= reference.num_nodes)),
     }

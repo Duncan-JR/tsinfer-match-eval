@@ -2,13 +2,15 @@
 
 import dataclasses
 import pathlib
+import sys
+import time
 
 import numpy as np
 import tsinfer
 import tskit
 import zarr
 
-from lib import haplotypes, matching, utils
+from lib import benchmark, haplotypes, matching, performance, utils
 
 
 def canonical(path):
@@ -97,9 +99,9 @@ def make_tiny(root, settings, hmm):
     canonical_alleles = alleles.copy()
     canonical_alleles[1::2] = canonical_alleles[1::2, ::-1]
     panel_calls = np.zeros((sites, 3, 1), dtype=np.int8)
-    panel_calls[1:8:2, 0, 0] = 1
-    panel_calls[2:12:3, 1, 0] = 1
-    panel_calls[3:12:2, 2, 0] = 1
+    panel_calls[1:6:2, 0, 0] = 1
+    panel_calls[2:6:2, 1, 0] = 1
+    panel_calls[7:12:2, 2, 0] = 1
     intervals = np.array([[0, positions[6]], [positions[6], positions[-1] + 10]])
     height, width, _ = settings["panel_chunks"]
     ancestors = tsinfer.vcz.setup_ancestor_zarr(
@@ -147,7 +149,9 @@ def make_tiny(root, settings, hmm):
         tables.individuals.add_row(metadata=metadata)
     for metadata in populations_md:
         tables.populations.add_row(metadata=metadata)
+    tables.nodes.add_row(time=6)
     tables.nodes.add_row(time=5)
+    tables.edges.add_row(0, tables.sequence_length, 0, 1)
     for ancestor in range(3):
         node = tables.nodes.add_row(
             time=3 - ancestor,
@@ -157,11 +161,11 @@ def make_tiny(root, settings, hmm):
                 "ploidy_index": 0,
             },
         )
-        tables.edges.add_row(0, tables.sequence_length, 0, node)
+        tables.edges.add_row(0, tables.sequence_length, 1, node)
     for site, position in enumerate(positions):
         tables.sites.add_row(position, ancestral[site])
         for ancestor in np.flatnonzero(panel_calls[site, :, 0] == 1):
-            tables.mutations.add_row(site, int(ancestor + 1), canonical_alleles[site, 1])
+            tables.mutations.add_row(site, int(ancestor + 2), canonical_alleles[site, 1])
     tables.sort()
     tables.tree_sequence().dump(reference)
     return Tiny(root, cfg_path, reference, panel, masked, calls, columns)
@@ -178,3 +182,20 @@ def prepared(tiny, directory):
     jobs.sort(key=lambda job: job.haplotype_index)
     samples = haplotypes.prepare_samples(cfg.sources["samples"], reference, jobs)
     return reference, jobs, samples
+
+
+def delayed_trial(spec_path, delay):
+    """Importable validation delay used only to exercise the real trial launcher."""
+    original = benchmark.quality_check
+
+    def validate(*args):
+        time.sleep(delay)
+        return original(*args)
+
+    benchmark.quality_check = validate
+    with performance.sample_memory():
+        return benchmark.trial(spec_path)
+
+
+if __name__ == "__main__":
+    delayed_trial(pathlib.Path(sys.argv[1]), float(sys.argv[2]))

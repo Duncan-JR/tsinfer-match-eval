@@ -60,5 +60,6 @@ performance:
   trial_timeout_s: 3600
   collect_stages: false
   quality_checks: true
+  quality_max_matrix_mib: 256
   resident_max_matrix_mib: 512
   resident_max_private_mib: 8192

@@ -226,7 +226,10 @@ Performance is opt-in and runs fresh trial processes sequentially. Each
 experiment directory must be empty. Output is under
 `data/performance/{experiment_id}/`: configuration and dependency/source
 manifest, `runs.csv`, `stages.csv`, optional `quality.json`, trial logs,
-process-tree memory samples and matched trees.
+process-tree memory samples and matched trees. Whole-trial memory includes
+validation; use `window_peak_private_bytes` for matching-memory comparisons.
+Validation timing is recorded separately, and completed matching measurements
+are retained if validation fails.
 Each performance dataset accepts scalar or list `af_cutoff` and requires scalar
 `min_region_size_kb`. Ordinary matching and diagnostics use each dataset's own
 Cartesian product. Both keys are required on datasets; top-level keys are rejected. Each greedy cutoff gets a separate trial; Full HMM runs
@@ -274,7 +277,8 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
 | `collect_stages` | Enable diagnostic aggregate setup, packing, loading, numeric matching, gap/assembly and output timings. Use `false` for headline totals. |
-| `quality_checks` | Untimed reference/sample metadata and called-allele reconstruction checks. |
+| `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
+| `quality_max_matrix_mib` | Positive decoded validation-call matrix budget in MiB, batching whole samples within physical chunks. Must fit one sample. Excludes reference/output trees, one decoded source tile, remapping buffers and decoder scratch. Splitting a chunk may reread tiles. |
 | `resident_max_matrix_mib` | Maximum decoded sample matrix for resident trials. |
 | `resident_max_private_mib` | Maximum summed private process-tree memory for resident trials. |
 

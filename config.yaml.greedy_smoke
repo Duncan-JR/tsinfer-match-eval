@@ -46,7 +46,7 @@ helper_threads:
   zarr_threading_max_workers: 1
   blas_threads: 1
 performance:
-  experiment_id: greedy_smoke_20261023_v1
+  experiment_id: greedy_smoke_20261023_v2
   datasets:
   - out_of_africa_n100_1mbp
   - tgp_chr20_n100_1mbp
@@ -107,4 +107,7 @@ smoke:
       - 4
       - 2
       - 1
-      quality_max_matrix_mib: 5.0e-05
+      quality_max_matrix_mib: 3.0e-05
+  validation_delay:
+    timeout_s: 8
+    delay_s: 20
