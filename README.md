@@ -124,7 +124,8 @@ Each `datasets` entry has:
 
 Coordinates remain absolute when selecting a region. Main products are:
 
-- `samples/{name}_samples_masked.zarr`: count-annotated sample copy.
+- `samples/{name}_samples_masked.zarr`: count-annotated sample copy. Annotation
+  counts selected columns one physical variant/sample tile at a time.
 - `configs/{name}_ancestor_inference.toml`: native inference/matching config.
 - `ancestors/{name}_inferred_ancestors.zarr` and `.trees`: panel and raw reference.
 - `matches/{name}_inferred_samples_raw.trees`: native full-HMM baseline.

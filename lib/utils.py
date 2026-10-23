@@ -35,7 +35,7 @@ def annotate_derived_counts(
 ) -> None:
     """Copy the VCZ and annotate derived counts for the native selected cohort.
 
-    Retain both original axes. Read selected columns in physical variant chunks;
+    Retain both original axes. Read selected columns within physical tiles;
     missing calls do not enter either allele count or frequency denominator.
     Under the biallelic input contract, non-reference ancestry makes REF derived.
     """
@@ -43,19 +43,32 @@ def annotate_derived_counts(
     store = zarr.open_group(output, mode="a", use_consolidated=False)
     columns = tsinfer.vcz.resolve_samples_selection(store, samples)
     genotypes = store["call_genotype"]
+    sample_blocks = columns // genotypes.chunks[1]
+    selected_chunks = {}
+    for block in np.unique(sample_blocks):
+        selected = columns[sample_blocks == block]
+        selected_chunks[int(block)] = selected - block * genotypes.chunks[1]
     allele_count = np.zeros(genotypes.shape[0], dtype=np.int64)
     frequency = np.zeros(genotypes.shape[0], dtype=float)
     for start in range(0, genotypes.shape[0], genotypes.chunks[0]):
         end = min(start + genotypes.chunks[0], genotypes.shape[0])
-        calls = genotypes.oindex[start:end, columns, :]
         alleles = store["variant_allele"][start:end]
         ancestral = alleles[:, 0]
         if not ancestral_state.get("is_reference", False):
             ancestral = store[ancestral_state["field"]][start:end]
         reference_ancestral = ancestral == alleles[:, 0]
-        derived = np.where(reference_ancestral[:, None, None], calls == 1, calls == 0)
-        counts = derived.sum(axis=(1, 2))
-        called = (calls >= 0).sum(axis=(1, 2))
+        derived_code = np.where(reference_ancestral, 1, 0)
+        counts = np.zeros(end - start, dtype=np.int64)
+        called = np.zeros(end - start, dtype=np.int64)
+        variant_block = start // genotypes.chunks[0]
+        for sample_block, local_columns in selected_chunks.items():
+            tile = genotypes.blocks[variant_block, sample_block, :]
+            calls = tile[:, local_columns, :]
+            del tile
+            derived = calls == derived_code[:, None, None]
+            counts += derived.sum(axis=(1, 2))
+            called += (calls >= 0).sum(axis=(1, 2))
+            del calls, derived
         allele_count[start:end] = counts
         np.divide(counts, called, out=frequency[start:end], where=called > 0)
     chunks = store["variant_position"].chunks

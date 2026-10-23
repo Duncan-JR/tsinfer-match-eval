@@ -6,6 +6,7 @@ import json
 
 import numpy as np
 import pytest
+import tsinfer
 import tskit
 
 from lib import benchmark, diagnostics, haplotypes, matching, utils
@@ -267,3 +268,51 @@ class TestDiagnosticTrialSources:
         assert paths == products.full + [run.stitched for run in products.runs]
         diagnostics.resolve_benchmark_outputs(smoke_config, products)
         assert products.full_benchmark_runs == {}
+
+
+class TestDerivedCounts:
+    def test_physical_tiles_match_dense(self, tiny, tmp_path, monkeypatch):
+        source = tsinfer.vcz.open_store(tiny.source)
+        original_calls = source["call_genotype"][:]
+        block_type = type(source["call_genotype"].blocks)
+        original = block_type.__getitem__
+        reads = []
+
+        def read(indexer, key):
+            if indexer.array.path == "call_genotype":
+                reads.append(key)
+            return original(indexer, key)
+
+        monkeypatch.setattr(block_type, "__getitem__", read)
+        output = tmp_path / "annotated.zarr"
+        selection = ",".join(f"s{column}" for column in tiny.columns)
+        utils.annotate_derived_counts(
+            tiny.source, output, {"field": "variant_ancestral_state"}, selection
+        )
+        result = tsinfer.vcz.open_store(output)
+        calls = original_calls[:, tiny.columns, :]
+        alleles = source["variant_allele"][:]
+        ancestral = source["variant_ancestral_state"][:]
+        polarity = ancestral == alleles[:, 0]
+        expected = np.where(polarity[:, None, None], calls == 1, calls == 0).sum(
+            axis=(1, 2)
+        )
+        called = (calls >= 0).sum(axis=(1, 2))
+        frequencies = np.zeros(len(expected))
+        np.divide(expected, called, out=frequencies, where=called > 0)
+        np.testing.assert_array_equal(
+            result["variant_match_eval_derived_ac"][:], expected
+        )
+        np.testing.assert_array_equal(
+            result["variant_match_eval_derived_af"][:], frequencies
+        )
+        np.testing.assert_array_equal(source["call_genotype"][:], original_calls)
+        for name in source.array_keys():
+            if not name.startswith("variant_match_eval"):
+                np.testing.assert_array_equal(source[name][:], result[name][:])
+        expected_reads = [
+            (variant, sample, slice(None))
+            for variant in range(4)
+            for sample in (0, 2, 3)
+        ]
+        assert reads == expected_reads
