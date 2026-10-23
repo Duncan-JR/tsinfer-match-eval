@@ -182,24 +182,9 @@ def make_worker(reference, catalog, num_alleles, parameters):
     )
     dummy = np.full(len(positions), -1, dtype=np.int8)
     dummy.flags.writeable = False
-    focal_runs(dummy, worker, 1, 0, len(dummy))
+    order = greedy.candidates(dummy, worker.exact, 0, len(dummy))
+    greedy.cover(worker.exact, order, 1)
     return worker
-
-
-def focal_runs(haplotype, worker, minimum, start, end):
-    """Discover, extend, stable-sort and cover using reusable worker scratch.
-
-    Returned views are consumed within :func:`match_stitched_haplotype`; result
-    ownership changes only when the final path is assembled.
-    """
-    state = worker.exact
-    order = greedy.candidates(haplotype, state, start, end)
-    written = greedy.cover(state, order, minimum)
-    return CopyingRuns(
-        state.run_left[:written],
-        state.run_right[:written],
-        state.catalog.parents[state.run_ids[:written]],
-    )
 
 
 def _match_region(haplotype, worker, start, end):
@@ -216,21 +201,6 @@ def _match_region(haplotype, worker, start, end):
     copied = worker.match_out[start:end]
     mutations = np.flatnonzero((observed >= 0) & (observed != copied)) + start
     return RegionMatch(runs, mutations)
-
-
-def _match_gap(haplotype, worker, start, end, blocks, mutations):
-    """Split independent gap HMM calls at the existing inference boundaries."""
-    first = np.searchsorted(worker.boundaries, start, side="right")
-    last = np.searchsorted(worker.boundaries, end, side="left")
-    cursor = start
-    calls = 0
-    for stop in [*worker.boundaries[first:last], end]:
-        result = _match_region(haplotype, worker, cursor, int(stop))
-        blocks.append(result.runs)
-        mutations.append(result.mutation_site)
-        calls += 1
-        cursor = int(stop)
-    return calls
 
 
 def _assemble_result(job_index, blocks, mutation_blocks, haplotype, worker, collector):
@@ -260,31 +230,56 @@ def _assemble_result(job_index, blocks, mutation_blocks, haplotype, worker, coll
 def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=None):
     """Match one complete canonical haplotype against a prepared reference.
 
-    Exact intervals contain called derived seeds and respect clipped supports.
-    Their touching unions are filtered before taking the complement. Each gap
-    starts fresh HMM likelihoods; topology reuse supplies no boundary condition.
+    Filter exact components, then copy supported one-site gaps using
+    :func:`lib.greedy.stitched_intervals`. Correct called bridge disagreements
+    with sample mutations. Remaining HMM intervals start fresh likelihoods.
     """
     called = np.flatnonzero(haplotype >= 0)
     start, end = 0, len(haplotype)
     if len(called) > 0:
         start, end = int(called[0]), int(called[-1]) + 1
+    state = worker.exact
     with performance.measure(collector, "candidate_extension_cover", "thread"):
-        focal = focal_runs(haplotype, worker, minimum, start, end)
-    blocks = [focal]
+        order = greedy.candidates(haplotype, state, start, end)
+        count = greedy.cover(state, order, minimum)
+    blocks = []
     mutations = []
-    cursor = start
     focal_sites = 0
+    focal_runs = 0
     gap_calls = 0
+    one_site_gap_sites = 0
     with performance.measure(collector, "gap_matching_assembly", "thread"):
-        for left, right in zip(focal.left, focal.right, strict=True):
-            if cursor < left:
-                gap_calls += _match_gap(
-                    haplotype, worker, cursor, int(left), blocks, mutations
+        intervals = greedy.stitched_intervals(
+            state, count, start, end, worker.boundaries
+        )
+        for interval in intervals:
+            if interval.ancestor is None:
+                region = _match_region(haplotype, worker, interval.left, interval.right)
+                blocks.append(region.runs)
+                mutations.append(region.mutation_site)
+                gap_calls += 1
+            else:
+                ancestor = interval.ancestor
+                parent = state.catalog.parents[ancestor]
+                blocks.append(
+                    CopyingRuns(
+                        np.asarray([interval.left], dtype=np.int64),
+                        np.asarray([interval.right], dtype=np.int64),
+                        np.asarray([parent], dtype=np.int32),
+                    )
                 )
-            focal_sites += int(right - left)
-            cursor = int(right)
-        if cursor < end:
-            gap_calls += _match_gap(haplotype, worker, cursor, end, blocks, mutations)
+                focal_sites += interval.right - interval.left
+                focal_runs += 1
+                one_site_gap_sites += len(interval.bridged_sites)
+                corrections = []
+                for site in interval.bridged_sites:
+                    offset = state.catalog.offsets[ancestor]
+                    offset += site - state.catalog.starts[ancestor]
+                    sample_call = haplotype[site]
+                    if sample_call >= 0 and sample_call != state.packed[offset]:
+                        corrections.append(site)
+                if len(corrections) > 0:
+                    mutations.append(np.asarray(corrections, dtype=np.int64))
         result = _assemble_result(
             job_index, blocks, mutations, haplotype, worker, collector
         )
@@ -294,8 +289,9 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
             domain_sites=end - start,
             focal_sites=focal_sites,
             gap_sites=end - start - focal_sites,
-            focal_runs=len(focal.left),
+            focal_runs=focal_runs,
             gap_calls=gap_calls,
+            one_site_gap_sites=one_site_gap_sites,
         )
     return result
 

@@ -50,8 +50,13 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    touching intervals. Short intervals can bridge a retained union. Equal
    reaches keep the first interval in stable panel order. This wrapper uses
    genome-wide mean density, rather than checking each union's physical length.
-7. Match uncovered gaps independently with the full HMM, splitting calls at
-   inference boundaries. Append completed results immediately, squash adjacent
+7. Split uncovered gaps at inference boundaries. For a one-site gap (one
+   inference-site index), copy a supported parent with a known allele: prefer
+   the left retained parent, then the right, then the activated ancestor with
+   the furthest support end in stable support-start order. Candidates rejected
+   by the minimum remain eligible for this choice. Correct called disagreements
+   with sample mutations; missing observations need no mutation. Match remaining
+   gaps independently with the full HMM. Append completed results, squash adjacent
    equal-parent/child edges once, then finalise and sort tables.
 
 The greedy cover minimises copying runs within each retained exact union.
@@ -82,7 +87,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
 | `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. Replace the old `min_focal_region_size` config key rather than reusing its site-count values as kb. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
-| `hmm.mismatch` | HMM mismatch probability, strictly between 0 and 1. Exact focal copying always allows zero mismatches. |
+| `hmm.mismatch` | Mismatch probability for remaining HMM calls, strictly between 0 and 1. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
 | `inference_threads` | Native ancestor inference workers and requested diagnostics CPU budget. Diagnostics uses the actual Snakemake-granted threads. |
 | `matching_threads` | Native ancestor/baseline threads and greedy process workers. |
@@ -143,7 +148,8 @@ collect benchmark timings or memory samples.
 ## Diagnostics
 
 Ordinary matching writes raw trees only. Reconstruct focal masks and compare raw
-copying parents across the configured dataset/AF/minimum grid explicitly:
+copying parents across the configured dataset/AF/minimum grid explicitly.
+Regenerate stitched trees before rebuilding masks or diagnostics with this policy:
 
 ```sh
 uv run snakemake diagnostics --cores all
@@ -152,7 +158,8 @@ uv run snakemake diagnostics --cores all
 Install `pigz` on PATH and sync the Python dependencies (including `tszip`). The
 driver prepares shared copying-path indexes once, then uses spawn workers to decode
 bounded waves of physical sample chunks and analyse individual haplotypes. Exact
-extension, sorting and baseline support are shared across minimum sizes. It does
+extension, sorting, activated-support lookup and baseline support are shared across
+minimum sizes. It does
 not run HMM matching. Numerical/codec
 helpers are serial; tree compression and level-1 pigz run after analysis workers
 exit, within the granted CPU budget. An enabled `performance` suite is a required

@@ -1,7 +1,7 @@
-"""Reconstruct exact focal masks, compare raw paths and package one experiment.
+"""Reconstruct greedy copying masks, compare raw paths and package one experiment.
 
 Matching never calls this module. The driver uses the native roster and packed
-reference helpers, and workers run only exact kernels and table-based analysis.
+reference helpers; workers reconstruct copying decisions and analyse raw paths.
 """
 
 import concurrent.futures as cf
@@ -250,30 +250,18 @@ class MaskRuns:
     end: int
 
 
-def mask_runs(state, order, minimum, start, end):
-    """Union touching cover runs, ignoring parents, then partition the domain."""
+def mask_runs(state, order, minimum, start, end, boundaries):
+    """Coalesce the same copying/HMM decisions used by stitched matching."""
     count = greedy.cover(state, order, minimum)
-    components = []
-    for left, right in zip(state.run_left[:count], state.run_right[:count], strict=True):
-        if components and left == components[-1][1]:
-            components[-1][1] = int(right)
-        else:
-            components.append([int(left), int(right)])
     lefts, rights, gaps = [], [], []
-    cursor = start
-    for left, right in components:
-        if cursor < left:
-            lefts.append(cursor)
-            rights.append(left)
-            gaps.append(True)
-        lefts.append(left)
-        rights.append(right)
-        gaps.append(False)
-        cursor = right
-    if cursor < end:
-        lefts.append(cursor)
-        rights.append(end)
-        gaps.append(True)
+    for interval in greedy.stitched_intervals(state, count, start, end, boundaries):
+        is_gap = interval.ancestor is None
+        if len(gaps) > 0 and gaps[-1] == is_gap:
+            rights[-1] = interval.right
+        else:
+            lefts.append(interval.left)
+            rights.append(interval.right)
+            gaps.append(is_gap)
     return MaskRuns(
         np.asarray(lefts, dtype=np.int64),
         np.asarray(rights, dtype=np.int64),
@@ -665,6 +653,7 @@ class WorkerData:
     panel_path: pathlib.Path
     exact: greedy.ExactState
     axis: SiteAxis
+    boundaries: np.ndarray
     labels: list[dict]
     runs: list[Run]
     full: IndexedPaths
@@ -710,12 +699,15 @@ def _initialise_worker(
 ):
     global _worker
     _serial_helpers(helpers)
+    boundary_sites = np.searchsorted(axis.positions, axis.inference_intervals.ravel())
+    boundaries = np.unique(boundary_sites)
     _worker = WorkerData(
         samples,
         directory,
         panel_path,
         greedy.make_state(catalog),
         axis,
+        boundaries,
         labels,
         runs,
         full_index.open(),
@@ -752,7 +744,7 @@ def _analyse_haplotype(task):
         full_support = full_path.support()
         for run in state.runs:
             minimum = run.min_focal_region_size
-            mask = mask_runs(state.exact, order, minimum, start, end)
+            mask = mask_runs(state.exact, order, minimum, start, end, state.boundaries)
             stitched_path = state.stitched[run.min_region_size_kb][index]
             stitched = stitched_path.parents_at_sites(state.axis.positions)
             analysis = comparison_metrics(
