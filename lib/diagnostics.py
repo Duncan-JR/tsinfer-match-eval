@@ -745,7 +745,7 @@ def _analyse_haplotype(task):
         start, end = 0, len(haplotype)
         if len(called) > 0:
             start, end = int(called[0]), int(called[-1]) + 1
-        order = greedy.candidates(haplotype, state.exact)
+        order = greedy.candidates(haplotype, state.exact, start, end)
         label = state.labels[index]
         full_path = state.full[index]
         full = full_path.parents_at_sites(state.axis.positions)

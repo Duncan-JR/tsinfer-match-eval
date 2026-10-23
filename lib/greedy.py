@@ -34,8 +34,8 @@ def make_state(catalog):
     return ExactState(catalog, catalog.packed.open(), *scratch)
 
 
-def candidates(haplotype, state):
-    """Extend and stable-sort once, before covering one or several minima."""
+def candidates(haplotype, state, start, end):
+    """Extend within the sample domain and stable-sort before minimum filtering."""
     catalog = state.catalog
     count = extend_exact(
         haplotype,
@@ -44,6 +44,8 @@ def candidates(haplotype, state):
         catalog.starts,
         catalog.stops,
         catalog.offsets,
+        start,
+        end,
         state.candidate_left,
         state.candidate_right,
         state.candidate_ids,
@@ -66,27 +68,39 @@ def cover(state, order, minimum):
 
 
 @numba.njit(cache=True, nogil=True)
-def extend_exact(haplotype, packed, seeds, starts, stops, offsets, left, right, ids):
-    """Discover derived seeds and extend locally within their clipped supports."""
+def extend_exact(
+    haplotype, packed, seeds, starts, stops, offsets, start, end, left, right, ids
+):
+    """Skip missing observations, stopping at disagreements or unknown references.
+
+    Intersect maximum supports with the sample domain before extension so
+    terminal missing calls cannot contribute to a minimum-size component.
+    """
     count = 0
     for ancestor in range(len(seeds)):
         seed = seeds[ancestor]
         if haplotype[seed] != 1:
             continue
-        start = starts[ancestor]
-        stop = stops[ancestor]
-        offset = offsets[ancestor] - start
+        lo_bound = max(starts[ancestor], start)
+        hi_bound = min(stops[ancestor], end)
+        offset = offsets[ancestor] - starts[ancestor]
         lo = seed
-        while lo > start:
+        while lo > lo_bound:
             site = lo - 1
-            call = haplotype[site]
-            if call < 0 or call != packed[offset + site]:
+            sample_call = haplotype[site]
+            ancestor_call = packed[offset + site]
+            if ancestor_call < 0:
+                break
+            if sample_call >= 0 and sample_call != ancestor_call:
                 break
             lo = site
         hi = seed + 1
-        while hi < stop:
-            call = haplotype[hi]
-            if call < 0 or call != packed[offset + hi]:
+        while hi < hi_bound:
+            sample_call = haplotype[hi]
+            ancestor_call = packed[offset + hi]
+            if ancestor_call < 0:
+                break
+            if sample_call >= 0 and sample_call != ancestor_call:
                 break
             hi += 1
         left[count] = lo

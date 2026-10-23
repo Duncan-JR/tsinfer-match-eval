@@ -37,8 +37,11 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    clipped to the containing inference interval, into one temporary mapped file.
 5. Load selected samples by physical Zarr chunks into temporary mapped slabs.
    Each worker matches one complete haplotype. A derived sample seed activates
-   its ancestor; extend exactly in both directions until mismatch, missing call,
-   support end or inference boundary. Different ancestors may share a seed.
+   its ancestor. Skip missing sample observations while extending in both
+   directions; called disagreements and unknown ancestor calls stop extension,
+   as do support ends and inference boundaries. Clip supports to the sample's
+   called domain before extension and minimum filtering. Different ancestors
+   may share a seed; missing seeds activate none.
 6. Convert `min_region_size_kb` once per matching run to a rounded mean site
    count: `max(1, round(kb * 1000 * num_sites / (last_position - first_position)))`,
    using the reference's `sites_position` array. Stable-sort intervals by left

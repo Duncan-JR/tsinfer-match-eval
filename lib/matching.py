@@ -182,18 +182,18 @@ def make_worker(reference, catalog, num_alleles, parameters):
     )
     dummy = np.full(len(positions), -1, dtype=np.int8)
     dummy.flags.writeable = False
-    focal_runs(dummy, worker, 1)
+    focal_runs(dummy, worker, 1, 0, len(dummy))
     return worker
 
 
-def focal_runs(haplotype, worker, minimum):
+def focal_runs(haplotype, worker, minimum, start, end):
     """Discover, extend, stable-sort and cover using reusable worker scratch.
 
     Returned views are consumed within :func:`match_stitched_haplotype`; result
     ownership changes only when the final path is assembled.
     """
     state = worker.exact
-    order = greedy.candidates(haplotype, state)
+    order = greedy.candidates(haplotype, state, start, end)
     written = greedy.cover(state, order, minimum)
     return CopyingRuns(
         state.run_left[:written],
@@ -269,7 +269,7 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
     if len(called) > 0:
         start, end = int(called[0]), int(called[-1]) + 1
     with performance.measure(collector, "candidate_extension_cover", "thread"):
-        focal = focal_runs(haplotype, worker, minimum)
+        focal = focal_runs(haplotype, worker, minimum, start, end)
     blocks = [focal]
     mutations = []
     cursor = start
