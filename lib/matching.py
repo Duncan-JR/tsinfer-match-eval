@@ -556,6 +556,7 @@ def match_stitched_samples(
         )
     native = tsinfer.config.Config.from_toml(config_path)
     panel_path = native.ancestors[0].path
+    del native
     cfg = _sample_config(config_path, ancestors_ts_path, output_path)
     utils.configure_helpers(helper_threads)
     with performance.measure(collector, "input_setup"):
@@ -596,6 +597,7 @@ def match_stitched_samples(
                 "Reference populations disagree with selected sample metadata"
             )
         nodes = _create_sample_nodes(tables, jobs)
+        del positions, individuals, populations
     if workers > len(jobs):
         raise ValueError(f"Requested {workers} workers for only {len(jobs)} haplotypes")
     ctx = mp.get_context("spawn")
@@ -607,7 +609,7 @@ def match_stitched_samples(
     processes = []
     loader = None
     watcher = None
-    success = False
+    matched = False
     diagnostics = collector is not None and collector.stages
     if temp_dir is not None:
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -637,6 +639,7 @@ def match_stitched_samples(
                     packed_calls=catalog.packed.shape[0],
                     eligible_ancestors=len(catalog.seeds),
                 )
+            del reference
             for _ in range(workers):
                 process = ctx.Process(
                     target=_worker_main,
@@ -657,6 +660,7 @@ def match_stitched_samples(
                 )
                 process.start()
                 processes.append(process)
+            del cfg
             watcher = threading.Thread(
                 target=_watch_workers, args=(processes, events, stopping)
             )
@@ -674,6 +678,7 @@ def match_stitched_samples(
                 _, measurements = _event(events)
                 if collector is not None:
                     collector.merge(measurements)
+            del catalog
             resident_slabs = None
             if resident:
                 resident_slabs = [
@@ -706,18 +711,14 @@ def match_stitched_samples(
                     collector,
                     resident_slabs,
                 )
-            with performance.measure(collector, "finalise_output"):
-                tables.edges.squash()
-                ts = tsinfer.matching.finalise_match_tables(tables)
-                ts.dump(output_path)
-            success = True
+            matched = True
         finally:
             stopping.set()
             for _ in range(sample_prefetch_chunks):
                 slots.release()
             if loader is not None:
                 loader.join()
-            if success:
+            if matched:
                 for _ in processes:
                     work.put(None)
             else:
@@ -728,11 +729,15 @@ def match_stitched_samples(
             if watcher is not None:
                 watcher.join()
             for channel in (work, events):
-                if not success:
+                if not matched:
                     channel.cancel_join_thread()
                 channel.close()
-                if success:
+                if matched:
                     channel.join_thread()
+        with performance.measure(collector, "finalise_output"):
+            tables.edges.squash()
+            ts = tsinfer.matching.finalise_match_tables(tables)
+            ts.dump(output_path)
     logger.info(
         "Wrote greedy stitched samples to %s using %d workers", output_path, workers
     )

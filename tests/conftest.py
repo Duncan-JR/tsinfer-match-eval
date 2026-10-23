@@ -1,10 +1,14 @@
 """Configuration and bounded Zarr v3 fixture shared by smoke checks."""
 
 import json
+import multiprocessing as mp
 import pathlib
 import shutil
+import threading
+import weakref
 
 import pytest
+import tskit
 import yaml
 
 from lib import benchmark, matching
@@ -86,3 +90,36 @@ def saved_suite(tmp_path, smoke_config, monkeypatch):
         (folder / "samples_raw.trees").touch()
     benchmark._write_csv(root / "runs.csv", [{**run, "status": "ok"} for run in runs])
     return root
+
+
+@pytest.fixture
+def lifetime_records(monkeypatch, tiny):
+    processes = []
+    threads = []
+    references = []
+    context = mp.get_context("spawn")
+    create_process = context.Process
+    create_thread = threading.Thread
+    load = tskit.load
+
+    def process(*args, **kwargs):
+        result = create_process(*args, **kwargs)
+        processes.append(result)
+        return result
+
+    def thread(*args, **kwargs):
+        result = create_thread(*args, **kwargs)
+        if kwargs.get("target") in (matching._load_samples, matching._watch_workers):
+            threads.append(result)
+        return result
+
+    def reference(path, **kwargs):
+        result = load(path, **kwargs)
+        if pathlib.Path(path) == tiny.reference:
+            references.append(weakref.ref(result))
+        return result
+
+    monkeypatch.setattr(context, "Process", process)
+    monkeypatch.setattr(threading, "Thread", thread)
+    monkeypatch.setattr(tskit, "load", reference)
+    return {"processes": processes, "threads": threads, "references": references}

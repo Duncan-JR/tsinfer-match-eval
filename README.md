@@ -295,7 +295,8 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 
 `from_reference` is the primary comparison: it times the deployed runner from
 existing ancestor trees through finished outputs, including startup, packing,
-loading, JIT cache loading/compilation and output. Both methods use identical
+loading, JIT cache loading/compilation, worker shutdown and output. Matching
+workers and the loader stop before edge squashing and output finalisation. Both methods use identical
 inputs, biological settings, CPU reservations and requested products.
 
 `resident_match` excludes input decoding and HMM/JIT setup. Greedy includes

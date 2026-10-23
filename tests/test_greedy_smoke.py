@@ -1,6 +1,7 @@
 """Focused checks for plans/further_greedy_optimisations.md."""
 
 import concurrent.futures as cf
+import contextlib
 import copy
 import csv
 import dataclasses
@@ -422,3 +423,109 @@ class TestReferencePacking:
             snapshots.append(calls.copy())
             haplotypes.close_mapping(calls)
         np.testing.assert_array_equal(*snapshots)
+
+
+class TestMatchingLifetime:
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_workers_exit_before_finalise(
+        self, tiny, tiny_config, lifetime_records, monkeypatch, workers
+    ):
+        original = tsinfer.matching.finalise_match_tables
+        finalised = []
+
+        def finalise(tables):
+            assert len(lifetime_records["processes"]) == workers
+            assert all(
+                p.exitcode == 0 and not p.is_alive()
+                for p in lifetime_records["processes"]
+            )
+            assert len(lifetime_records["threads"]) == 2
+            assert all(not thread.is_alive() for thread in lifetime_records["threads"])
+            assert len(lifetime_records["references"]) == 1
+            assert all(ref() is None for ref in lifetime_records["references"])
+            finalised.append(True)
+            return original(tables)
+
+        monkeypatch.setattr(tsinfer.matching, "finalise_match_tables", finalise)
+        output = tiny.root / "lifetime.trees"
+        matching.match_stitched_samples(
+            tiny.config,
+            tiny.reference,
+            output,
+            af_cutoff=1,
+            min_region_size_kb=0,
+            workers=workers,
+            sample_prefetch_chunks=1,
+            max_pending_haplotypes=2,
+            helper_threads=tiny_config["helper_threads"],
+            temp_dir=tiny.root,
+        )
+        assert finalised == [True]
+        assert not list(tiny.root.glob("greedy_*"))
+
+    @pytest.mark.parametrize("failure", ["seed", "finalise"])
+    def test_failure_cleans_workers_and_slabs(
+        self, tiny, tiny_config, lifetime_records, monkeypatch, failure
+    ):
+        if failure == "seed":
+            panel = zarr.open_group(tiny.panel, mode="a", use_consolidated=False)
+            panel["call_genotype"][1, 0, 0] = 0
+            message = "not called and derived"
+        else:
+
+            def fail(tables):
+                assert all(not p.is_alive() for p in lifetime_records["processes"])
+                raise RuntimeError("finaliser failure")
+
+            monkeypatch.setattr(tsinfer.matching, "finalise_match_tables", fail)
+            message = "finaliser failure"
+        with pytest.raises(RuntimeError, match=message):
+            matching.match_stitched_samples(
+                tiny.config,
+                tiny.reference,
+                tiny.root / "failed.trees",
+                af_cutoff=1,
+                min_region_size_kb=0,
+                workers=2,
+                sample_prefetch_chunks=1,
+                max_pending_haplotypes=2,
+                helper_threads=tiny_config["helper_threads"],
+                temp_dir=tiny.root,
+            )
+        assert all(not p.is_alive() for p in lifetime_records["processes"])
+        assert all(not thread.is_alive() for thread in lifetime_records["threads"])
+        assert not list(tiny.root.glob("greedy_*"))
+
+    def test_resident_window_ends_before_shutdown(
+        self, tiny, tiny_config, lifetime_records
+    ):
+        boundaries = []
+
+        @contextlib.contextmanager
+        def window():
+            assert all(p.is_alive() for p in lifetime_records["processes"])
+            assert list(tiny.root.glob("greedy_*/samples_*.bin"))
+            boundaries.append("start")
+            yield
+            assert all(p.is_alive() for p in lifetime_records["processes"])
+            assert not list(tiny.root.glob("greedy_*/samples_*.bin"))
+            boundaries.append("end")
+
+        matching.match_stitched_samples(
+            tiny.config,
+            tiny.reference,
+            tiny.root / "resident.trees",
+            af_cutoff=1,
+            min_region_size_kb=0,
+            workers=2,
+            sample_prefetch_chunks=1,
+            max_pending_haplotypes=2,
+            helper_threads=tiny_config["helper_threads"],
+            temp_dir=tiny.root,
+            resident=True,
+            window=window(),
+        )
+        assert boundaries == ["start", "end"]
+        assert all(not p.is_alive() for p in lifetime_records["processes"])
+        assert all(not thread.is_alive() for thread in lifetime_records["threads"])
+        assert not list(tiny.root.glob("greedy_*"))
