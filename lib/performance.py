@@ -28,6 +28,8 @@ class Measurement:
     stage: str
     scope: str
     call_count: int = 0
+    parent_stage: str | None = None
+    inclusive: bool = False
     wall_s: float | None = None
     user_s: float | None = None
     system_s: float | None = None
@@ -63,6 +65,20 @@ class Collector:
                 if value is not None:
                     setattr(target, name, getattr(target, name) + value)
 
+    def elapsed(self, stage, duration, *, parent_stage=None, inclusive=False):
+        """Record coordinator elapsed time or latency without sampling process CPU."""
+        if self.stages:
+            self.add(
+                Measurement(
+                    stage,
+                    "coordinator",
+                    call_count=1,
+                    wall_s=duration,
+                    parent_stage=parent_stage,
+                    inclusive=inclusive,
+                )
+            )
+
     def merge(self, other):
         for measurement in other.records.values():
             self.add(measurement)
@@ -70,33 +86,37 @@ class Collector:
 
 
 @contextlib.contextmanager
-def _measure(collector, stage, scope):
+def _measure(collector, stage, scope, parent_stage, inclusive):
     start = time.perf_counter()
     if scope == "process":
         cpu = resource.getrusage(resource.RUSAGE_SELF)
-    else:
+    elif scope == "thread":
         cpu = time.thread_time()
     try:
         yield
     finally:
         elapsed = time.perf_counter() - start
-        record = Measurement(stage, scope, call_count=1)
+        record = Measurement(
+            stage, scope, call_count=1, parent_stage=parent_stage, inclusive=inclusive
+        )
         if scope == "process":
             end_cpu = resource.getrusage(resource.RUSAGE_SELF)
             record.wall_s = elapsed
             record.user_s = end_cpu.ru_utime - cpu.ru_utime
             record.system_s = end_cpu.ru_stime - cpu.ru_stime
-        else:
+        elif scope == "thread":
             record.service_s = elapsed
             record.thread_cpu_s = time.thread_time() - cpu
+        else:
+            record.wall_s = elapsed
         collector.add(record)
 
 
-def measure(collector, stage, scope="process"):
+def measure(collector, stage, scope="process", *, parent_stage=None, inclusive=False):
     """Return a no-op for ordinary runs; never sample process CPU in tasks."""
     if collector is None or not collector.stages:
         return contextlib.nullcontext()
-    return _measure(collector, stage, scope)
+    return _measure(collector, stage, scope, parent_stage, inclusive)
 
 
 @dataclasses.dataclass

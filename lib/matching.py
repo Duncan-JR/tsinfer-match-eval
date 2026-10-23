@@ -10,6 +10,7 @@ import multiprocessing.connection
 import pathlib
 import tempfile
 import threading
+import time
 import traceback
 
 import numpy as np
@@ -187,19 +188,31 @@ def make_worker(reference, catalog, num_alleles, parameters):
     return worker
 
 
-def _match_region(haplotype, worker, start, end):
+def _match_region(haplotype, worker, start, end, collector=None):
     """Collect a regional HMM path and mutations before native scratch is reused."""
-    left, right, parents = worker.matcher.find_path(
-        haplotype, start, end, worker.match_out
-    )
-    left_site = np.searchsorted(worker.positions, left[::-1])
-    right_site = np.searchsorted(worker.positions, right[::-1])
-    np.maximum(left_site, start, out=left_site)
-    np.minimum(right_site, end, out=right_site)
-    runs = CopyingRuns(left_site, right_site, parents[::-1].copy())
-    observed = haplotype[start:end]
-    copied = worker.match_out[start:end]
-    mutations = np.flatnonzero((observed >= 0) & (observed != copied)) + start
+    with performance.measure(
+        collector, "gap_native_find_path", "thread", parent_stage="gap_matching_assembly"
+    ):
+        left, right, parents = worker.matcher.find_path(
+            haplotype, start, end, worker.match_out
+        )
+    with performance.measure(
+        collector, "gap_path_conversion", "thread", parent_stage="gap_matching_assembly"
+    ):
+        left_site = np.searchsorted(worker.positions, left[::-1])
+        right_site = np.searchsorted(worker.positions, right[::-1])
+        np.maximum(left_site, start, out=left_site)
+        np.minimum(right_site, end, out=right_site)
+        runs = CopyingRuns(left_site, right_site, parents[::-1].copy())
+    with performance.measure(
+        collector,
+        "gap_mutation_extraction",
+        "thread",
+        parent_stage="gap_matching_assembly",
+    ):
+        observed = haplotype[start:end]
+        copied = worker.match_out[start:end]
+        mutations = np.flatnonzero((observed >= 0) & (observed != copied)) + start
     return RegionMatch(runs, mutations)
 
 
@@ -248,13 +261,17 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
     focal_runs = 0
     gap_calls = 0
     one_site_gap_sites = 0
-    with performance.measure(collector, "gap_matching_assembly", "thread"):
+    with performance.measure(
+        collector, "gap_matching_assembly", "thread", inclusive=True
+    ):
         intervals = greedy.stitched_intervals(
             state, count, start, end, worker.boundaries
         )
         for interval in intervals:
             if interval.ancestor is None:
-                region = _match_region(haplotype, worker, interval.left, interval.right)
+                region = _match_region(
+                    haplotype, worker, interval.left, interval.right, collector
+                )
                 blocks.append(region.runs)
                 mutations.append(region.mutation_site)
                 gap_calls += 1
@@ -280,9 +297,15 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
                         corrections.append(site)
                 if len(corrections) > 0:
                     mutations.append(np.asarray(corrections, dtype=np.int64))
-        result = _assemble_result(
-            job_index, blocks, mutations, haplotype, worker, collector
-        )
+        with performance.measure(
+            collector,
+            "gap_final_concatenation",
+            "thread",
+            parent_stage="gap_matching_assembly",
+        ):
+            result = _assemble_result(
+                job_index, blocks, mutations, haplotype, worker, collector
+            )
     if collector is not None:
         collector.count(
             matched_haplotypes=1,
@@ -324,12 +347,18 @@ def _worker_main(
                 collector,
                 "reference_packing",
                 "thread",
+                parent_stage="coordinator_packing_completion",
             ):
                 count = haplotypes.pack_reference_chunk(panel_path, catalog, chunk)
             collector.count(ancestor_blocks_read=count)
             events.put(("packed", collector))
         collector = performance.Collector(stages=diagnostics)
-        with performance.measure(collector, "worker_setup", "thread"):
+        with performance.measure(
+            collector,
+            "worker_setup",
+            "thread",
+            parent_stage="coordinator_worker_readiness",
+        ):
             reference = tskit.load(reference_path)
             worker = make_worker(reference, catalog, num_alleles, parameters)
             del reference
@@ -459,6 +488,7 @@ def _coordinate(
     slots,
     collector,
     resident_slabs,
+    admitted,
 ):
     """Drain events and refill continuously; pending includes unappended results."""
     ready = collections.deque()
@@ -466,7 +496,17 @@ def _coordinate(
     next_row = 0
     pending = 0
     completed = 0
+    first_slab = True
+    first_result = True
     if resident_slabs is not None:
+        if admitted is not None:
+            collector.elapsed(
+                "first_sample_slab_latency",
+                0,
+                parent_stage="coordinator_matching_drain",
+                inclusive=True,
+            )
+        first_slab = False
         ready.extend(resident_slabs)
         live.update(
             {
@@ -484,8 +524,22 @@ def _coordinate(
             if next_row == len(slab.job_indices):
                 ready.popleft()
                 next_row = 0
-        kind, payload = _event(events)
+        with performance.measure(
+            collector,
+            "coordinator_result_wait",
+            "coordinator",
+            parent_stage="coordinator_matching_drain",
+        ):
+            kind, payload = _event(events)
         if kind == "slab":
+            if first_slab and admitted is not None:
+                collector.elapsed(
+                    "first_sample_slab_latency",
+                    time.perf_counter() - admitted,
+                    parent_stage="coordinator_matching_drain",
+                    inclusive=True,
+                )
+            first_slab = False
             slab = payload
             ready.append(slab)
             live[slab.chunk] = ActiveSlab(slab, len(slab.job_indices))
@@ -501,8 +555,18 @@ def _coordinate(
                         )
                     )
         elif kind == "result":
+            if first_result and admitted is not None:
+                collector.elapsed(
+                    "first_result_latency",
+                    time.perf_counter() - admitted,
+                    parent_stage="coordinator_matching_drain",
+                    inclusive=True,
+                )
+            first_result = False
             chunk, result = payload
-            with performance.measure(collector, "assembly_output"):
+            with performance.measure(
+                collector, "assembly_output", parent_stage="coordinator_matching_drain"
+            ):
                 append_result(
                     tables, nodes[result.job_index], result, samples.allele_mapper
                 )
@@ -640,51 +704,66 @@ def match_stitched_samples(
                     eligible_ancestors=len(catalog.seeds),
                 )
             del reference
-            for _ in range(workers):
-                process = ctx.Process(
-                    target=_worker_main,
-                    args=(
-                        work,
-                        events,
-                        start_matching,
-                        panel_path,
-                        ancestors_ts_path,
-                        catalog,
-                        samples.allele_mapper.num_alleles_array(),
-                        cfg.match.sources["samples"],
-                        min_focal_region_size,
-                        helper_threads,
-                        collector is not None,
-                        diagnostics,
-                    ),
+            with performance.measure(
+                collector, "coordinator_process_startup", "coordinator"
+            ):
+                for _ in range(workers):
+                    process = ctx.Process(
+                        target=_worker_main,
+                        args=(
+                            work,
+                            events,
+                            start_matching,
+                            panel_path,
+                            ancestors_ts_path,
+                            catalog,
+                            samples.allele_mapper.num_alleles_array(),
+                            cfg.match.sources["samples"],
+                            min_focal_region_size,
+                            helper_threads,
+                            collector is not None,
+                            diagnostics,
+                        ),
+                    )
+                    process.start()
+                    processes.append(process)
+                del cfg
+                watcher = threading.Thread(
+                    target=_watch_workers, args=(processes, events, stopping)
                 )
-                process.start()
-                processes.append(process)
-            del cfg
-            watcher = threading.Thread(
-                target=_watch_workers, args=(processes, events, stopping)
-            )
-            watcher.start()
-            _pack_reference(
-                work,
-                events,
-                haplotypes.reference_chunks(panel_path, catalog),
-                max_pending_haplotypes,
+                watcher.start()
+            with performance.measure(
                 collector,
-            )
-            for _ in processes:
-                work.put(None)
-            for _ in processes:
-                _, measurements = _event(events)
-                if collector is not None:
-                    collector.merge(measurements)
+                "coordinator_packing_completion",
+                "coordinator",
+                inclusive=True,
+            ):
+                _pack_reference(
+                    work,
+                    events,
+                    haplotypes.reference_chunks(panel_path, catalog),
+                    max_pending_haplotypes,
+                    collector,
+                )
+            with performance.measure(
+                collector, "coordinator_worker_readiness", "coordinator", inclusive=True
+            ):
+                for _ in processes:
+                    work.put(None)
+                for _ in processes:
+                    _, measurements = _event(events)
+                    if collector is not None:
+                        collector.merge(measurements)
             del catalog
             resident_slabs = None
             if resident:
-                resident_slabs = [
-                    haplotypes.load_sample_chunk(samples, chunk, directory)
-                    for chunk in samples.chunks
-                ]
+                with performance.measure(
+                    collector, "resident_sample_preload", "coordinator"
+                ):
+                    resident_slabs = [
+                        haplotypes.load_sample_chunk(samples, chunk, directory)
+                        for chunk in samples.chunks
+                    ]
                 if collector is not None:
                     collector.count(
                         sample_blocks_read=sum(
@@ -698,42 +777,51 @@ def match_stitched_samples(
                 )
                 loader.start()
             with window if window is not None else contextlib.nullcontext():
-                start_matching.set()
-                _coordinate(
-                    work,
-                    events,
-                    jobs,
-                    tables,
-                    nodes,
-                    samples,
-                    max_pending_haplotypes,
-                    slots,
+                with performance.measure(
                     collector,
-                    resident_slabs,
-                )
+                    "coordinator_matching_drain",
+                    "coordinator",
+                    inclusive=True,
+                ):
+                    admitted = time.perf_counter() if diagnostics else None
+                    start_matching.set()
+                    _coordinate(
+                        work,
+                        events,
+                        jobs,
+                        tables,
+                        nodes,
+                        samples,
+                        max_pending_haplotypes,
+                        slots,
+                        collector,
+                        resident_slabs,
+                        admitted,
+                    )
             matched = True
         finally:
-            stopping.set()
-            for _ in range(sample_prefetch_chunks):
-                slots.release()
-            if loader is not None:
-                loader.join()
-            if matched:
-                for _ in processes:
-                    work.put(None)
-            else:
-                for process in processes:
-                    process.terminate()
-            for process in processes:
-                process.join()
-            if watcher is not None:
-                watcher.join()
-            for channel in (work, events):
-                if not matched:
-                    channel.cancel_join_thread()
-                channel.close()
+            with performance.measure(collector, "coordinator_shutdown", "coordinator"):
+                stopping.set()
+                for _ in range(sample_prefetch_chunks):
+                    slots.release()
+                if loader is not None:
+                    loader.join()
                 if matched:
-                    channel.join_thread()
+                    for _ in processes:
+                        work.put(None)
+                else:
+                    for process in processes:
+                        process.terminate()
+                for process in processes:
+                    process.join()
+                if watcher is not None:
+                    watcher.join()
+                for channel in (work, events):
+                    if not matched:
+                        channel.cancel_join_thread()
+                    channel.close()
+                    if matched:
+                        channel.join_thread()
         with performance.measure(collector, "finalise_output"):
             tables.edges.squash()
             ts = tsinfer.matching.finalise_match_tables(tables)

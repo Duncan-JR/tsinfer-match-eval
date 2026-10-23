@@ -258,3 +258,15 @@ class TrackedOffsets(np.ndarray):
         if np.isscalar(index):
             self.visits += 1
         return super().__getitem__(index)
+
+
+class CountingMatcher:
+    """Count actual native calls without changing the matching interface."""
+
+    def __init__(self, matcher):
+        self.matcher = matcher
+        self.calls = 0
+
+    def find_path(self, *args):
+        self.calls += 1
+        return self.matcher.find_path(*args)

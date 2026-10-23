@@ -14,7 +14,7 @@ import tsinfer
 import tskit
 import zarr
 
-from lib import benchmark, diagnostics, haplotypes, matching, utils
+from lib import benchmark, diagnostics, haplotypes, matching, performance, utils
 from tests import smoke_helpers
 
 
@@ -529,3 +529,123 @@ class TestMatchingLifetime:
         assert all(not p.is_alive() for p in lifetime_records["processes"])
         assert all(not thread.is_alive() for thread in lifetime_records["threads"])
         assert not list(tiny.root.glob("greedy_*"))
+
+
+class TestStageTimings:
+    @pytest.mark.parametrize("workers", [1, 2])
+    def test_stages_preserve_outputs_and_workload(self, tiny, tiny_config, workers):
+        collectors = []
+        outputs = []
+        for enabled in (False, True):
+            collector = performance.Collector(stages=enabled)
+            output = tiny.root / f"stages_{enabled}.trees"
+            matching.match_stitched_samples(
+                tiny.config,
+                tiny.reference,
+                output,
+                af_cutoff=1,
+                min_region_size_kb=0,
+                workers=workers,
+                sample_prefetch_chunks=1,
+                max_pending_haplotypes=2,
+                helper_threads=tiny_config["helper_threads"],
+                temp_dir=tiny.root,
+                collector=collector,
+            )
+            collectors.append(collector)
+            outputs.append(smoke_helpers.canonical(output))
+        assert outputs[0] == outputs[1]
+        assert collectors[0].workload == collectors[1].workload
+        assert collectors[0].records == {}
+        records = {record.stage: record for record in collectors[1].records.values()}
+        phases = [
+            "coordinator_process_startup",
+            "coordinator_packing_completion",
+            "coordinator_worker_readiness",
+            "coordinator_matching_drain",
+            "coordinator_shutdown",
+            "coordinator_result_wait",
+            "first_sample_slab_latency",
+            "first_result_latency",
+        ]
+        for name in phases:
+            record = records[name]
+            assert record.scope == "coordinator"
+            assert np.isfinite(record.wall_s) and record.wall_s >= 0
+            assert record.user_s is None and record.thread_cpu_s is None
+        slab = records["first_sample_slab_latency"].wall_s
+        result = records["first_result_latency"].wall_s
+        drain = records["coordinator_matching_drain"].wall_s
+        assert 0 <= slab <= result <= drain
+        assert records["coordinator_result_wait"].wall_s <= drain
+        assert records["assembly_output"].wall_s <= drain
+        native = records["gap_native_find_path"]
+        assert native.call_count == collectors[1].workload["gap_calls"]
+        assert records["gap_path_conversion"].call_count == native.call_count
+        assert records["gap_mutation_extraction"].call_count == native.call_count
+        assert (
+            records["gap_final_concatenation"].call_count
+            == collectors[1].workload["matched_haplotypes"]
+        )
+        assert records["gap_matching_assembly"].inclusive
+        for name in (
+            "gap_native_find_path",
+            "gap_path_conversion",
+            "gap_mutation_extraction",
+            "gap_final_concatenation",
+        ):
+            record = records[name]
+            assert record.parent_stage == "gap_matching_assembly"
+            assert record.scope == "thread"
+            assert record.service_s >= 0 and record.thread_cpu_s >= 0
+            assert record.wall_s is None
+
+    @pytest.mark.parametrize("kind", ["all_focal", "all_gap", "one_site_gap"])
+    def test_native_counts_and_shortcuts(self, tiny, tiny_config, tmp_path, kind):
+        reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
+        catalog = haplotypes.prepare_reference(
+            tiny.panel, samples, reference, 1, "left", tmp_path
+        )
+        for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
+            haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
+        if kind == "all_gap":
+            empty = haplotypes.MappedCalls(tmp_path / "empty.bin", (0,))
+            fields = {
+                field.name: getattr(catalog, field.name)[:0]
+                for field in dataclasses.fields(catalog)
+                if isinstance(getattr(catalog, field.name), np.ndarray)
+            }
+            catalog = dataclasses.replace(catalog, packed=empty, **fields)
+        cfg = matching._sample_config(
+            tiny.config, tiny.reference, tiny.root / "unused.trees"
+        )
+        worker = matching.make_worker(
+            reference,
+            catalog,
+            samples.allele_mapper.num_alleles_array(),
+            cfg.match.sources["samples"],
+        )
+        native = smoke_helpers.CountingMatcher(worker.matcher)
+        worker.matcher = native
+        calls = tsinfer.vcz.open_store(tiny.panel)["call_genotype"][:]
+        haplotype = np.concatenate([calls[:6, 1, 0], calls[6:, 2, 0]])
+        if kind == "one_site_gap":
+            haplotype[0] = 1 - haplotype[0]
+        collector = performance.Collector()
+        try:
+            matching.match_stitched_haplotype(0, haplotype, worker, 1, collector)
+        finally:
+            haplotypes.close_mapping(worker.exact.packed)
+        counts = collector.workload
+        assert counts["gap_calls"] == native.calls
+        recorded = collector.records.get(("gap_native_find_path", "thread"))
+        assert (0 if recorded is None else recorded.call_count) == native.calls
+        if kind == "all_gap":
+            assert counts["gap_sites"] == reference.num_sites
+            assert counts["focal_sites"] == 0
+            assert native.calls == 2
+        else:
+            assert counts["focal_sites"] == reference.num_sites
+            assert native.calls == 0
+            if kind == "one_site_gap":
+                assert counts["one_site_gap_sites"] == 1

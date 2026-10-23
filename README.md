@@ -286,7 +286,7 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `seed` | Randomises method/worker order within each repeat. |
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
-| `collect_stages` | Enable diagnostic aggregate setup, packing, loading, numeric matching, gap/assembly and output timings. Use `false` for headline totals. |
+| `collect_stages` | Enable aggregate preparation, coordinator, loading, native gap matching and assembly timings. `false` retains workload counts without stage timers. Record one staged run at every new scale, including one million haplotypes; use whole `from_reference` windows for method-level comparisons. |
 | `diagnostics_run` | Explicit `mode`, `workers` and zero-based `repeat` selecting completed trees for diagnostics; must belong to the suite. Diagnostic coverage is checked only when diagnostics is requested. |
 | `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
 | `quality_max_matrix_mib` | Positive decoded validation-call matrix budget in MiB, batching whole samples within physical chunks. Must fit one sample. Excludes reference/output trees, one decoded source tile, remapping buffers and decoder scratch. Splitting a chunk may reread tiles. |
@@ -296,8 +296,9 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 `from_reference` is the primary comparison: it times the deployed runner from
 existing ancestor trees through finished outputs, including startup, packing,
 loading, JIT cache loading/compilation, worker shutdown and output. Matching
-workers and the loader stop before edge squashing and output finalisation. Both methods use identical
-inputs, biological settings, CPU reservations and requested products.
+workers and the loader stop before edge squashing and output finalisation. Both
+methods use identical inputs, biological settings, CPU reservations and requested
+products.
 
 `resident_match` excludes input decoding and HMM/JIT setup. Greedy includes
 candidate discovery, exact extension, covering, gap matching and immediate
@@ -314,3 +315,18 @@ add measurement overhead and can miss short peaks. Filesystem
 caches are uncontrolled and the on-disk Numba cache is reused; fresh processes
 do not imply cold caches. Diagnostic worker service times overlap and must not
 be added to wall time. Performance improvements require measurement.
+
+With stages enabled, `coordinator_*` records elapsed startup, packing completion,
+worker readiness, matching/drain, result waiting and shutdown. First-slab and
+first-result latencies start at matching admission and end when the coordinator
+observes each event. Resident slabs are already loaded, so first-slab latency is
+zero and preload timing is separate. `assembly_output` measures coordinator append
+work. Worker records use their executing thread's CPU and summed service time;
+they overlap coordinator windows and are not additive to wall time.
+
+`gap_matching_assembly` is inclusive. Its children separate native `find_path`,
+path conversion, mutation extraction and final concatenation. Native call counts
+exclude one-site copying shortcuts. `parent_stage` and `inclusive` label totals
+and children in `stages.csv`; never add an inclusive total to its children or
+add overlapping latencies. Validation has its own window in each trial result
+and `validation_wall_s` in `runs.csv`, outside matching timings.
