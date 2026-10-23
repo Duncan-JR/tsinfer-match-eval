@@ -633,6 +633,117 @@ def trial_runs(config):
     return runs
 
 
+@dataclasses.dataclass(frozen=True)
+class DiagnosticTrialKey:
+    """Scientific identity shared by the configured and saved trial inventories."""
+
+    dataset: str
+    method: str
+    af_cutoff: float | None
+    min_region_size_kb: float | None
+
+
+@dataclasses.dataclass
+class TrialOutput:
+    """A completed tree and its saved trial specification."""
+
+    tree: pathlib.Path
+    run: dict
+
+
+def diagnostic_key(run):
+    return DiagnosticTrialKey(
+        run["dataset"], run["method"], run["af_cutoff"], run["min_region_size_kb"]
+    )
+
+
+def diagnostic_trials(config):
+    """Validate diagnostic coverage without requiring a completed benchmark yet."""
+    settings = config["performance"]
+    selector = settings.get("diagnostics_run")
+    if selector is None:
+        raise ValueError(
+            "Benchmark-backed diagnostics requires performance.diagnostics_run"
+        )
+    if (
+        selector["mode"] not in settings["modes"]
+        or type(selector["workers"]) is not int
+        or selector["workers"] not in settings["worker_counts"]
+        or type(selector["repeat"]) is not int
+        or not 0 <= selector["repeat"] < settings["repeats"]
+    ):
+        raise ValueError("performance.diagnostics_run selects an unavailable trial")
+    selected = [
+        run
+        for run in trial_runs(config)
+        if run["mode"] == selector["mode"]
+        and run["requested_workers"] == selector["workers"]
+        and run["repeat"] == selector["repeat"]
+    ]
+    available = {diagnostic_key(run) for run in selected}
+    required = set()
+    for dataset in config["datasets"]:
+        name = dataset["name"]
+        required.add(DiagnosticTrialKey(name, "full_hmm", None, None))
+        for af, minimum in itertools.product(
+            utils.parameter_values(dataset["af_cutoff"]),
+            utils.parameter_values(dataset["min_region_size_kb"]),
+        ):
+            required.add(DiagnosticTrialKey(name, "greedy", af, minimum))
+    missing = required - available
+    if missing:
+        raise ValueError(f"Diagnostic benchmark coverage is incomplete: {missing}")
+    return selected
+
+
+def diagnostic_outputs(config):
+    """Resolve from runs.csv and saved specifications, never from filename identities."""
+    expected = {diagnostic_key(run) for run in diagnostic_trials(config)}
+    root = output_directory(config)
+    selector = config["performance"]["diagnostics_run"]
+    selected = {}
+    with (root / "runs.csv").open(newline="") as source:
+        rows = list(csv.DictReader(source))
+    for row in rows:
+        if (
+            row["mode"] != selector["mode"]
+            or int(row["requested_workers"]) != selector["workers"]
+            or int(row["repeat"]) != selector["repeat"]
+        ):
+            continue
+        folder = root / row["run_id"]
+        run = json.loads((folder / "trial.json").read_text())["run"]
+        for name in ("run_id", "dataset", "mode", "method"):
+            if run[name] != row[name]:
+                raise ValueError(
+                    f"Trial specification disagrees with runs.csv: {folder}"
+                )
+        for name in ("requested_workers", "repeat", "order"):
+            if run[name] != int(row[name]):
+                raise ValueError(
+                    f"Trial specification disagrees with runs.csv: {folder}"
+                )
+        for name in ("af_cutoff", "min_region_size_kb"):
+            value = None if row[name] == "" else float(row[name])
+            if run[name] != value:
+                raise ValueError(
+                    f"Trial specification disagrees with runs.csv: {folder}"
+                )
+        key = diagnostic_key(run)
+        if key not in expected:
+            raise ValueError(f"Unconfigured diagnostic trial in completed suite: {key}")
+        if key in selected or row["status"] != "ok":
+            raise ValueError(f"Diagnostic trial is duplicated or unsuccessful: {key}")
+        tree = folder / "samples_raw.trees"
+        if not tree.is_file():
+            raise FileNotFoundError(f"Selected diagnostic trial tree is missing: {tree}")
+        selected[key] = TrialOutput(tree, run)
+    missing = expected - selected.keys()
+    if missing:
+        raise ValueError(f"Completed suite lacks required diagnostic trials: {missing}")
+    return selected
+
+
 def run_suite(config, allocation, config_paths=None):
     """Measure each greedy AF cutoff, sharing Full HMM trials across cutoffs."""
     validate_config(config, allocation)

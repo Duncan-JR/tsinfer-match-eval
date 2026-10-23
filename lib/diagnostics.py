@@ -43,6 +43,7 @@ class Run:
     stitched: pathlib.Path
     mask: pathlib.Path
     min_focal_region_size: int | None = None
+    benchmark_run: dict | None = None
 
 
 @dataclasses.dataclass
@@ -55,6 +56,7 @@ class Inventory:
     archive: pathlib.Path
     tables: list[pathlib.Path]
     sites: list[pathlib.Path]
+    full_benchmark_runs: dict = dataclasses.field(default_factory=dict)
 
 
 def inventory(config):
@@ -93,6 +95,43 @@ def inventory(config):
     ]
     archive = root / "diagnostics" / f"{config['config_name']}_diagnostics.tar.gz"
     return Inventory(full, runs, directory, archive, tables, sites)
+
+
+def matching_inputs(config, products):
+    """DAG dependencies: completed suite or ordinary matching, without mixing routes."""
+    if config.get("performance") is None:
+        return [*products.full, *(run.stitched for run in products.runs)]
+    benchmark.diagnostic_trials(config)
+    return benchmark.final_products(config)
+
+
+def resolve_benchmark_outputs(config, products):
+    """Resolve only after suite completion; masks keep ordinary parameterised paths."""
+    if config.get("performance") is None:
+        return
+    outputs = benchmark.diagnostic_outputs(config)
+    for index, dataset in enumerate(config["datasets"]):
+        key = benchmark.DiagnosticTrialKey(dataset["name"], "full_hmm", None, None)
+        selected = outputs[key]
+        products.full[index] = selected.tree
+        products.full_benchmark_runs[dataset["name"]] = selected.run
+    for run in products.runs:
+        key = benchmark.DiagnosticTrialKey(
+            run.dataset, "greedy", run.af_cutoff, run.min_region_size_kb
+        )
+        run.stitched = outputs[key].tree
+        run.benchmark_run = outputs[key].run
+
+
+def _tree_archive_path(config, path):
+    if config.get("performance") is not None:
+        relative = path.relative_to(benchmark.output_directory(config))
+        return (
+            pathlib.Path("performance")
+            / config["performance"]["experiment_id"]
+            / relative
+        ).as_posix()
+    return path.relative_to(pathlib.Path(config["data_dir"]).expanduser()).as_posix()
 
 
 def population_sources(config):
@@ -968,21 +1007,19 @@ def _archive_manifest(config, products, datasets, workers):
         path.stem: add(path, f"diagnostics/{path.name}") for path in products.tables
     }
     dataset_map = []
-    for dataset, information in zip(config["datasets"], datasets, strict=True):
+    for dataset, information, full_path in zip(
+        config["datasets"], datasets, products.full, strict=True
+    ):
         name = dataset["name"]
         inputs = benchmark.prepared_inputs(config, dataset)
-        full_path = (
-            pathlib.Path(config["data_dir"]).expanduser()
-            / "matches"
-            / f"{name}_inferred_samples_raw.trees"
-        )
         entry = {
             "name": name,
             "native_config": add(inputs.config, f"configs/{inputs.config.name}"),
             "reference": add(
                 inputs.reference, f"ancestors/{inputs.reference.name}", True
             ),
-            "full_hmm": add(full_path, f"matches/{full_path.name}", True),
+            "full_hmm": add(full_path, _tree_archive_path(config, full_path), True),
+            "full_hmm_benchmark_run": products.full_benchmark_runs.get(name),
             "sites": add(
                 products.directory / f"{name}_sites.npz", f"diagnostics/{name}_sites.npz"
             ),
@@ -996,9 +1033,6 @@ def _archive_manifest(config, products, datasets, workers):
             entry["truth"] = add(pathlib.Path(truth), f"truth/{name}.trees", True)
         for run in products.runs:
             if run.dataset == name:
-                relative = run.stitched.relative_to(
-                    pathlib.Path(config["data_dir"]).expanduser()
-                )
                 relative_mask = run.mask.relative_to(
                     pathlib.Path(config["data_dir"]).expanduser()
                 )
@@ -1007,7 +1041,10 @@ def _archive_manifest(config, products, datasets, workers):
                         "af_cutoff": run.af_cutoff,
                         "min_region_size_kb": run.min_region_size_kb,
                         "min_focal_region_size": run.min_focal_region_size,
-                        "stitched": add(run.stitched, relative.as_posix(), True),
+                        "stitched": add(
+                            run.stitched, _tree_archive_path(config, run.stitched), True
+                        ),
+                        "benchmark_run": run.benchmark_run,
                         "mask": add(run.mask, relative_mask.as_posix()),
                     }
                 )
@@ -1169,6 +1206,7 @@ def run(config, workers):
     population_sources(config)
     _performance_files(config)
     products = inventory(config)
+    resolve_benchmark_outputs(config, products)
     products.directory.mkdir(parents=True, exist_ok=True)
     (products.directory / "config.yaml").write_text(
         yaml.safe_dump(config, sort_keys=False)

@@ -150,6 +150,15 @@ collect benchmark timings or memory samples.
 
 ## Diagnostics
 
+With performance enabled, diagnostics reuses completed trial trees selected by
+`performance.diagnostics_run` (`mode`, `workers`, zero-based `repeat`). The suite
+must cover every diagnostic dataset and its settings with both methods. Missing
+coverage or trees raises an error. Diagnostics depends on suite completion and
+prepared inputs, and schedules no ordinary sample matching. With
+`performance: null`, it uses ordinary trees under `matches/`. Selected saved run
+specifications are recorded in the archive manifest. The ordinary `all` target
+always enumerates ordinary outputs independently of this selection.
+
 Ordinary matching writes raw trees only. Reconstruct focal masks and compare raw
 copying parents across the configured dataset/AF/minimum grid explicitly.
 Regenerate stitched trees before rebuilding masks or diagnostics with this policy:
@@ -277,6 +286,7 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
 | `collect_stages` | Enable diagnostic aggregate setup, packing, loading, numeric matching, gap/assembly and output timings. Use `false` for headline totals. |
+| `diagnostics_run` | Explicit `mode`, `workers` and zero-based `repeat` selecting completed trees for diagnostics; must belong to the suite. Diagnostic coverage is checked only when diagnostics is requested. |
 | `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
 | `quality_max_matrix_mib` | Positive decoded validation-call matrix budget in MiB, batching whole samples within physical chunks. Must fit one sample. Excludes reference/output trees, one decoded source tile, remapping buffers and decoder scratch. Splitting a chunk may reread tiles. |
 | `resident_max_matrix_mib` | Maximum decoded sample matrix for resident trials. |

@@ -1,12 +1,13 @@
 """Configuration and bounded Zarr v3 fixture shared by smoke checks."""
 
+import json
 import pathlib
 import shutil
 
 import pytest
 import yaml
 
-from lib import matching
+from lib import benchmark, matching
 from tests import smoke_helpers
 
 
@@ -68,3 +69,20 @@ def tiny_output(tiny, tiny_config):
         temp_dir=tiny.root,
     )
     return output
+
+
+@pytest.fixture
+def saved_suite(tmp_path, smoke_config, monkeypatch):
+    root = tmp_path / "suite"
+    root.mkdir()
+    monkeypatch.setattr(benchmark, "output_directory", lambda config: root)
+    runs = benchmark.trial_runs(smoke_config)
+    for run in runs:
+        folder = root / run["run_id"]
+        folder.mkdir()
+        (folder / "trial.json").write_text(
+            json.dumps({"run": run, "config": smoke_config})
+        )
+        (folder / "samples_raw.trees").touch()
+    benchmark._write_csv(root / "runs.csv", [{**run, "status": "ok"} for run in runs])
+    return root

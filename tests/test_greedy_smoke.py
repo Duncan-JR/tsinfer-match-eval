@@ -207,3 +207,63 @@ class TestQualityBatches:
         assert result["window"]["wall_s"] > 0
         assert result["window_peak_private_bytes"] > 0
         assert result["quality"]["status"] == "failed"
+
+
+class TestDiagnosticTrialSources:
+    def test_resolves_selected_specs(self, smoke_config, saved_suite):
+        products = diagnostics.inventory(smoke_config)
+        assert diagnostics.matching_inputs(
+            smoke_config, products
+        ) == benchmark.final_products(smoke_config)
+        diagnostics.resolve_benchmark_outputs(smoke_config, products)
+        assert len(products.full_benchmark_runs) == 2
+        for run in products.runs:
+            saved = run.benchmark_run
+            assert saved["requested_workers"] == 2
+            assert saved["repeat"] == 0
+            assert saved["af_cutoff"] == run.af_cutoff
+            assert saved["min_region_size_kb"] == run.min_region_size_kb
+            assert run.stitched == saved_suite / saved["run_id"] / "samples_raw.trees"
+
+    @pytest.mark.parametrize(
+        "field,value", [("workers", 3), ("repeat", 1), ("mode", "resident_match")]
+    )
+    def test_unavailable_selector(self, smoke_config, field, value):
+        smoke_config["performance"]["diagnostics_run"][field] = value
+        with pytest.raises(ValueError, match="unavailable trial"):
+            benchmark.diagnostic_trials(smoke_config)
+
+    @pytest.mark.parametrize("missing", ["method", "dataset"])
+    def test_incomplete_coverage(self, smoke_config, missing):
+        if missing == "method":
+            smoke_config["performance"]["methods"] = ["greedy"]
+        else:
+            smoke_config["performance"]["datasets"].pop()
+        benchmark.validate_config(
+            smoke_config, benchmark.required_allocation(smoke_config)
+        )
+        with pytest.raises(ValueError, match="coverage is incomplete"):
+            diagnostics.matching_inputs(
+                smoke_config, diagnostics.inventory(smoke_config)
+            )
+
+    def test_absent_af_trial(self, smoke_config, saved_suite):
+        rows = list(csv.DictReader((saved_suite / "runs.csv").open()))
+        rows = [row for row in rows if row["af_cutoff"] != "0.05"]
+        benchmark._write_csv(saved_suite / "runs.csv", rows)
+        with pytest.raises(ValueError, match="lacks required diagnostic trials"):
+            benchmark.diagnostic_outputs(smoke_config)
+
+    def test_deleted_selected_tree(self, smoke_config, saved_suite):
+        outputs = benchmark.diagnostic_outputs(smoke_config)
+        next(iter(outputs.values())).tree.unlink()
+        with pytest.raises(FileNotFoundError, match="Selected diagnostic trial tree"):
+            benchmark.diagnostic_outputs(smoke_config)
+
+    def test_ordinary_dependencies(self, smoke_config):
+        smoke_config["performance"] = None
+        products = diagnostics.inventory(smoke_config)
+        paths = diagnostics.matching_inputs(smoke_config, products)
+        assert paths == products.full + [run.stitched for run in products.runs]
+        diagnostics.resolve_benchmark_outputs(smoke_config, products)
+        assert products.full_benchmark_runs == {}

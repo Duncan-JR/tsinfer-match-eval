@@ -70,14 +70,12 @@ rule diagnostics:
 
 rule make_diagnostics:
     input:
-        full=full_outputs,
-        stitched=stitched_outputs,
+        matches=lambda wildcards: diagnostics.matching_inputs(config, inventory),
         samples=expand(data_dir / "samples" / "{name}_samples_masked.zarr", name=names),
         panels=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr", name=names),
         references=expand(data_dir / "ancestors" / "{name}_inferred_ancestors.trees", name=names),
         configs=expand(data_dir / "configs" / "{name}_ancestor_inference.toml", name=names),
         population=lambda wildcards: diagnostics.population_sources(config),
-        performance=performance_outputs,
     output:
         archive=inventory.archive,
         masks=[run.mask for run in inventory.runs],
