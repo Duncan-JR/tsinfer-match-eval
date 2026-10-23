@@ -84,8 +84,6 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `data_dir` | Ordinary output root. Use a separate directory for each biological configuration. |
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
-| `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
-| `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. Replace the old `min_focal_region_size` config key rather than reusing its site-count values as kb. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.mismatch` | Mismatch probability for remaining HMM calls, strictly between 0 and 1. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
@@ -108,6 +106,8 @@ Each `datasets` entry has:
 | Option | Meaning |
 | --- | --- |
 | `name` | Unique lowercase label with underscores, used in filenames. |
+| `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
+| `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. Replace the old `min_focal_region_size` config key rather than reusing its site-count values as kb. |
 | `zarr_path` | Input VCZ store. |
 | `ts_path` | Optional truth tree sequence, used for explicit true-ancestor extraction, configured population joins and archive inclusion; otherwise `null`. |
 | `ancestral_state.field` | Array of ancestral allele strings. |
@@ -138,8 +138,11 @@ choice. Logs and greedy benchmark workload records also report the site count.
 For a parameter search, configure for example:
 
 ```yaml
-af_cutoff: [0.01, 0.03, 0.05]
-min_region_size_kb: [0, 50, 100, 200]
+datasets:
+  - name: example_dataset
+    af_cutoff: [0.01, 0.03, 0.05]
+    min_region_size_kb: [0, 50, 100, 200]
+    # Existing paths and metadata follow.
 ```
 
 `performance: null` disables the benchmark target. Ordinary matching does not
@@ -224,8 +227,9 @@ experiment directory must be empty. Output is under
 `data/performance/{experiment_id}/`: configuration and dependency/source
 manifest, `runs.csv`, `stages.csv`, optional `quality.json`, trial logs,
 process-tree memory samples and matched trees.
-Performance trials accept scalar or list `af_cutoff` and require scalar
-`min_region_size_kb`. Each greedy cutoff gets a separate trial; Full HMM runs
+Each performance dataset accepts scalar or list `af_cutoff` and requires scalar
+`min_region_size_kb`. Ordinary matching and diagnostics use each dataset's own
+Cartesian product. Both keys are required on datasets; top-level keys are rejected. Each greedy cutoff gets a separate trial; Full HMM runs
 once per dataset/mode/worker/repeat and supplies the baseline for all cutoffs.
 `runs.csv` records each greedy trial's AF and kb setting, plus its resolved
 `min_focal_region_size` in sites. AF and kb are blank for Full HMM trials.

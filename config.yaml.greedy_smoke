@@ -1,0 +1,110 @@
+config_name: greedy_smoke
+data_dir: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke
+progress_dir: .progress/greedy_smoke
+focal_choice: left
+hmm:
+  recombination: 0.01
+  mismatch: 1.0e-20
+datasets:
+- name: out_of_africa_n100_1mbp
+  zarr_path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/out_of_africa_n100_1mbp.zarr
+  af_cutoff:
+  - 0.03
+  - 0.05
+  min_region_size_kb: 0
+  ancestral_state:
+    field: variant_ancestral_state
+  matching_cache_size: 64
+  population:
+    source: csv
+    path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/out_of_africa_n100_1mbp_populations.csv
+    zarr_id_field: sample_id
+    csv_id_field: sample_id
+    field: population
+- name: tgp_chr20_n100_1mbp
+  zarr_path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/tgp_chr20_n100_1mbp.zarr
+  af_cutoff: 0.02
+  min_region_size_kb: 1
+  ancestral_state:
+    field: variant_ancestral_allele
+  matching_cache_size: 64
+  population:
+    source: csv
+    path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/tgp_chr20_n100_1mbp_populations.csv
+    zarr_id_field: sample_id
+    csv_id_field: sample_id
+    field: population
+ancestor_chunk_size: 5000
+inference_threads: 2
+matching_threads: 2
+sample_prefetch_chunks: 1
+max_pending_haplotypes: 4
+temp_dir: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/temporary
+helper_threads:
+  blosc_threads: 1
+  zarr_async_concurrency: 1
+  zarr_threading_max_workers: 1
+  blas_threads: 1
+performance:
+  experiment_id: greedy_smoke_20261023_v1
+  datasets:
+  - out_of_africa_n100_1mbp
+  - tgp_chr20_n100_1mbp
+  modes:
+  - from_reference
+  methods:
+  - full_hmm
+  - greedy
+  worker_counts:
+  - 1
+  - 2
+  repeats: 1
+  seed: 20261020
+  rss_sample_interval_s: 0.05
+  trial_timeout_s: 300
+  collect_stages: true
+  quality_checks: true
+  resident_max_matrix_mib: 512
+  resident_max_private_mib: 16384
+  quality_max_matrix_mib: 256
+  diagnostics_run:
+    mode: from_reference
+    workers: 2
+    repeat: 0
+smoke:
+  seed: 20261023
+  repeat_counts:
+    baseline: 1
+    instrumentation: 2
+  fixtures:
+    simulation:
+      individuals: 100
+      span_bp: 1000000
+      genotype_chunks:
+      - 1000
+      - 100
+      - 2
+    real:
+      individuals: 100
+      span_bp: 1000000
+      genotype_chunks:
+      - 20000
+      - 100
+      - 2
+    tiny:
+      variants: 13
+      individuals: 7
+      genotype_chunks:
+      - 4
+      - 2
+      - 1
+      selected_samples:
+      - s0
+      - s1
+      - s4
+      - s6
+      panel_chunks:
+      - 4
+      - 2
+      - 1
+      quality_max_matrix_mib: 5.0e-05

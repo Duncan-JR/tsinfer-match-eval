@@ -68,8 +68,8 @@ def inventory(config):
         name = dataset["name"]
         full.append(root / "matches" / f"{name}_inferred_samples_raw.trees")
         sites.append(directory / f"{name}_sites.npz")
-        for af in utils.parameter_values(config["af_cutoff"]):
-            for minimum in utils.parameter_values(config["min_region_size_kb"]):
+        for af in utils.parameter_values(dataset["af_cutoff"]):
+            for minimum in utils.parameter_values(dataset["min_region_size_kb"]):
                 parameters = pathlib.Path(f"af_{af}") / f"min_region_kb_{minimum}"
                 stitched = root / "matches" / parameters
                 mask = root / "focal_masks" / parameters
@@ -1224,7 +1224,7 @@ def run(config, workers):
             full_index = prepare_paths(
                 full_path, reference, identities, dataset_directory / "full"
             )
-            for af in utils.parameter_values(config["af_cutoff"]):
+            for af in utils.parameter_values(dataset["af_cutoff"]):
                 runs = [
                     item
                     for item in products.runs

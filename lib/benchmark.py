@@ -75,8 +75,6 @@ def required_allocation(config):
 def validate_config(config, allocation):
     """Validate performance settings at the suite entry point."""
     utils.validate_config(config)
-    if isinstance(config["min_region_size_kb"], list):
-        raise ValueError("Performance trials require a scalar min_region_size_kb")
     settings = config["performance"]
     if not settings["methods"] or not set(settings["methods"]) <= {"full_hmm", "greedy"}:
         raise ValueError("performance.methods: choose full_hmm and/or greedy")
@@ -90,6 +88,14 @@ def validate_config(config, allocation):
     names = {dataset["name"] for dataset in config["datasets"]}
     if not settings["datasets"] or not set(settings["datasets"]) <= names:
         raise ValueError("performance.datasets must select configured datasets")
+    for dataset in config["datasets"]:
+        if dataset["name"] in settings["datasets"] and isinstance(
+            dataset["min_region_size_kb"], list
+        ):
+            raise ValueError(
+                f"Dataset {dataset['name']}: performance trials require a scalar "
+                "min_region_size_kb"
+            )
     for name in ("methods", "modes", "worker_counts", "datasets"):
         if len(set(settings[name])) != len(settings[name]):
             raise ValueError(f"performance.{name} must not contain duplicates")
@@ -568,6 +574,48 @@ def _manifest(config, allocation):
     }
 
 
+def trial_runs(config):
+    """Enumerate the configured trial identities, sharing each Full HMM baseline."""
+    settings = config["performance"]
+    datasets = {dataset["name"]: dataset for dataset in config["datasets"]}
+    rng = random.Random(settings["seed"])
+    runs = []
+    for repeat, dataset, mode in itertools.product(
+        range(settings["repeats"]), settings["datasets"], settings["modes"]
+    ):
+        selected = datasets[dataset]
+        combinations = []
+        for method, workers in itertools.product(
+            settings["methods"], settings["worker_counts"]
+        ):
+            cutoffs = (
+                utils.parameter_values(selected["af_cutoff"])
+                if method == "greedy"
+                else [None]
+            )
+            for cutoff in cutoffs:
+                combinations.append((method, workers, cutoff))
+        rng.shuffle(combinations)
+        for order, (method, workers, cutoff) in enumerate(combinations):
+            suffix = f"_af{cutoff}" if method == "greedy" else ""
+            run_id = f"{dataset}_{mode}_{method}{suffix}_w{workers}_r{repeat}_o{order}"
+            run = {
+                "run_id": run_id,
+                "dataset": dataset,
+                "mode": mode,
+                "method": method,
+                "af_cutoff": cutoff,
+                "min_region_size_kb": (
+                    selected["min_region_size_kb"] if method == "greedy" else None
+                ),
+                "requested_workers": workers,
+                "repeat": repeat,
+                "order": order,
+            }
+            runs.append(run)
+    return runs
+
+
 def run_suite(config, allocation, config_paths=None):
     """Measure each greedy AF cutoff, sharing Full HMM trials across cutoffs."""
     validate_config(config, allocation)
@@ -584,86 +632,52 @@ def run_suite(config, allocation, config_paths=None):
         for index, path in enumerate(config_paths):
             shutil.copy2(path, folder / f"source_config_{index}.yaml")
     settings = config["performance"]
-    rng = random.Random(settings["seed"])
     rows = []
     stage_rows = []
     quality = []
-    for repeat, dataset, mode in itertools.product(
-        range(settings["repeats"]), settings["datasets"], settings["modes"]
-    ):
-        combinations = []
-        for method, workers in itertools.product(
-            settings["methods"], settings["worker_counts"]
-        ):
-            cutoffs = (
-                utils.parameter_values(config["af_cutoff"])
-                if method == "greedy"
-                else [None]
+    for run in trial_runs(config):
+        run_id = run["run_id"]
+        dataset = run["dataset"]
+        trial_folder = folder / run_id
+        trial_folder.mkdir()
+        spec = trial_folder / "trial.json"
+        spec.write_text(json.dumps({"config": config, "run": run}, indent=2) + "\n")
+        logger.info("Starting %s", run_id)
+        result = _launch(spec, config)
+        row = {
+            **run,
+            "status": result["status"],
+            "error": result.get("error", ""),
+            "trial_peak_private_bytes": result["trial_peak_private_bytes"],
+        }
+        if result["status"] == "ok":
+            row.update(
+                {key: result["window"][key] for key in ("wall_s", "user_s", "system_s")}
             )
-            for cutoff in cutoffs:
-                combinations.append((method, workers, cutoff))
-        rng.shuffle(combinations)
-        for order, (method, workers, cutoff) in enumerate(combinations):
-            suffix = f"_af{cutoff}" if method == "greedy" else ""
-            run_id = f"{dataset}_{mode}_{method}{suffix}_w{workers}_r{repeat}_o{order}"
-            trial_folder = folder / run_id
-            trial_folder.mkdir()
-            run = {
-                "run_id": run_id,
-                "dataset": dataset,
-                "mode": mode,
-                "method": method,
-                "af_cutoff": cutoff,
-                "min_region_size_kb": (
-                    config["min_region_size_kb"] if method == "greedy" else None
-                ),
-                "requested_workers": workers,
-                "repeat": repeat,
-                "order": order,
-            }
-            spec = trial_folder / "trial.json"
-            spec.write_text(json.dumps({"config": config, "run": run}, indent=2) + "\n")
-            logger.info("Starting %s", run_id)
-            result = _launch(spec, config)
-            row = {
-                **run,
-                "status": result["status"],
-                "error": result.get("error", ""),
-                "trial_peak_private_bytes": result["trial_peak_private_bytes"],
-            }
-            if result["status"] == "ok":
-                row.update(
-                    {
-                        key: result["window"][key]
-                        for key in ("wall_s", "user_s", "system_s")
-                    }
-                )
-                row.update(result["workload"])
-                row["actual_workers"] = result["actual_workers"]
-                row["window_peak_private_bytes"] = result["window_peak_private_bytes"]
-                stage_rows.extend(
-                    {"run_id": run_id, **record} for record in result["stages"]
-                )
-                if settings["quality_checks"]:
-                    try:
-                        report = quality_check(config, dataset, trial_folder)
-                        quality.append({"run_id": run_id, "status": "ok", **report})
-                    except Exception:
-                        quality.append(
-                            {
-                                "run_id": run_id,
-                                "status": "failed",
-                                "error": traceback.format_exc(),
-                            }
-                        )
-            rows.append(row)
-            _write_csv(folder / "runs.csv", rows)
-            _write_csv(folder / "stages.csv", stage_rows, ["run_id", "stage", "scope"])
+            row.update(result["workload"])
+            row["actual_workers"] = result["actual_workers"]
+            row["window_peak_private_bytes"] = result["window_peak_private_bytes"]
+            stage_rows.extend(
+                {"run_id": run_id, **record} for record in result["stages"]
+            )
             if settings["quality_checks"]:
-                (folder / "quality.json").write_text(
-                    json.dumps(quality, indent=2) + "\n"
-                )
-            logger.info("Finished %s: %s", run_id, result["status"])
+                try:
+                    report = quality_check(config, dataset, trial_folder)
+                    quality.append({"run_id": run_id, "status": "ok", **report})
+                except Exception:
+                    quality.append(
+                        {
+                            "run_id": run_id,
+                            "status": "failed",
+                            "error": traceback.format_exc(),
+                        }
+                    )
+        rows.append(row)
+        _write_csv(folder / "runs.csv", rows)
+        _write_csv(folder / "stages.csv", stage_rows, ["run_id", "stage", "scope"])
+        if settings["quality_checks"]:
+            (folder / "quality.json").write_text(json.dumps(quality, indent=2) + "\n")
+        logger.info("Finished %s: %s", run_id, result["status"])
     if any(row["status"] != "ok" for row in [*rows, *quality]):
         raise RuntimeError(
             "Benchmark trials or quality checks failed; see runs.csv/quality.json"

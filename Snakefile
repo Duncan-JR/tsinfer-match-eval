@@ -9,8 +9,8 @@ configfile: "config.yaml"
 
 utils.validate_config(config)
 focal_choice = config.get("focal_choice", "left")
-af_cutoffs = utils.parameter_values(config["af_cutoff"])
-min_region_sizes_kb = utils.parameter_values(config["min_region_size_kb"])
+af_cutoffs = {value for dataset in config["datasets"] for value in utils.parameter_values(dataset["af_cutoff"])}
+min_region_sizes_kb = {value for dataset in config["datasets"] for value in utils.parameter_values(dataset["min_region_size_kb"])}
 helpers = config["helper_threads"]
 utils.configure_helpers(helpers)
 
@@ -33,6 +33,14 @@ greedy_log_dir = progress_dir / "match_stitched_samples" / parameter_dir
 def panel_config(wildcards):
     suffix = "ancestor_inference" if wildcards.kind == "inferred" else "true_ancestors"
     return data_dir / "configs" / f"{wildcards.name}_{suffix}.toml"
+
+
+def greedy_input(wildcards, path):
+    utils.validate_parameter_pair(
+        datasets[wildcards.name], float(wildcards.af_cutoff),
+        float(wildcards.min_region_size_kb),
+    )
+    return path.format(name=wildcards.name)
 
 
 wildcard_constraints:
@@ -211,7 +219,7 @@ rule match_ancestors:
 
 rule match_stitched_samples:
     input:
-        reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+        reference=lambda wildcards: greedy_input(wildcards, str(data_dir / "ancestors" / "{name}_inferred_ancestors.trees")),
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",

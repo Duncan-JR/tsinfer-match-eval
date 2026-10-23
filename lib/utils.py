@@ -201,20 +201,12 @@ def validate_config(config):
         )
     if config.get("focal_choice", "left") not in ("left", "right"):
         raise ValueError("focal_choice must be left or right")
-    for name in ("af_cutoff", "min_region_size_kb"):
-        values = parameter_values(config[name])
-        if len(values) == 0:
-            raise ValueError(f"{name} must contain at least one value")
-        for value in values:
-            if name == "af_cutoff":
-                if type(value) not in (int, float) or not 0 <= value <= 1:
-                    raise ValueError("af_cutoff values must be numbers between 0 and 1")
-            elif type(value) not in (int, float) or not np.isfinite(value) or value < 0:
-                raise ValueError(
-                    "min_region_size_kb values must be finite nonnegative numbers"
-                )
-        if len(set(values)) != len(values):
-            raise ValueError(f"{name} must not contain duplicates")
+    obsolete = {"af_cutoff", "min_region_size_kb"} & config.keys()
+    if obsolete:
+        names = ", ".join(sorted(obsolete))
+        raise ValueError(f"Move {names} into each datasets entry")
+    for dataset in config["datasets"]:
+        validate_dataset_parameters(dataset)
     for name in (
         "ancestor_chunk_size",
         "inference_threads",
@@ -245,3 +237,35 @@ def validate_config(config):
     for dataset in config["datasets"]:
         if dataset.get("include") is not None and dataset.get("exclude") is not None:
             raise ValueError("Choose at most one of include and exclude")
+
+
+def validate_dataset_parameters(dataset):
+    """Require distinct, valid axes directly on each dataset."""
+    for name in ("af_cutoff", "min_region_size_kb"):
+        if name not in dataset:
+            raise ValueError(f"Dataset {dataset['name']} requires {name}")
+        values = parameter_values(dataset[name])
+        if len(values) == 0:
+            raise ValueError(f"{name} must contain at least one value")
+        for value in values:
+            if name == "af_cutoff":
+                if type(value) not in (int, float) or not 0 <= value <= 1:
+                    raise ValueError("af_cutoff values must be numbers between 0 and 1")
+            elif type(value) not in (int, float) or not np.isfinite(value) or value < 0:
+                raise ValueError(
+                    "min_region_size_kb values must be finite nonnegative numbers"
+                )
+        if len(set(values)) != len(values):
+            raise ValueError(f"{name} must not contain duplicates")
+
+
+def validate_parameter_pair(dataset, af_cutoff, min_region_size_kb):
+    """Reject explicit wildcard pairs outside this dataset's Cartesian product."""
+    validate_dataset_parameters(dataset)
+    if af_cutoff not in parameter_values(
+        dataset["af_cutoff"]
+    ) or min_region_size_kb not in parameter_values(dataset["min_region_size_kb"]):
+        raise ValueError(
+            f"Parameter pair AF={af_cutoff}, minimum={min_region_size_kb} kb "
+            f"is not configured for dataset {dataset['name']}"
+        )

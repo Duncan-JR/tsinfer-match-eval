@@ -27,7 +27,10 @@ package = false
 tsinfer = { path = "../tsinfer", editable = true }
 
 [dependency-groups]
-dev = ["ruff"]
+dev = [
+    "pytest>=9.1.1",
+    "ruff",
+]
 
 [tool.ruff]
 line-length = 89
