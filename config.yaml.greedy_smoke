@@ -4,7 +4,7 @@ progress_dir: .progress/greedy_smoke
 focal_choice: left
 hmm:
   recombination: 0.01
-  mismatch: 1.0e-20
+  mismatch: 0.01
 datasets:
 - name: out_of_africa_n100_1mbp
   zarr_path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/out_of_africa_n100_1mbp.zarr

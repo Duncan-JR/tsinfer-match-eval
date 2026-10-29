@@ -56,9 +56,12 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    the left retained parent, then the right, then the activated ancestor with
    the furthest support end in stable support-start order. Candidates rejected
    by the minimum remain eligible for this choice. Correct called disagreements
-   with sample mutations; missing observations need no mutation. Match remaining
-   gaps independently with the full HMM. Append completed results, squash adjacent
-   equal-parent/child edges once, then finalise and sort tables.
+   with sample mutations; missing observations need no mutation. Keep these focal
+   copying decisions fixed. Match residual gaps with the HMM, conditioning on
+   available adjacent copied parents at the observations immediately outside each
+   gap. Inference boundaries prevent padding across intervals. Retain only the
+   gap's path and mutations, then append completed results, squash adjacent
+   equal-parent/child edges once, and finalise and sort tables.
 
 Both matching runners append sample individual and population metadata after
 the reference rows, using the same IDs as tsinfer reference matching. Existing
@@ -66,8 +69,13 @@ VCZ stores must satisfy vcztools 0.2 variant-chunk alignment requirements;
 rechunk older stores with inconsistent variant chunks before reusing them.
 
 The greedy cover minimises copying runs within each retained exact union.
-Gap matches start independent likelihoods; this does not optimise global HMM
-likelihood or switches across gaps. Storage chunks never limit extension.
+Each residual gap has a conditional HMM optimum under the existing numerical
+approximation, with either, both or neither flanking copied state available.
+The HMM selects the first and last gap parents and pays transition costs to
+available anchors; it can accept a mismatch instead of switching. This does
+not globally reoptimise the greedy cover. Each gap still makes one HMM call,
+with up to two extra flanking observations. Compression and chosen paths can
+change runtime. Storage chunks never limit extension.
 The matching domain runs from first through last called site, or the full
 reference axis for an all-missing haplotype.
 
@@ -103,6 +111,12 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `helper_threads.zarr_async_concurrency` | Zarr async I/O concurrency per process; start with `1`. |
 | `helper_threads.zarr_threading_max_workers` | Zarr helper pool size per process; start with `1`. |
 | `helper_threads.blas_threads` | Numerical-library threads inherited by spawned children; start with `1`. Numba kernels are serial. |
+
+`config.yaml.greedy_smoke` uses `hmm.recombination: 0.01` and
+`hmm.mismatch: 0.01` as convenient example probabilities, not fitted biological
+parameters. Both full-HMM and gap matching use the configured probabilities.
+Use fresh output directories and regenerate native TOML and prepared references
+when changing these settings.
 
 Snakemake reserves matching workers plus loader/decoding helpers. With all helper
 limits set to `1`, greedy requires `max(2 * workers, workers + 3)` CPUs. Increase
