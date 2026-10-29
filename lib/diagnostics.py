@@ -1027,6 +1027,11 @@ def _archive_manifest(config, products, datasets, workers):
             **information,
             "runs": [],
         }
+        native = tsinfer.config.Config.from_toml(inputs.config)
+        rate = native.match.sources["samples"].recombination_rate
+        if isinstance(rate, (str, pathlib.Path)):
+            map_path = pathlib.Path(rate)
+            entry["recombination_map"] = add(map_path, f"configs/{map_path.name}")
         truth = dataset.get("ts_path")
         entry["truth"] = None
         if truth is not None:

@@ -432,6 +432,75 @@ class TestReferencePacking:
         np.testing.assert_array_equal(*snapshots)
 
 
+class TestRecombinationSettings:
+    @pytest.mark.parametrize("rate", [0, 1e-8])
+    def test_rate(self, smoke_config, rate):
+        smoke_config["hmm"] = {
+            "recombination": None,
+            "recombination_rate": rate,
+            "mismatch": 0.01,
+        }
+        utils.validate_config(smoke_config)
+
+    @pytest.mark.parametrize(
+        "hmm",
+        [
+            {"recombination": 0.01, "recombination_rate": 1e-8, "mismatch": 0.01},
+            {"mismatch": 0.01},
+            {"recombination_rate": -1e-8, "mismatch": 0.01},
+            {"recombination_rate": "missing_map.txt", "mismatch": 0.01},
+        ],
+    )
+    def test_invalid_settings(self, smoke_config, hmm):
+        smoke_config["hmm"] = hmm
+        with pytest.raises(ValueError, match="hmm"):
+            utils.validate_config(smoke_config)
+
+    @pytest.mark.parametrize("cumulative", [False, True])
+    def test_map_config_and_manifest(self, tiny, tiny_config, tmp_path, cumulative):
+        source_map = tmp_path / "chr1.txt"
+        header = "Chromosome Position(bp) Rate(cM/Mb)"
+        rows = ["chr1 10 2", "chr1 50 3", "chr1 140 0"]
+        if cumulative:
+            header += " Map(cM)"
+            rows = [
+                f"{row} {cm}" for row, cm in zip(rows, [0, 8e-5, 35e-5], strict=True)
+            ]
+        source_map.write_text(header + "\n" + "\n".join(rows) + "\n")
+        tiny_config["hmm"] = {
+            "recombination": None,
+            "recombination_rate": str(source_map),
+            "mismatch": 0.01,
+        }
+        utils.validate_config(tiny_config)
+        path = benchmark.prepared_inputs(tiny_config, tiny_config["datasets"][0]).config
+        utils.make_inference_config(
+            tiny.source,
+            tiny.panel,
+            path,
+            {"field": "variant_ancestral_state"},
+            tiny_config["hmm"],
+        )
+        cfg = tsinfer.config.Config.from_toml(path)
+        settings = cfg.match.sources["samples"]
+        assert settings.recombination is None
+        assert settings.recombination_rate == str(
+            path.with_suffix(".recombination_map.txt")
+        )
+        data = utils.read_recombination_map(settings.recombination_rate)
+        np.testing.assert_allclose(data[:, 2], [0, 8e-5, 35e-5])
+        parameters = tsinfer.matching.hmm_parameters(settings, np.array([10, 50, 140]))
+        distances = np.array([8e-7, 27e-7])
+        expected = np.insert((1 - np.exp(-2 * distances)) / 2, 0, 0)
+        np.testing.assert_allclose(parameters.recombination, expected)
+        benchmark._manifest(tiny_config, benchmark.required_allocation(tiny_config))
+        source_map.write_text(
+            header + "\n" + "\n".join(rows).replace(" 50 ", " 60 ") + "\n"
+        )
+        with pytest.raises(ValueError, match="disagrees"):
+            benchmark._manifest(tiny_config, benchmark.required_allocation(tiny_config))
+
+
 class TestMatchingLifetime:
     @pytest.mark.parametrize("workers", [1, 2])
     def test_workers_exit_before_finalise(

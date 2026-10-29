@@ -4,6 +4,9 @@ progress_dir: .progress
 focal_choice: left
 hmm:
   recombination: 0.01
+  # Or replace recombination with a rate per bp per generation or a HapMap path:
+  # recombination_rate: 1.0e-8
+  # recombination_rate: ~/work/dphil-analysis/data/HapMapII_GRCh38/genetic_map_Hg38_chr20.txt
   mismatch: 1.0e-20
 
 datasets:

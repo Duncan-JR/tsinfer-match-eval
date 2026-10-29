@@ -16,6 +16,11 @@ utils.configure_helpers(helpers)
 
 data_dir = pathlib.Path(config["data_dir"]).expanduser()
 progress_dir = pathlib.Path(config["progress_dir"]).expanduser()
+recombination_rate = config["hmm"].get("recombination_rate")
+recombination_maps = (
+    [pathlib.Path(recombination_rate).expanduser()]
+    if isinstance(recombination_rate, str) else []
+)
 datasets = {dataset["name"]: dict(dataset) for dataset in config["datasets"]}
 for dataset in datasets.values():
     dataset["samples"] = None
@@ -114,8 +119,13 @@ rule annotate_derived_counts:
 rule make_inference_config:
     input:
         data_dir / "samples" / "{name}_samples_masked.zarr",
+        recombination_map=recombination_maps,
     output:
         data_dir / "configs" / "{name}_ancestor_inference.toml",
+        recombination_map=(
+            [data_dir / "configs" / "{name}_ancestor_inference.recombination_map.txt"]
+            if recombination_maps else []
+        ),
     log:
         progress_dir / "make_inference_config" / "{name}_make_inference_config.log",
     params:
@@ -174,8 +184,13 @@ rule make_true_ancestors_config:
     input:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         ancestors=data_dir / "ancestors" / "{name}_true_ancestors.zarr",
+        recombination_map=recombination_maps,
     output:
         data_dir / "configs" / "{name}_true_ancestors.toml",
+        recombination_map=(
+            [data_dir / "configs" / "{name}_true_ancestors.recombination_map.txt"]
+            if recombination_maps else []
+        ),
     log:
         progress_dir / "make_true_ancestors_config" / "{name}_true_make_true_ancestors_config.log",
     params:

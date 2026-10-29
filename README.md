@@ -99,6 +99,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
+| `hmm.recombination_rate` | Alternative to `hmm.recombination`: a nonnegative rate per bp per generation, or a HapMap file path. tsinfer converts genetic distances between inference sites to probabilities using Haldane's map function. Choose exactly one recombination setting. |
 | `hmm.mismatch` | Mismatch probability for remaining HMM calls, strictly between 0 and 1. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
 | `inference_threads` | Native ancestor inference workers and requested diagnostics CPU budget. Diagnostics uses the actual Snakemake-granted threads. |
@@ -117,6 +118,14 @@ Paths are relative to the working directory; input paths, `data_dir`,
 parameters. Both full-HMM and gap matching use the configured probabilities.
 Use fresh output directories and regenerate native TOML and prepared references
 when changing these settings.
+
+HapMap files have a header and columns for chromosome, position (bp), rate
+(cM/Mb), and optionally cumulative map position (cM). Three-column files are
+integrated from the first position, using each row's rate up to the next row.
+Native configuration generation saves a four-column copy beside each TOML;
+ancestor, full-HMM and greedy matching all use that map. Physical coordinates
+must match the input variants; keep chromosome coordinates when selecting a region.
+When overlaying YAML configurations, set the unused recombination setting to `null`.
 
 Snakemake reserves matching workers plus loader/decoding helpers. With all helper
 limits set to `1`, greedy requires `max(2 * workers, workers + 3)` CPUs. Increase

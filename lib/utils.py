@@ -100,6 +100,23 @@ def make_inference_config(
     Both sources stay in match.sources so ancestor matching obtains the full
     sample contig length. A true-panel configuration is for matching only.
     """
+    hmm = {name: value for name, value in hmm.items() if value is not None}
+    rate = hmm.get("recombination_rate")
+    if isinstance(rate, (str, pathlib.Path)):
+        source_map = pathlib.Path(rate).expanduser()
+        native_map = output.with_suffix(".recombination_map.txt").resolve()
+        map_data = read_recombination_map(source_map)
+        with source_map.open() as source:
+            next(source)
+            chromosome = next(source).split()[0]
+        np.savetxt(
+            native_map,
+            map_data,
+            fmt=f"{chromosome}\t%.17g\t%.17g\t%.17g",
+            header="Chromosome Position(bp) Rate(cM/Mb) Map(cM)",
+            comments="",
+        )
+        hmm["recombination_rate"] = str(native_map)
     if include is not None:
         include = f"({include}) & (INFO/match_eval_derived_ac != 1)"
     elif exclude is not None:
@@ -148,6 +165,20 @@ def make_inference_config(
     }
     output.write_text(tomli_w.dumps(native))
     logger.info("Wrote %s", output)
+
+
+def read_recombination_map(path):
+    """Read position, rate and cumulative cM from a three/four-column HapMap file."""
+    path = pathlib.Path(path).expanduser()
+    with path.open() as source:
+        columns = len(source.readline().split())
+    usecols = (1, 2) if columns == 3 else (1, 2, 3)
+    data = np.loadtxt(path, skiprows=1, usecols=usecols, ndmin=2)
+    if columns == 3:
+        distance_cm = np.diff(data[:, 0]) * data[:-1, 1] / 1e6
+        cumulative_cm = np.insert(np.cumsum(distance_cm), 0, 0)
+        data = np.column_stack((data, cumulative_cm))
+    return data
 
 
 def configure_helpers(helpers):
@@ -239,9 +270,25 @@ def validate_config(config):
     pending = config["max_pending_haplotypes"]
     if pending is not None and (type(pending) is not int or pending < 1):
         raise ValueError("max_pending_haplotypes must be a positive integer or null")
-    for name in ("recombination", "mismatch"):
-        if not 0 < config["hmm"][name] < 1:
-            raise ValueError(f"hmm.{name} must be between zero and one")
+    hmm = config["hmm"]
+    recombination = hmm.get("recombination")
+    rate = hmm.get("recombination_rate")
+    if (recombination is None) == (rate is None):
+        raise ValueError(
+            "Choose exactly one of hmm.recombination and hmm.recombination_rate"
+        )
+    if recombination is not None and not 0 < recombination < 1:
+        raise ValueError("hmm.recombination must be between zero and one")
+    if isinstance(rate, (str, pathlib.Path)):
+        if not pathlib.Path(rate).expanduser().is_file():
+            raise ValueError(f"hmm.recombination_rate map does not exist: {rate}")
+    elif rate is not None:
+        if not isinstance(rate, (int, float)) or not np.isfinite(rate) or rate < 0:
+            raise ValueError(
+                "hmm.recombination_rate must be a nonnegative rate or map path"
+            )
+    if not 0 < hmm["mismatch"] < 1:
+        raise ValueError("hmm.mismatch must be between zero and one")
     for name in (
         "blas_threads",
         "blosc_threads",

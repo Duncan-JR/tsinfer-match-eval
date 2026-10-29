@@ -651,9 +651,20 @@ def _manifest(config, allocation):
         )
         parameters = cfg.match.sources["samples"]
         requested = config["hmm"]
-        if (parameters.recombination, parameters.mismatch) != (
-            requested["recombination"],
-            requested["mismatch"],
+        requested_rate = requested.get("recombination_rate")
+        prepared_rate = parameters.recombination_rate
+        if isinstance(requested_rate, (str, pathlib.Path)) and isinstance(
+            prepared_rate, (str, pathlib.Path)
+        ):
+            requested_map = utils.read_recombination_map(requested_rate)
+            prepared_map = utils.read_recombination_map(prepared_rate)
+            rate_matches = np.array_equal(requested_map, prepared_map)
+        else:
+            rate_matches = requested_rate == prepared_rate
+        if (
+            parameters.recombination != requested.get("recombination")
+            or parameters.mismatch != requested["mismatch"]
+            or not rate_matches
         ):
             raise ValueError("Prepared native configuration disagrees with hmm settings")
         jobs = _sample_jobs(cfg, reference).jobs
