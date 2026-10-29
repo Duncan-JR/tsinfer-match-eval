@@ -329,7 +329,7 @@ def trial(spec_path):
         if run["method"] == "greedy" and config["performance"].get(
             "collect_haplotype_timings", False
         ):
-            origin = collector.diagnostics["matching_start_timestamp"]
+            origin = window.start_timestamp
             rows = sorted(collector.haplotype_timings, key=lambda row: row["job_index"])
             for row in rows:
                 row["match_start_s"] -= origin
@@ -390,10 +390,10 @@ def _launch(spec_path, config):
         tempfile.TemporaryDirectory(
             dir=temp_parent, prefix="matching_trial_"
         ) as mapped_root,
+        tempfile.TemporaryDirectory(prefix="matching_memory_") as memory_temporary,
         (spec_path.parent / "trial.log").open("w") as log,
     ):
-        memory_root = pathlib.Path(mapped_root) / "memory"
-        memory_root.mkdir()
+        memory_root = pathlib.Path(memory_temporary)
         env["MATCH_EVAL_MEMORY_DIR"] = str(memory_root)
         env["MATCH_EVAL_TEMP_DIR"] = mapped_root
         with subprocess.Popen(
@@ -405,11 +405,11 @@ def _launch(spec_path, config):
         ) as child:
             try:
                 while child.poll() is None:
-                    stamp = time.perf_counter()
                     snapshots = [
                         json.loads(path.read_text())
                         for path in memory_root.glob("memory_*.json")
                     ]
+                    stamp = time.perf_counter()
                     private = sum(item["private_bytes"] for item in snapshots)
                     pss_values = [item["pss_bytes"] for item in snapshots]
                     pss = (
@@ -458,6 +458,25 @@ def _launch(spec_path, config):
                 child.wait()
         history_root = spec_path.parent / "memory_history"
         shutil.copytree(memory_root, history_root)
+        observation_finished = time.perf_counter()
+    process_histories = []
+    for path in history_root.glob("memory_*.jsonl"):
+        records = [json.loads(line) for line in path.open() if line.endswith("\n")]
+        timestamps = [record["timestamp"] for record in records]
+        complete = len(records) > 0 and not records[-1]["active"]
+        if not complete:
+            timestamps.append(observation_finished)
+        process_histories.append(
+            {
+                "file": path.name,
+                "samples": len(records),
+                "complete": complete,
+                "longest_gap_s": max(
+                    (right - left for left, right in itertools.pairwise(timestamps)),
+                    default=0,
+                ),
+            }
+        )
     _write_csv(spec_path.parent / "memory_samples.csv", samples)
     result_path = spec_path.parent / "result.json"
     result = json.loads(result_path.read_text()) if result_path.exists() else {}
@@ -479,9 +498,21 @@ def _launch(spec_path, config):
             if window["start_timestamp"] <= row["timestamp"] <= window["end_timestamp"]
         ]
         result["window_peak_private_bytes"] = max(values, default=0)
-    boundaries = [started, *(row["timestamp"] for row in samples), time.perf_counter()]
+        pss_values = [
+            row["pss_bytes"]
+            for row in samples
+            if window["start_timestamp"] <= row["timestamp"] <= window["end_timestamp"]
+            and row["pss_bytes"] is not None
+        ]
+        result["window_peak_pss_bytes"] = max(pss_values, default=None)
+    boundaries = [started, *(row["timestamp"] for row in samples), observation_finished]
     result["memory_longest_observation_gap_s"] = max(
         right - left for left, right in itertools.pairwise(boundaries)
+    )
+    result["memory_process_histories"] = process_histories
+    result["memory_snapshot_directory"] = str(memory_root)
+    result["memory_longest_process_observation_gap_s"] = max(
+        (history["longest_gap_s"] for history in process_histories), default=0
     )
     result["trial_peak_pss_bytes"] = max(
         (row["pss_bytes"] for row in samples if row["pss_bytes"] is not None),
@@ -843,6 +874,13 @@ def run_suite(config, allocation, config_paths=None):
             "status": result["status"],
             "error": result.get("error", ""),
             "trial_peak_private_bytes": result["trial_peak_private_bytes"],
+            "trial_peak_pss_bytes": result["trial_peak_pss_bytes"],
+            "memory_longest_observation_gap_s": result[
+                "memory_longest_observation_gap_s"
+            ],
+            "memory_longest_process_observation_gap_s": result[
+                "memory_longest_process_observation_gap_s"
+            ],
         }
         if "window" in result:
             row.update(
@@ -851,6 +889,7 @@ def run_suite(config, allocation, config_paths=None):
             row.update(result["workload"])
             row["actual_workers"] = result["actual_workers"]
             row["window_peak_private_bytes"] = result["window_peak_private_bytes"]
+            row["window_peak_pss_bytes"] = result["window_peak_pss_bytes"]
             stage_rows.extend(
                 {"run_id": run_id, **record} for record in result["stages"]
             )

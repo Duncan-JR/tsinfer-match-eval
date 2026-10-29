@@ -154,7 +154,14 @@ class TestQualityBatches:
             result["validation_window"]["start_timestamp"]
             >= result["window"]["end_timestamp"]
         )
-        result.update(trial_peak_private_bytes=1, window_peak_private_bytes=1)
+        result.update(
+            trial_peak_private_bytes=1,
+            window_peak_private_bytes=1,
+            trial_peak_pss_bytes=None,
+            window_peak_pss_bytes=None,
+            memory_longest_observation_gap_s=0,
+            memory_longest_process_observation_gap_s=0,
+        )
         suite = folder / "suite"
         monkeypatch.setattr(benchmark, "output_directory", lambda config: suite)
         monkeypatch.setattr(benchmark, "_manifest", lambda *args: {})
@@ -619,12 +626,10 @@ class TestStageTimings:
         cfg = matching._sample_config(
             tiny.config, tiny.reference, tiny.root / "unused.trees"
         )
-        worker = matching.make_worker(
-            reference,
-            catalog,
-            samples.allele_mapper.num_alleles_array(),
-            cfg.match.sources["samples"],
+        inputs = haplotypes.share_reference(
+            catalog, samples.allele_mapper.num_alleles_array(), reference, tmp_path
         )
+        worker = matching.make_worker(inputs, catalog, cfg.match.sources["samples"])
         native = smoke_helpers.CountingMatcher(worker.matcher)
         worker.matcher = native
         calls = tsinfer.vcz.open_store(tiny.panel)["call_genotype"][:]

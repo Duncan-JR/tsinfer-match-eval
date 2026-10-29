@@ -159,15 +159,39 @@ class Worker:
     indexes: tsinfer.matching.MatcherIndexes
     matcher: tsinfer.matching.AncestorMatcher
     match_out: np.ndarray
+    reference_mappings: list[np.ndarray]
 
 
-def make_worker(reference, catalog, num_alleles, parameters):
-    """Build native state once and warm the actual read-only Numba signatures."""
-    positions = reference.sites_position.astype(np.int32)
-    intervals = np.asarray(reference.metadata["sequence_intervals"])
-    boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
-    indexes = tsinfer.matching.MatcherIndexes(
-        reference, vestigial_root=False, num_alleles=num_alleles
+def make_worker(inputs, catalog, parameters):
+    """Borrow mapped native edges and warm the actual read-only Numba signatures."""
+    arrays = {
+        name: np.load(getattr(inputs, name), mmap_mode="r", allow_pickle=False)
+        for name in (
+            "insertion",
+            "removal",
+            "positions",
+            "match_positions",
+            "mutation_site",
+            "mutation_node",
+            "num_alleles",
+            "boundaries",
+        )
+    }
+    positions = arrays["match_positions"]
+    boundaries = arrays["boundaries"]
+    if positions.dtype != np.int32 or positions.shape != arrays["positions"].shape:
+        raise ValueError("Invalid matching site positions")
+    if boundaries.dtype != np.int64 or boundaries.ndim != 1:
+        raise ValueError("Invalid inference boundaries")
+    indexes = tsinfer.matching.MatcherIndexes.from_prepared(
+        arrays["insertion"],
+        arrays["removal"],
+        arrays["positions"],
+        arrays["mutation_site"],
+        arrays["mutation_node"],
+        arrays["num_alleles"],
+        inputs.num_nodes,
+        inputs.sequence_length,
     )
     matcher = tsinfer.matching.AncestorMatcher(
         indexes,
@@ -178,11 +202,12 @@ def make_worker(reference, catalog, num_alleles, parameters):
     worker = Worker(
         greedy.make_state(catalog),
         positions,
-        reference.sequence_length,
+        inputs.sequence_length,
         boundaries,
         indexes,
         matcher,
         np.empty(len(positions), dtype=np.int8),
+        list(arrays.values()),
     )
     dummy = np.full(len(positions), -1, dtype=np.int8)
     dummy.flags.writeable = False
@@ -328,7 +353,6 @@ def _worker_main(
     events,
     start_matching,
     panel_path,
-    reference_path,
     inputs,
     parameters,
     minimum,
@@ -340,12 +364,10 @@ def _worker_main(
     """Preparation barrier followed by matching, reusing the same processes."""
     worker = None
     catalog = None
-    num_alleles = None
     try:
         utils.configure_helpers(helpers)
         worker_pid = os.getpid()
         catalog = inputs.open_catalog()
-        num_alleles = inputs.open_num_alleles()
         while True:
             chunk = work.get()
             if chunk is None:
@@ -367,9 +389,7 @@ def _worker_main(
             "thread",
             parent_stage="coordinator_worker_readiness",
         ):
-            reference = tskit.load(reference_path)
-            worker = make_worker(reference, catalog, num_alleles, parameters)
-            del reference
+            worker = make_worker(inputs, catalog, parameters)
         events.put(("worker_ready", collector))
         start_matching.wait()
         while True:
@@ -413,11 +433,16 @@ def _worker_main(
     finally:
         if worker is not None:
             haplotypes.close_mapping(worker.exact.packed)
+            worker.matcher = None
+            worker.indexes = None
+            worker.positions = None
+            worker.boundaries = None
+            for array in worker.reference_mappings:
+                haplotypes.close_mapping(array)
             del worker
         if catalog is not None:
             for field in dataclasses.fields(catalog):
                 haplotypes.close_mapping(getattr(catalog, field.name))
-        haplotypes.close_mapping(num_alleles)
 
 
 def _watch_workers(processes, events, stopping):
@@ -739,7 +764,9 @@ def match_stitched_samples(
                     directory,
                 )
                 num_alleles = samples.allele_mapper.num_alleles_array()
-                inputs = haplotypes.share_reference(catalog, num_alleles, directory)
+                inputs = haplotypes.share_reference(
+                    catalog, num_alleles, reference, directory
+                )
             if collector is not None:
                 slab_sizes = [
                     len(chunk.job_indices) * reference.num_sites
@@ -754,6 +781,10 @@ def match_stitched_samples(
                 )
                 collector.count(
                     mapped_input_bound_bytes=mapped_bound,
+                    shared_reference_bytes=inputs.mapped_bytes,
+                    shared_native_edge_bytes=inputs.edge_bytes,
+                    avoided_worker_edge_bytes=workers * inputs.edge_bytes,
+                    native_index_constructions=1,
                     packed_calls=catalog.packed.shape[0],
                     eligible_ancestors=len(catalog.seeds),
                 )
@@ -780,7 +811,6 @@ def match_stitched_samples(
                             events,
                             start_matching,
                             panel_path,
-                            ancestors_ts_path,
                             inputs,
                             cfg.match.sources["samples"],
                             min_focal_region_size,
@@ -874,8 +904,6 @@ def match_stitched_samples(
                     inclusive=True,
                 ):
                     admitted = time.perf_counter() if collector is not None else None
-                    if collect_haplotype_timings:
-                        collector.diagnostics["matching_start_timestamp"] = admitted
                     start_matching.set()
                     _coordinate(
                         work,

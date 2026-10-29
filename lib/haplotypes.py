@@ -64,6 +64,16 @@ class ReferenceInputs:
     stops: pathlib.Path
     offsets: pathlib.Path
     num_alleles: pathlib.Path
+    insertion: pathlib.Path
+    removal: pathlib.Path
+    positions: pathlib.Path
+    match_positions: pathlib.Path
+    mutation_site: pathlib.Path
+    mutation_node: pathlib.Path
+    boundaries: pathlib.Path
+    num_nodes: int
+    sequence_length: float
+    edge_bytes: int
     packed: MappedCalls
     mapped_bytes: int
 
@@ -79,32 +89,50 @@ class ReferenceInputs:
             raise ValueError("Catalog input shapes disagree")
         return ReferenceCatalog(*arrays, self.packed)
 
-    def open_num_alleles(self):
-        array = np.load(self.num_alleles, mmap_mode="r", allow_pickle=False)
-        if array.dtype != np.uint64 or array.ndim != 1 or not array.flags.c_contiguous:
-            raise ValueError("Allele counts must be contiguous native uint64")
-        return array
 
+def share_reference(catalog, num_alleles, reference, directory):
+    """Build/export native indexes once and save all immutable reference inputs.
 
-def share_reference(catalog, num_alleles, directory):
-    """Write catalog arrays and allele counts once, preserving their dtypes."""
+    Owned construction objects and copied exports die before workers are spawned.
+    Matching workers borrow only the two edge buffers and own their site state.
+    """
+    indexes = tsinfer.matching.MatcherIndexes(
+        reference, vestigial_root=False, num_alleles=num_alleles
+    )
+    insertion, removal = indexes.export_edge_indexes()
+    positions = reference.sites_position
+    match_positions = positions.astype(np.int32)
+    intervals = np.asarray(reference.metadata["sequence_intervals"])
+    boundaries = np.unique(np.searchsorted(match_positions, intervals.ravel()))
+    arrays = {
+        "parents": catalog.parents,
+        "columns": catalog.columns,
+        "seeds": catalog.seeds,
+        "starts": catalog.starts,
+        "stops": catalog.stops,
+        "offsets": catalog.offsets,
+        "num_alleles": num_alleles,
+        "insertion": insertion,
+        "removal": removal,
+        "positions": positions,
+        "match_positions": match_positions,
+        "mutation_site": reference.mutations_site,
+        "mutation_node": reference.mutations_node,
+        "boundaries": boundaries,
+    }
     paths = {}
-    mapped_bytes = 0
-    for name in (
-        "parents",
-        "columns",
-        "seeds",
-        "starts",
-        "stops",
-        "offsets",
-        "num_alleles",
-    ):
-        array = num_alleles if name == "num_alleles" else getattr(catalog, name)
+    for name, array in arrays.items():
         path = directory / f"{name}.npy"
         np.save(path, array, allow_pickle=False)
         paths[name] = path
-        mapped_bytes += array.nbytes
-    return ReferenceInputs(**paths, packed=catalog.packed, mapped_bytes=mapped_bytes)
+    return ReferenceInputs(
+        **paths,
+        packed=catalog.packed,
+        mapped_bytes=sum(array.nbytes for array in arrays.values()),
+        edge_bytes=insertion.nbytes + removal.nbytes,
+        num_nodes=reference.num_nodes,
+        sequence_length=reference.sequence_length,
+    )
 
 
 @dataclasses.dataclass

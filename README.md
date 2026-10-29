@@ -338,9 +338,14 @@ contains compact worker launch/start summaries and the physical sample chunk
 shape, slab widths and temporary mapping location. Memory observers write to
 trial-owned scratch before copying timestamped histories into `memory_history/`.
 `memory_samples.csv` records USS, PSS where available, stale/missing observations
-and sample ages; `memory_summary.json` reports the longest observation gap.
-Mapped input capacity is separate from physical memory, and nested service
-measurements must not be added to coordinator elapsed time.
+and sample ages; `memory_summary.json` reports launcher and per-process
+observation gaps and whether each process history completed. Snapshot scratch
+uses `TMPDIR` independently of the mapped-input `temp_dir` setting.
+Greedy workload records include all reference mappings, shared native edge
+capacity and the removed per-worker edge capacity. Native edge buffers are
+prepared once in the coordinator and borrowed by workers; their mutable HMM
+state stays private. Mapped input capacity is separate from physical memory.
+Nested service measurements must not be added to coordinator elapsed time.
 
 When enabled, each trial's `haplotype_timings.csv` contains one row per completed
 greedy haplotype, ordered by `job_index`, and is included in the performance
@@ -351,7 +356,7 @@ archive. Older archives have no such data. Columns are:
 | `run_id`, `job_index` | Trial and canonical job; include the experiment ID when combining suites. |
 | `source`, `sample_id`, `ploidy_index` | Stable haplotype identity. |
 | `worker_pid` | Worker identity within this trial. |
-| `match_start_s`, `match_end_s` | Monotonic offsets from the matching-window start. |
+| `match_start_s`, `match_end_s` | Monotonic offsets from the measured trial-window start (including preparation in `from_reference`). |
 | `match_wall_s`, `match_thread_cpu_s` | Elapsed and executing-thread CPU time inside the matching call. |
 | `domain_sites`, `focal_sites`, `gap_sites`, `gap_calls` | Existing per-haplotype workload counters. |
 

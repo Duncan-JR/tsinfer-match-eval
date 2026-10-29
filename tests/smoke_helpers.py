@@ -10,7 +10,7 @@ import tsinfer
 import tskit
 import zarr
 
-from lib import benchmark, haplotypes, matching, performance, utils
+from lib import benchmark, haplotypes, matching, utils
 
 
 def canonical(path):
@@ -197,8 +197,7 @@ def delayed_trial(spec_path, delay):
         return original(*args)
 
     benchmark.quality_check = validate
-    with performance.sample_memory():
-        return benchmark.trial(spec_path)
+    return benchmark.trial(spec_path)
 
 
 if __name__ == "__main__":
