@@ -30,6 +30,8 @@ class Measurement:
     call_count: int = 0
     parent_stage: str | None = None
     inclusive: bool = False
+    start_timestamp: float | None = None
+    end_timestamp: float | None = None
     wall_s: float | None = None
     user_s: float | None = None
     system_s: float | None = None
@@ -49,6 +51,8 @@ class Collector:
     records: dict = dataclasses.field(default_factory=dict)
     workload: dict = dataclasses.field(default_factory=dict)
 
+    diagnostics: dict = dataclasses.field(default_factory=dict)
+
     def count(self, **counts):
         for name, value in counts.items():
             self.workload[name] = self.workload.get(name, 0) + int(value)
@@ -60,6 +64,13 @@ class Collector:
         else:
             target = self.records[key]
             target.call_count += measurement.call_count
+            if measurement.start_timestamp is not None:
+                target.start_timestamp = min(
+                    target.start_timestamp, measurement.start_timestamp
+                )
+                target.end_timestamp = max(
+                    target.end_timestamp, measurement.end_timestamp
+                )
             for name in ("wall_s", "user_s", "system_s", "service_s", "thread_cpu_s"):
                 value = getattr(measurement, name)
                 if value is not None:
@@ -95,9 +106,16 @@ def _measure(collector, stage, scope, parent_stage, inclusive):
     try:
         yield
     finally:
-        elapsed = time.perf_counter() - start
+        end = time.perf_counter()
+        elapsed = end - start
         record = Measurement(
-            stage, scope, call_count=1, parent_stage=parent_stage, inclusive=inclusive
+            stage,
+            scope,
+            call_count=1,
+            parent_stage=parent_stage,
+            inclusive=inclusive,
+            start_timestamp=start,
+            end_timestamp=end,
         )
         if scope == "process":
             end_cpu = resource.getrusage(resource.RUSAGE_SELF)
@@ -188,15 +206,29 @@ def sample_memory():
     temporary = path.with_suffix(".tmp")
     stop = threading.Event()
 
-    def publish(value):
-        temporary.write_text(json.dumps({"private_bytes": value}))
+    history = directory / f"memory_{process.pid}.jsonl"
+
+    def publish(active):
+        info = process.memory_full_info()
+        pss = getattr(info, "pss", None)
+        if not active and pss is not None:
+            pss = 0
+        record = {
+            "timestamp": time.perf_counter(),
+            "private_bytes": info.uss if active else 0,
+            "pss_bytes": pss,
+            "active": active,
+        }
+        temporary.write_text(json.dumps(record))
         temporary.replace(path)
+        with history.open("a") as output:
+            output.write(json.dumps(record) + "\n")
 
     def sample():
         while not stop.is_set():
-            publish(process.memory_full_info().uss)
+            publish(True)
             stop.wait(interval)
-        publish(0)
+        publish(False)
 
     thread = threading.Thread(target=sample)
     thread.start()

@@ -324,6 +324,7 @@ def trial(spec_path):
             "window": dataclasses.asdict(window),
             "actual_workers": workers,
             "workload": collector.workload,
+            "diagnostics": collector.diagnostics,
             "stages": [
                 dataclasses.asdict(record) for record in collector.records.values()
             ],
@@ -359,7 +360,6 @@ def _launch(spec_path, config):
     spec = json.loads(spec_path.read_text())
     utils.configure_helpers(config["helper_threads"])
     env = os.environ.copy()
-    env["MATCH_EVAL_MEMORY_DIR"] = str(spec_path.parent)
     env["MATCH_EVAL_MEMORY_INTERVAL_S"] = str(settings["rss_sample_interval_s"])
     temp_parent = config["temp_dir"]
     if temp_parent is not None:
@@ -372,6 +372,9 @@ def _launch(spec_path, config):
         ) as mapped_root,
         (spec_path.parent / "trial.log").open("w") as log,
     ):
+        memory_root = pathlib.Path(mapped_root) / "memory"
+        memory_root.mkdir()
+        env["MATCH_EVAL_MEMORY_DIR"] = str(memory_root)
         env["MATCH_EVAL_TEMP_DIR"] = mapped_root
         with subprocess.Popen(
             [sys.executable, "-m", "lib.benchmark", "trial", str(spec_path)],
@@ -382,11 +385,35 @@ def _launch(spec_path, config):
         ) as child:
             try:
                 while child.poll() is None:
-                    private = 0
-                    for snapshot_path in spec_path.parent.glob("memory_*.json"):
-                        snapshot = json.loads(snapshot_path.read_text())
-                        private += snapshot["private_bytes"]
-                    samples.append((time.perf_counter(), private))
+                    stamp = time.perf_counter()
+                    snapshots = [
+                        json.loads(path.read_text())
+                        for path in memory_root.glob("memory_*.json")
+                    ]
+                    private = sum(item["private_bytes"] for item in snapshots)
+                    pss_values = [item["pss_bytes"] for item in snapshots]
+                    pss = (
+                        sum(pss_values)
+                        if pss_values and all(value is not None for value in pss_values)
+                        else None
+                    )
+                    ages = [
+                        stamp - item["timestamp"] for item in snapshots if item["active"]
+                    ]
+                    stale = sum(
+                        age > 2 * settings["rss_sample_interval_s"] for age in ages
+                    )
+                    samples.append(
+                        {
+                            "timestamp": stamp,
+                            "private_bytes": private,
+                            "pss_bytes": pss,
+                            "observed_processes": len(ages),
+                            "stale_processes": stale,
+                            "missing_samples": len(snapshots) == 0,
+                            "oldest_sample_age_s": max(ages, default=0),
+                        }
+                    )
                     if time.perf_counter() - started > settings["trial_timeout_s"]:
                         error = (
                             f"Trial exceeded timeout ({settings['trial_timeout_s']} s)"
@@ -409,10 +436,9 @@ def _launch(spec_path, config):
                 if child.poll() is None:
                     os.killpg(child.pid, signal.SIGKILL)
                 child.wait()
-    with (spec_path.parent / "memory_samples.csv").open("w", newline="") as output:
-        writer = csv.writer(output)
-        writer.writerow(["timestamp", "private_bytes"])
-        writer.writerows(samples)
+        history_root = spec_path.parent / "memory_history"
+        shutil.copytree(memory_root, history_root)
+    _write_csv(spec_path.parent / "memory_samples.csv", samples)
     result_path = spec_path.parent / "result.json"
     result = json.loads(result_path.read_text()) if result_path.exists() else {}
     if error or not result or child.returncode != 0:
@@ -422,15 +448,36 @@ def _launch(spec_path, config):
         )
         if settings["quality_checks"] and "window" in result and "quality" not in result:
             result["quality"] = {"status": "failed", "error": result["error"]}
-    result["trial_peak_private_bytes"] = max((value for _, value in samples), default=0)
+    result["trial_peak_private_bytes"] = max(
+        (row["private_bytes"] for row in samples), default=0
+    )
     if "window" in result:
         window = result["window"]
         values = [
-            value
-            for stamp, value in samples
-            if window["start_timestamp"] <= stamp <= window["end_timestamp"]
+            row["private_bytes"]
+            for row in samples
+            if window["start_timestamp"] <= row["timestamp"] <= window["end_timestamp"]
         ]
         result["window_peak_private_bytes"] = max(values, default=0)
+    boundaries = [started, *(row["timestamp"] for row in samples), time.perf_counter()]
+    result["memory_longest_observation_gap_s"] = max(
+        right - left for left, right in itertools.pairwise(boundaries)
+    )
+    result["trial_peak_pss_bytes"] = max(
+        (row["pss_bytes"] for row in samples if row["pss_bytes"] is not None),
+        default=None,
+    )
+    (spec_path.parent / "memory_summary.json").write_text(
+        json.dumps(
+            {
+                key: value
+                for key, value in result.items()
+                if key.startswith("memory_") or key.endswith("pss_bytes")
+            },
+            indent=2,
+        )
+        + "\n"
+    )
     return result
 
 

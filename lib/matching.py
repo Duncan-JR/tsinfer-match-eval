@@ -8,6 +8,7 @@ import logging
 import multiprocessing as mp
 import multiprocessing.connection
 import pathlib
+import statistics
 import tempfile
 import threading
 import time
@@ -703,11 +704,22 @@ def match_stitched_samples(
                     packed_calls=catalog.packed.shape[0],
                     eligible_ancestors=len(catalog.seeds),
                 )
+            if collector is not None:
+                collector.diagnostics.update(
+                    sample_chunk_shape=samples.chunk_shape,
+                    haplotypes_per_slab=[
+                        len(chunk.job_indices) for chunk in samples.chunks
+                    ],
+                    temporary_directory=str(directory),
+                )
             del reference
             with performance.measure(
                 collector, "coordinator_process_startup", "coordinator"
             ):
+                launches = []
+                starts = []
                 for _ in range(workers):
+                    launch_started = time.perf_counter()
                     process = ctx.Process(
                         target=_worker_main,
                         args=(
@@ -725,8 +737,24 @@ def match_stitched_samples(
                             diagnostics,
                         ),
                     )
+                    start_started = time.perf_counter()
                     process.start()
+                    launched = time.perf_counter()
+                    if diagnostics:
+                        launches.append(launched - launch_started)
+                        starts.append(launched - start_started)
                     processes.append(process)
+                if diagnostics:
+                    for name, durations in (
+                        ("launch", launches),
+                        ("process_start", starts),
+                    ):
+                        collector.diagnostics[name] = {
+                            "total_s": sum(durations),
+                            "median_s": statistics.median(durations),
+                            "max_s": max(durations),
+                            "worker_s": durations,
+                        }
                 del cfg
                 watcher = threading.Thread(
                     target=_watch_workers, args=(processes, events, stopping)

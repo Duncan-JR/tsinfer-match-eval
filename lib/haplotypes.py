@@ -80,6 +80,7 @@ class SampleInput:
     allele_mapper: tsinfer.vcz.AlleleMapper
     num_sites: int
     source_rows: np.ndarray
+    chunk_shape: tuple[int, ...]
 
 
 @dataclasses.dataclass
@@ -152,7 +153,9 @@ def prepare_samples(source, reference, jobs):
         min(widths),
         max(widths),
     )
-    return SampleInput(source.path, blocks, chunks, remap, mapper, len(rows), rows)
+    return SampleInput(
+        source.path, blocks, chunks, remap, mapper, len(rows), rows, genotypes.chunks
+    )
 
 
 def load_sample_chunk(inputs, chunk, directory):

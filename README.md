@@ -330,3 +330,12 @@ exclude one-site copying shortcuts. `parent_stage` and `inclusive` label totals
 and children in `stages.csv`; never add an inclusive total to its children or
 add overlapping latencies. Validation has its own window in each trial result
 and `validation_wall_s` in `runs.csv`, outside matching timings.
+
+Benchmark stage records include monotonic phase boundaries. Trial `result.json`
+contains compact worker launch/start summaries and the physical sample chunk
+shape, slab widths and temporary mapping location. Memory observers write to
+trial-owned scratch before copying timestamped histories into `memory_history/`.
+`memory_samples.csv` records USS, PSS where available, stale/missing observations
+and sample ages; `memory_summary.json` reports the longest observation gap.
+Mapped input capacity is separate from physical memory, and nested service
+measurements must not be added to coordinator elapsed time.
