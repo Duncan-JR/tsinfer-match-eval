@@ -266,6 +266,6 @@ class CountingMatcher:
         self.matcher = matcher
         self.calls = 0
 
-    def find_path(self, *args):
+    def find_path(self, *args, **kwargs):
         self.calls += 1
-        return self.matcher.find_path(*args)
+        return self.matcher.find_path(*args, **kwargs)

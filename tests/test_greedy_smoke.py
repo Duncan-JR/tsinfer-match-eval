@@ -14,7 +14,7 @@ import tsinfer
 import tskit
 import zarr
 
-from lib import benchmark, diagnostics, haplotypes, matching, performance, utils
+from lib import benchmark, diagnostics, greedy, haplotypes, matching, performance, utils
 from tests import smoke_helpers
 
 
@@ -536,6 +536,113 @@ class TestMatchingLifetime:
         assert all(not p.is_alive() for p in lifetime_records["processes"])
         assert all(not thread.is_alive() for thread in lifetime_records["threads"])
         assert not list(tiny.root.glob("greedy_*"))
+
+
+class TestConditionedGaps:
+    @pytest.fixture
+    def worker(self, tiny, tmp_path):
+        reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
+        catalog = haplotypes.prepare_reference(
+            tiny.panel, samples, reference, 1, "left", tmp_path
+        )
+        for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
+            haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
+        inputs = haplotypes.share_reference(
+            catalog, samples.allele_mapper.num_alleles_array(), reference, tmp_path
+        )
+        cfg = matching._sample_config(
+            tiny.config, tiny.reference, tmp_path / "unused.trees"
+        )
+        worker = matching.make_worker(inputs, catalog, cfg.match.sources["samples"])
+        yield worker
+        haplotypes.close_mapping(worker.exact.packed)
+
+    @pytest.mark.parametrize("separate", [False, True])
+    def test_padded_calls_and_boundaries(self, worker, monkeypatch, separate):
+        state = worker.exact
+        state.run_left = np.array([2, 3, 8, 11])
+        state.run_right = np.array([3, 4, 9, 13])
+        state.run_ids = np.array([0, 1, 2, 2])
+        boundaries = [0, 6, 13]
+        if separate:
+            boundaries = [0, 4, 6, 8, 9, 11, 13]
+        worker.boundaries = np.array(boundaries)
+        monkeypatch.setattr(greedy, "candidates", lambda *args: None)
+        monkeypatch.setattr(greedy, "cover", lambda *args: 4)
+        calls = []
+
+        def find_path(h, start, end, out, **kwargs):
+            calls.append((start, end, kwargs))
+            # One segment per site includes anchor-only segments to be discarded.
+            left = np.arange(start, end)
+            right = left + 1
+            parents = np.ones(end - start, dtype=np.int32)
+            if kwargs.get("initial_state") is not None:
+                parents[0] = kwargs["initial_state"]
+            if kwargs.get("final_state") is not None:
+                parents[-1] = kwargs["final_state"]
+            out[start:end] = 0
+            return (
+                worker.positions[left][::-1],
+                np.append(worker.positions, worker.sequence_length)[right][::-1],
+                parents[::-1],
+            )
+
+        monkeypatch.setattr(worker.matcher, "find_path", find_path)
+        collector = performance.Collector()
+        h = np.zeros(13, dtype=np.int8)
+        result = matching.match_stitched_haplotype(0, h, worker, 1, collector)
+        parents = state.catalog.parents
+        if separate:
+            expected = [
+                (0, 3, {"initial_state": None, "final_state": parents[0]}),
+                (4, 6, {}),
+                (6, 8, {}),
+                (9, 11, {}),
+            ]
+        else:
+            expected = [
+                (0, 3, {"initial_state": None, "final_state": parents[0]}),
+                (3, 6, {"initial_state": parents[1], "final_state": None}),
+                (6, 9, {"initial_state": None, "final_state": parents[2]}),
+                (8, 12, {"initial_state": parents[2], "final_state": parents[2]}),
+            ]
+        assert calls == expected
+        assert np.all(result.left < result.right)
+        assert len(result.parent) == len(result.left)
+        assert collector.workload["gap_calls"] == 4
+        assert collector.workload["gap_sites"] == 8
+
+    def test_real_stitched_output(self, tiny, worker, monkeypatch):
+        # Include a mismatching one-site bridge and residual conditioned gaps.
+        h = np.array([1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0], dtype=np.int8)
+        native = worker.matcher.find_path
+        calls = []
+
+        def find_path(h, start, end, out, **kwargs):
+            calls.append((start, end, kwargs))
+            return native(h, start, end, out, **kwargs)
+
+        monkeypatch.setattr(worker.matcher, "find_path", find_path)
+        result = matching.match_stitched_haplotype(0, h, worker, 1)
+        assert any(end - start > 3 and kwargs for start, end, kwargs in calls)
+        tables = tskit.load(tiny.reference).dump_tables()
+        child = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0)
+        _, _, samples = smoke_helpers.prepared(tiny, tiny.root)
+        mapper = samples.allele_mapper
+        matching.append_result(tables, child, result, mapper)
+        output = tsinfer.matching.finalise_match_tables(tables)
+        decoded = np.array(
+            [
+                variant.alleles[variant.genotypes[0]]
+                for variant in output.variants(samples=[child])
+            ]
+        )
+        alleles = mapper.forward_map()
+        np.testing.assert_array_equal(decoded, alleles[np.arange(len(h)), h])
+        assert np.all(result.left < result.right)
+        assert len(result.mutation_site) == len(np.unique(result.mutation_site))
+        assert 0 in result.mutation_site
 
 
 class TestStageTimings:

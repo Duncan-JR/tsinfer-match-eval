@@ -103,12 +103,16 @@ class MatchInterval:
 
     ``bridged_sites`` records only one-site copying decisions, allowing matching
     to compare their known packed alleles without scanning exact runs again.
+    HMM intervals carry adjacent copied catalog IDs in ``left_ancestor`` and
+    ``right_ancestor`` when no inference boundary separates the sites.
     """
 
     left: int
     right: int
     ancestor: int | None
     bridged_sites: list[int] = dataclasses.field(default_factory=list)
+    left_ancestor: int | None = None
+    right_ancestor: int | None = None
 
 
 def _known_support(state, ancestor, site):
@@ -168,9 +172,11 @@ def stitched_intervals(state, count, start, end, boundaries):
 
     Hold one pending interval to extend a chosen neighbour's endpoint. Catalog
     supports cannot cross inference boundaries, so equal copied ancestors can
-    be joined safely. HMM pieces remain independent at every boundary.
+    be joined safely. Only adjacent copied sites in the same inference interval
+    supply HMM boundary states.
     """
     pending = None
+    left_ancestor = None
     for interval in _partition_intervals(state, count, start, end, boundaries):
         if pending is not None:
             same_parent = (
@@ -180,9 +186,22 @@ def stitched_intervals(state, count, start, end, boundaries):
                 pending.right = interval.right
                 pending.bridged_sites.extend(interval.bridged_sites)
                 continue
+            boundary_index = np.searchsorted(boundaries, pending.right)
+            at_boundary = (
+                boundary_index < len(boundaries)
+                and boundaries[boundary_index] == pending.right
+            )
+            adjacent = pending.right == interval.left and not at_boundary
+            if pending.ancestor is None:
+                pending.left_ancestor = left_ancestor
+                if adjacent:
+                    pending.right_ancestor = interval.ancestor
+            left_ancestor = pending.ancestor if adjacent else None
             yield pending
         pending = interval
     if pending is not None:
+        if pending.ancestor is None:
+            pending.left_ancestor = left_ancestor
         yield pending
 
 

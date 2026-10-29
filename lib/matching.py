@@ -218,14 +218,39 @@ def make_worker(inputs, catalog, parameters):
     return worker
 
 
-def _match_region(haplotype, worker, start, end, collector=None):
+def _match_region(
+    haplotype,
+    worker,
+    start,
+    end,
+    collector=None,
+    *,
+    initial_state=None,
+    final_state=None,
+):
     """Collect a regional HMM path and mutations before native scratch is reused."""
+    match_start = start
+    match_end = end
+    if initial_state is not None:
+        match_start = start - 1
+    if final_state is not None:
+        match_end = end + 1
     with performance.measure(
         collector, "gap_native_find_path", "thread", parent_stage="gap_matching_assembly"
     ):
-        left, right, parents = worker.matcher.find_path(
-            haplotype, start, end, worker.match_out
-        )
+        if initial_state is None and final_state is None:
+            left, right, parents = worker.matcher.find_path(
+                haplotype, match_start, match_end, worker.match_out
+            )
+        else:
+            left, right, parents = worker.matcher.find_path(
+                haplotype,
+                match_start,
+                match_end,
+                worker.match_out,
+                initial_state=initial_state,
+                final_state=final_state,
+            )
     with performance.measure(
         collector, "gap_path_conversion", "thread", parent_stage="gap_matching_assembly"
     ):
@@ -233,7 +258,8 @@ def _match_region(haplotype, worker, start, end, collector=None):
         right_site = np.searchsorted(worker.positions, right[::-1])
         np.maximum(left_site, start, out=left_site)
         np.minimum(right_site, end, out=right_site)
-        runs = CopyingRuns(left_site, right_site, parents[::-1].copy())
+        keep = left_site < right_site
+        runs = CopyingRuns(left_site[keep], right_site[keep], parents[::-1][keep])
     with performance.measure(
         collector,
         "gap_mutation_extraction",
@@ -275,7 +301,7 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
 
     Filter exact components, then copy supported one-site gaps using
     :func:`lib.greedy.stitched_intervals`. Correct called bridge disagreements
-    with sample mutations. Remaining HMM intervals start fresh likelihoods.
+    with sample mutations. Condition residual HMM gaps on adjacent copied parents.
     """
     called = np.flatnonzero(haplotype >= 0)
     start, end = 0, len(haplotype)
@@ -299,8 +325,20 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
         )
         for interval in intervals:
             if interval.ancestor is None:
+                initial_state = None
+                final_state = None
+                if interval.left_ancestor is not None:
+                    initial_state = state.catalog.parents[interval.left_ancestor]
+                if interval.right_ancestor is not None:
+                    final_state = state.catalog.parents[interval.right_ancestor]
                 region = _match_region(
-                    haplotype, worker, interval.left, interval.right, collector
+                    haplotype,
+                    worker,
+                    interval.left,
+                    interval.right,
+                    collector,
+                    initial_state=initial_state,
+                    final_state=final_state,
                 )
                 blocks.append(region.runs)
                 mutations.append(region.mutation_site)
