@@ -37,6 +37,7 @@ datasets:
 ancestor_chunk_size: 5000
 inference_threads: 2
 matching_threads: 2
+sample_reader_threads: 1
 sample_prefetch_chunks: 1
 max_pending_haplotypes: 4
 temp_dir: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/temporary

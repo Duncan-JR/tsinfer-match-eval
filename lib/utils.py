@@ -169,12 +169,16 @@ def configure_helpers(helpers):
     )
 
 
-def cpu_allocation(workers, helpers):
+def cpu_allocation(workers, helpers, sample_reader_threads=1):
     """Reserve match/loader CPUs and the simultaneously active decoding helpers."""
     decoding = helpers["zarr_threading_max_workers"] + helpers["blosc_threads"]
     packing = workers * decoding
-    matching = workers + 1 + decoding
-    return max(packing, matching) + (workers + 1) * (helpers["blas_threads"] - 1)
+    # Zarr's async limit controls outstanding I/O, not an extra CPU pool.
+    # Its thread executor and codec helpers are shared by the outer readers.
+    readers = sample_reader_threads if sample_reader_threads > 1 else 0
+    matching = workers + 1 + readers + decoding
+    numerical_threads = workers + 1 + readers
+    return max(packing, matching) + numerical_threads * (helpers["blas_threads"] - 1)
 
 
 def parameter_values(value):
@@ -229,6 +233,9 @@ def validate_config(config):
         value = config[name]
         if type(value) is not int or value < 1:
             raise ValueError(f"{name} must be a positive integer")
+    readers = config.get("sample_reader_threads", 1)
+    if type(readers) is not int or readers < 1:
+        raise ValueError("sample_reader_threads must be a positive integer")
     pending = config["max_pending_haplotypes"]
     if pending is not None and (type(pending) is not int or pending < 1):
         raise ValueError("max_pending_haplotypes must be a positive integer or null")

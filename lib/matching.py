@@ -460,14 +460,16 @@ def _pack_reference(work, events, chunks, cap, collector):
             pending -= 1
 
 
-def _load_samples(inputs, directory, slots, stopping, events):
+def _load_samples(inputs, directory, slots, stopping, events, sample_reader_threads):
     """Publish complete slabs; a slot covers loading, waiting and worker use."""
     try:
         for chunk in inputs.chunks:
             slots.acquire()
             if stopping.is_set():
                 return
-            slab = haplotypes.load_sample_chunk(inputs, chunk, directory)
+            slab = haplotypes.load_sample_chunk(
+                inputs, chunk, directory, sample_reader_threads
+            )
             if stopping.is_set():
                 return
             events.put(("slab", slab))
@@ -639,6 +641,7 @@ def match_stitched_samples(
     focal_choice: str = "left",
     temp_dir: pathlib.Path | None = None,
     collector: performance.Collector | None = None,
+    sample_reader_threads: int = 1,
     collect_haplotype_timings: bool = False,
     resident: bool = False,
     window: performance.Window | None = None,
@@ -646,7 +649,7 @@ def match_stitched_samples(
     """Pack once, stream slabs and append completed full-haplotype jobs immediately.
 
     The entry point receives validated configuration. One spawn pool handles
-    packing and matching; a single loader owns sample Zarr reads. Outstanding
+    packing and matching; a loader owns bounded sample Zarr reader threads. Outstanding
     jobs and live decoded slabs have separate bounds. Temporary inputs are
     removed only after loader and children stop. Returns the actual worker count.
 
@@ -839,7 +842,9 @@ def match_stitched_samples(
                     collector, "resident_sample_preload", "coordinator"
                 ):
                     resident_slabs = [
-                        haplotypes.load_sample_chunk(samples, chunk, directory)
+                        haplotypes.load_sample_chunk(
+                            samples, chunk, directory, sample_reader_threads
+                        )
                         for chunk in samples.chunks
                     ]
                 if collector is not None:
@@ -851,7 +856,14 @@ def match_stitched_samples(
             else:
                 loader = threading.Thread(
                     target=_load_samples,
-                    args=(samples, directory, slots, stopping, events),
+                    args=(
+                        samples,
+                        directory,
+                        slots,
+                        stopping,
+                        events,
+                        sample_reader_threads,
+                    ),
                 )
                 loader.start()
             with window if window is not None else contextlib.nullcontext():

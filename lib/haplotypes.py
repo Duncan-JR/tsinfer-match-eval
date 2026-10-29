@@ -1,6 +1,8 @@
 """Packed ancestor references and physical-block, selected-cohort sample loading."""
 
+import concurrent.futures as cf
 import dataclasses
+import itertools
 import logging
 import pathlib
 import time
@@ -212,8 +214,22 @@ def prepare_samples(source, reference, jobs):
     )
 
 
-def load_sample_chunk(inputs, chunk, directory):
-    """Read each required physical tile once, selecting before numeric remapping."""
+def _load_variant_block(genotypes, inputs, chunk, block, slab):
+    """Decode one physical tile and write its disjoint slab columns."""
+    tile = genotypes.blocks[block.block, chunk.block, :]
+    raw = tile[block.local_rows[:, None], chunk.columns[None, :], :]
+    del tile
+    remap = inputs.remap[block.output_rows]
+    safe = np.maximum(raw, 0)
+    encoded = remap[np.arange(len(remap))[:, None, None], safe]
+    encoded[raw < 0] = -1
+    selected = encoded.reshape(len(remap), -1)
+    slab[:, block.output_rows] = selected.T
+    return genotypes.cdata_shape[2]
+
+
+def load_sample_chunk(inputs, chunk, directory, sample_reader_threads=1):
+    """Read each physical tile once; publish only after every block finishes."""
     started = time.perf_counter()
     store = tsinfer.vcz.open_store(inputs.path)
     genotypes = store["call_genotype"]
@@ -224,18 +240,21 @@ def load_sample_chunk(inputs, chunk, directory):
     slab = descriptor.open("w+")
     blocks_read = 0
     try:
-        for block in inputs.blocks:
-            # Slice all ploidy blocks together, keeping both chromosome copies.
-            tile = genotypes.blocks[block.block, chunk.block, :]
-            raw = tile[block.local_rows[:, None], chunk.columns[None, :], :]
-            del tile
-            remap = inputs.remap[block.output_rows]
-            safe = np.maximum(raw, 0)
-            encoded = remap[np.arange(len(remap))[:, None, None], safe]
-            encoded[raw < 0] = -1
-            selected = encoded.reshape(len(remap), -1)
-            slab[:, block.output_rows] = selected.T
-            blocks_read += genotypes.cdata_shape[2]
+        if sample_reader_threads == 1:
+            for block in inputs.blocks:
+                blocks_read += _load_variant_block(genotypes, inputs, chunk, block, slab)
+        else:
+            blocks = iter(inputs.blocks)
+            with cf.ThreadPoolExecutor(max_workers=sample_reader_threads) as executor:
+                while batch := list(itertools.islice(blocks, sample_reader_threads)):
+                    futures = [
+                        executor.submit(
+                            _load_variant_block, genotypes, inputs, chunk, block, slab
+                        )
+                        for block in batch
+                    ]
+                    for future in futures:
+                        blocks_read += future.result()
     finally:
         close_mapping(slab)
     elapsed = time.perf_counter() - started

@@ -229,15 +229,16 @@ rule match_stitched_samples:
         focal_choice=focal_choice,
         workers=config["matching_threads"],
         sample_prefetch_chunks=config["sample_prefetch_chunks"],
+        sample_reader_threads=config.get("sample_reader_threads", 1),
         max_pending_haplotypes=config["max_pending_haplotypes"],
         temp_dir=config["temp_dir"],
         helper_threads=helpers,
-    threads: utils.cpu_allocation(config["matching_threads"], helpers)
+    threads: utils.cpu_allocation(config["matching_threads"], helpers, config.get("sample_reader_threads", 1))
     log:
         greedy_log_dir / "{name}_inferred_match_stitched_samples.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
-        required = utils.cpu_allocation(params.workers, params.helper_threads)
+        required = utils.cpu_allocation(params.workers, params.helper_threads, params.sample_reader_threads)
         if threads < required:
             raise ValueError(f"Greedy matching needs {required} CPUs including helpers; got {threads}")
         matching.match_stitched_samples(
@@ -245,6 +246,7 @@ rule match_stitched_samples:
             af_cutoff=params.af_cutoff, min_region_size_kb=params.min_region_size_kb,
             focal_choice=params.focal_choice, workers=params.workers,
             sample_prefetch_chunks=params.sample_prefetch_chunks,
+            sample_reader_threads=params.sample_reader_threads,
             max_pending_haplotypes=params.max_pending_haplotypes,
             temp_dir=None if params.temp_dir is None else pathlib.Path(params.temp_dir).expanduser(),
             helper_threads=params.helper_threads,

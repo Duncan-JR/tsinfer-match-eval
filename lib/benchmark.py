@@ -68,7 +68,9 @@ def final_products(config):
 
 def required_allocation(config):
     return utils.cpu_allocation(
-        max(config["performance"]["worker_counts"]), config["helper_threads"]
+        max(config["performance"]["worker_counts"]),
+        config["helper_threads"],
+        config.get("sample_reader_threads", 1),
     )
 
 
@@ -277,6 +279,7 @@ def trial(spec_path):
                 "workers": workers,
                 "helper_threads": config["helper_threads"],
                 "sample_prefetch_chunks": config["sample_prefetch_chunks"],
+                "sample_reader_threads": config.get("sample_reader_threads", 1),
                 "max_pending_haplotypes": config["max_pending_haplotypes"],
                 "temp_dir": None
                 if temp_parent is None

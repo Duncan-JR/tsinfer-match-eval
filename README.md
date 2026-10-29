@@ -89,6 +89,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
 | `inference_threads` | Native ancestor inference workers and requested diagnostics CPU budget. Diagnostics uses the actual Snakemake-granted threads. |
 | `matching_threads` | Native ancestor/baseline threads and greedy process workers. |
+| `sample_reader_threads` | Greedy physical variant-block readers per slab; default `1`. Blocks write disjoint columns and publish together. Pilot `2`, then `4` only while useful; allow extra decode scratch. Shared Zarr async and thread limits remain separate from reader count and are included in the CPU budget. |
 | `sample_prefetch_chunks` | Maximum live decoded sample slabs; start with `2`. |
 | `max_pending_haplotypes` | Maximum queued, running and completed-but-unappended haplotype jobs; also bounds preparation admission. `null` uses the requested worker count. An explicit limit must be at least that count. |
 | `temp_dir` | Temporary mapped-file parent, or `null` for the system temporary directory. |
