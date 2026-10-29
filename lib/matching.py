@@ -329,8 +329,7 @@ def _worker_main(
     start_matching,
     panel_path,
     reference_path,
-    catalog,
-    num_alleles,
+    inputs,
     parameters,
     minimum,
     helpers,
@@ -340,9 +339,13 @@ def _worker_main(
 ):
     """Preparation barrier followed by matching, reusing the same processes."""
     worker = None
+    catalog = None
+    num_alleles = None
     try:
         utils.configure_helpers(helpers)
         worker_pid = os.getpid()
+        catalog = inputs.open_catalog()
+        num_alleles = inputs.open_num_alleles()
         while True:
             chunk = work.get()
             if chunk is None:
@@ -410,6 +413,11 @@ def _worker_main(
     finally:
         if worker is not None:
             haplotypes.close_mapping(worker.exact.packed)
+            del worker
+        if catalog is not None:
+            for field in dataclasses.fields(catalog):
+                haplotypes.close_mapping(getattr(catalog, field.name))
+        haplotypes.close_mapping(num_alleles)
 
 
 def _watch_workers(processes, events, stopping):
@@ -727,6 +735,8 @@ def match_stitched_samples(
                     focal_choice,
                     directory,
                 )
+                num_alleles = samples.allele_mapper.num_alleles_array()
+                inputs = haplotypes.share_reference(catalog, num_alleles, directory)
             if collector is not None:
                 slab_sizes = [
                     len(chunk.job_indices) * reference.num_sites
@@ -734,7 +744,11 @@ def match_stitched_samples(
                 ]
                 slab_sizes.sort(reverse=True)
                 live_count = len(slab_sizes) if resident else sample_prefetch_chunks
-                mapped_bound = catalog.packed.shape[0] + sum(slab_sizes[:live_count])
+                mapped_bound = (
+                    catalog.packed.shape[0]
+                    + inputs.mapped_bytes
+                    + sum(slab_sizes[:live_count])
+                )
                 collector.count(
                     mapped_input_bound_bytes=mapped_bound,
                     packed_calls=catalog.packed.shape[0],
@@ -764,8 +778,7 @@ def match_stitched_samples(
                             start_matching,
                             panel_path,
                             ancestors_ts_path,
-                            catalog,
-                            samples.allele_mapper.num_alleles_array(),
+                            inputs,
                             cfg.match.sources["samples"],
                             min_focal_region_size,
                             helper_threads,
@@ -848,7 +861,7 @@ def match_stitched_samples(
                     "coordinator",
                     inclusive=True,
                 ):
-                    admitted = time.perf_counter()
+                    admitted = time.perf_counter() if collector is not None else None
                     if collect_haplotype_timings:
                         collector.diagnostics["matching_start_timestamp"] = admitted
                     start_matching.set()

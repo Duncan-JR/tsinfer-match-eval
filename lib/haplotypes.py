@@ -52,6 +52,60 @@ class ReferenceCatalog:
 
 
 @dataclasses.dataclass
+class ReferenceInputs:
+    """Named immutable .npy inputs; only paths and scalars cross spawn."""
+
+    parents: pathlib.Path
+    columns: pathlib.Path
+    seeds: pathlib.Path
+    starts: pathlib.Path
+    stops: pathlib.Path
+    offsets: pathlib.Path
+    num_alleles: pathlib.Path
+    packed: MappedCalls
+    mapped_bytes: int
+
+    def open_catalog(self):
+        arrays = []
+        for name in ("parents", "columns", "seeds", "starts", "stops", "offsets"):
+            array = np.load(getattr(self, name), mmap_mode="r", allow_pickle=False)
+            dtype = np.int32 if name == "parents" else np.int64
+            if array.dtype != dtype or array.ndim != 1:
+                raise ValueError(f"Invalid catalog input: {name}")
+            arrays.append(array)
+        if any(array.shape != arrays[0].shape for array in arrays):
+            raise ValueError("Catalog input shapes disagree")
+        return ReferenceCatalog(*arrays, self.packed)
+
+    def open_num_alleles(self):
+        array = np.load(self.num_alleles, mmap_mode="r", allow_pickle=False)
+        if array.dtype != np.uint64 or array.ndim != 1 or not array.flags.c_contiguous:
+            raise ValueError("Allele counts must be contiguous native uint64")
+        return array
+
+
+def share_reference(catalog, num_alleles, directory):
+    """Write catalog arrays and allele counts once, preserving their dtypes."""
+    paths = {}
+    mapped_bytes = 0
+    for name in (
+        "parents",
+        "columns",
+        "seeds",
+        "starts",
+        "stops",
+        "offsets",
+        "num_alleles",
+    ):
+        array = num_alleles if name == "num_alleles" else getattr(catalog, name)
+        path = directory / f"{name}.npy"
+        np.save(path, array, allow_pickle=False)
+        paths[name] = path
+        mapped_bytes += array.nbytes
+    return ReferenceInputs(**paths, packed=catalog.packed, mapped_bytes=mapped_bytes)
+
+
+@dataclasses.dataclass
 class VariantBlock:
     """Reference-site rows selected from one physical variant block."""
 
