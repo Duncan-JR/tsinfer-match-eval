@@ -58,6 +58,7 @@ performance:
   seed: 20261016
   rss_sample_interval_s: 0.05
   trial_timeout_s: 3600
+  collect_haplotype_timings: false
   collect_stages: false
   diagnostics_run: {mode: from_reference, workers: 6, repeat: 0}
   quality_checks: true

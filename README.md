@@ -286,6 +286,7 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `seed` | Randomises method/worker order within each repeat. |
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
+| `collect_haplotype_timings` | Default `false`; save greedy task service times independently of regional stage timers. Full HMM timing rows are unavailable. |
 | `collect_stages` | Enable aggregate preparation, coordinator, loading, native gap matching and assembly timings. `false` retains workload counts without stage timers. Record one staged run at every new scale, including one million haplotypes; use whole `from_reference` windows for method-level comparisons. |
 | `diagnostics_run` | Explicit `mode`, `workers` and zero-based `repeat` selecting completed trees for diagnostics; must belong to the suite. Diagnostic coverage is checked only when diagnostics is requested. |
 | `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
@@ -339,3 +340,24 @@ trial-owned scratch before copying timestamped histories into `memory_history/`.
 and sample ages; `memory_summary.json` reports the longest observation gap.
 Mapped input capacity is separate from physical memory, and nested service
 measurements must not be added to coordinator elapsed time.
+
+When enabled, each trial's `haplotype_timings.csv` contains one row per completed
+greedy haplotype, ordered by `job_index`, and is included in the performance
+archive. Older archives have no such data. Columns are:
+
+| Fields | Meaning |
+| --- | --- |
+| `run_id`, `job_index` | Trial and canonical job; include the experiment ID when combining suites. |
+| `source`, `sample_id`, `ploidy_index` | Stable haplotype identity. |
+| `worker_pid` | Worker identity within this trial. |
+| `match_start_s`, `match_end_s` | Monotonic offsets from the matching-window start. |
+| `match_wall_s`, `match_thread_cpu_s` | Elapsed and executing-thread CPU time inside the matching call. |
+| `domain_sites`, `focal_sites`, `gap_sites`, `gap_calls` | Existing per-haplotype workload counters. |
+
+The timed call includes domain/candidate detection, extension, cover, bridges,
+independent HMM gaps and owned output construction, including scheduling or page
+fault delays inside it. It excludes startup, decoding, queue wait, mapping
+open/close, result transfer, coordinator append and final output. For an
+individual service time, sum its two haplotype times; neither that sum nor their
+maximum is individual end-to-end latency. Run wall time divided by haplotype
+count measures throughput. Never add summed service times to run wall time.

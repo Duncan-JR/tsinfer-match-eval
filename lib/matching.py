@@ -7,6 +7,7 @@ import json
 import logging
 import multiprocessing as mp
 import multiprocessing.connection
+import os
 import pathlib
 import statistics
 import tempfile
@@ -134,6 +135,7 @@ class HaplotypeResult:
     mutation_site: np.ndarray
     mutation_code: np.ndarray
     measurements: performance.Collector | None = None
+    timing: performance.HaplotypeTiming | None = None
 
 
 @dataclasses.dataclass
@@ -334,11 +336,13 @@ def _worker_main(
     helpers,
     collect,
     diagnostics,
+    collect_haplotype_timings,
 ):
     """Preparation barrier followed by matching, reusing the same processes."""
     worker = None
     try:
         utils.configure_helpers(helpers)
+        worker_pid = os.getpid()
         while True:
             chunk = work.get()
             if chunk is None:
@@ -375,9 +379,27 @@ def _worker_main(
                 collector = (
                     performance.Collector(stages=diagnostics) if collect else None
                 )
+                if collect_haplotype_timings:
+                    match_start = time.perf_counter()
+                    cpu_start = time.thread_time()
                 result = match_stitched_haplotype(
                     task.job_index, row, worker, minimum, collector
                 )
+                if collect_haplotype_timings:
+                    match_end = time.perf_counter()
+                    thread_cpu = time.thread_time() - cpu_start
+                    counts = collector.workload
+                    result.timing = performance.HaplotypeTiming(
+                        worker_pid,
+                        match_start,
+                        match_end,
+                        match_end - match_start,
+                        thread_cpu,
+                        counts["domain_sites"],
+                        counts["focal_sites"],
+                        counts["gap_sites"],
+                        counts["gap_calls"],
+                    )
                 del row
             finally:
                 haplotypes.close_mapping(calls)
@@ -571,6 +593,17 @@ def _coordinate(
                 append_result(
                     tables, nodes[result.job_index], result, samples.allele_mapper
                 )
+            if result.timing is not None:
+                job = jobs[result.job_index]
+                collector.haplotype_timings.append(
+                    {
+                        "job_index": result.job_index,
+                        "source": job.source,
+                        "sample_id": job.sample_id,
+                        "ploidy_index": job.ploidy_index,
+                        **dataclasses.asdict(result.timing),
+                    }
+                )
             if collector is not None and result.measurements is not None:
                 collector.merge(result.measurements)
             pending -= 1
@@ -598,6 +631,7 @@ def match_stitched_samples(
     focal_choice: str = "left",
     temp_dir: pathlib.Path | None = None,
     collector: performance.Collector | None = None,
+    collect_haplotype_timings: bool = False,
     resident: bool = False,
     window: performance.Window | None = None,
 ) -> int:
@@ -612,6 +646,8 @@ def match_stitched_samples(
     ``window``; the benchmark limits their total size. Normal end-to-end timing
     wraps this entire function, including startup, packing and final output.
     """
+    if collect_haplotype_timings and collector is None:
+        raise ValueError("Haplotype timing collection requires a collector")
     if max_pending_haplotypes is None:
         max_pending_haplotypes = workers
     if max_pending_haplotypes < workers:
@@ -735,6 +771,7 @@ def match_stitched_samples(
                             helper_threads,
                             collector is not None,
                             diagnostics,
+                            collect_haplotype_timings,
                         ),
                     )
                     start_started = time.perf_counter()
@@ -811,7 +848,9 @@ def match_stitched_samples(
                     "coordinator",
                     inclusive=True,
                 ):
-                    admitted = time.perf_counter() if diagnostics else None
+                    admitted = time.perf_counter()
+                    if collect_haplotype_timings:
+                        collector.diagnostics["matching_start_timestamp"] = admitted
                     start_matching.set()
                     _coordinate(
                         work,

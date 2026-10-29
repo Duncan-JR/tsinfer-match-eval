@@ -40,6 +40,21 @@ class Measurement:
 
 
 @dataclasses.dataclass
+class HaplotypeTiming:
+    """Scalar service-time boundaries captured around one matching call."""
+
+    worker_pid: int
+    match_start_s: float
+    match_end_s: float
+    match_wall_s: float
+    match_thread_cpu_s: float
+    domain_sites: int
+    focal_sites: int
+    gap_sites: int
+    gap_calls: int
+
+
+@dataclasses.dataclass
 class Collector:
     """Trial or haplotype-local records, merged only by the coordinator.
 
@@ -52,6 +67,7 @@ class Collector:
     workload: dict = dataclasses.field(default_factory=dict)
 
     diagnostics: dict = dataclasses.field(default_factory=dict)
+    haplotype_timings: list[dict] = dataclasses.field(default_factory=list)
 
     def count(self, **counts):
         for name, value in counts.items():

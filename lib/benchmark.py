@@ -282,6 +282,9 @@ def trial(spec_path):
                 if temp_parent is None
                 else pathlib.Path(temp_parent).expanduser(),
                 "collector": collector,
+                "collect_haplotype_timings": config["performance"].get(
+                    "collect_haplotype_timings", False
+                ),
             }
             if run["mode"] == "from_reference":
                 with window:
@@ -319,8 +322,22 @@ def trial(spec_path):
             del matched_ts, reference
         if workers != run["requested_workers"]:
             raise ValueError("Actual worker count differs from requested_workers")
+        timing_path = None
+        if run["method"] == "greedy" and config["performance"].get(
+            "collect_haplotype_timings", False
+        ):
+            origin = collector.diagnostics["matching_start_timestamp"]
+            rows = sorted(collector.haplotype_timings, key=lambda row: row["job_index"])
+            for row in rows:
+                row["match_start_s"] -= origin
+                row["match_end_s"] -= origin
+            timing_path = "haplotype_timings.csv"
+            _write_csv(
+                folder / timing_path, [{"run_id": run["run_id"], **row} for row in rows]
+            )
         result = {
             "status": "ok",
+            "haplotype_timings": timing_path,
             "window": dataclasses.asdict(window),
             "actual_workers": workers,
             "workload": collector.workload,
