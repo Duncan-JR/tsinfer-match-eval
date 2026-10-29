@@ -146,9 +146,18 @@ def validate_config(config, allocation):
         )
 
 
+@dataclasses.dataclass
+class SampleJobs:
+    """Sample jobs and the metadata rows appended to their reference."""
+
+    jobs: list[tsinfer.config.MatchJob]
+    individuals: list[dict]
+    populations: list[dict]
+
+
 def _sample_jobs(cfg, reference):
-    jobs, _, _ = tsinfer.pipeline._build_jobs_with_metadata(
-        cfg, reference.sites_position.astype(np.int32)
+    jobs, individuals, populations = tsinfer.pipeline._build_jobs_with_metadata(
+        cfg, reference.sites_position.astype(np.int32), reference
     )
     jobs.sort(key=lambda job: job.haplotype_index)
     if (
@@ -157,15 +166,17 @@ def _sample_jobs(cfg, reference):
         or any(job.time != 0 for job in jobs)
     ):
         raise ValueError("Benchmarks require one nonempty present-day sample group")
-    return jobs
+    return SampleJobs(jobs, individuals, populations)
 
 
 def _native_reader(cfg, reference, jobs, cache_size, workers):
     positions = reference.sites_position.astype(np.int32)
     ancestral = np.asarray([site.ancestral_state for site in reference.sites()])
     schedule = [(job.source, job.sample_id, job.ploidy_index) for job in jobs]
+    resolved = tsinfer.vcz.resolve_sources(list(cfg.sources.values()), None, cfg.contig)
+    sources = {source.name: source for source in resolved.sources}
     return tsinfer.vcz.HaplotypeReader(
-        cfg.sources,
+        sources,
         positions,
         ancestral,
         cache_size_mb=cache_size,
@@ -179,7 +190,8 @@ def _resident_full_hmm(paths, dataset, output, workers, window):
     """Native HMM baseline with decoded input and indexes outside its window."""
     cfg = matching._sample_config(paths.config, paths.reference, output)
     reference = tskit.load(paths.reference)
-    jobs = _sample_jobs(cfg, reference)
+    sample_jobs = _sample_jobs(cfg, reference)
+    jobs = sample_jobs.jobs
     reader = _native_reader(
         cfg, reference, jobs, dataset.get("matching_cache_size"), workers
     )
@@ -192,12 +204,18 @@ def _resident_full_hmm(paths, dataset, output, workers, window):
     indexes = tsinfer.matching.MatcherIndexes(
         reference, vestigial_root=False, num_alleles=num_alleles
     )
-    parameters = cfg.match.sources["samples"]
-    rho = np.full(reference.num_sites, parameters.recombination)
-    mu = np.full(reference.num_sites, parameters.mismatch)
+    parameters = tsinfer.matching.hmm_parameters(
+        cfg.match.sources["samples"], reference.sites_position
+    )
     # Native matchers are private to the executor threads; initialise all before timing.
     matchers = [
-        tsinfer.matching.AncestorMatcher(indexes, rho, mu) for _ in range(workers)
+        tsinfer.matching.AncestorMatcher(
+            indexes,
+            parameters.recombination,
+            parameters.mismatch,
+            likelihood_threshold=parameters.likelihood_threshold,
+        )
+        for _ in range(workers)
     ]
     chunks = np.array_split(np.arange(len(jobs)), workers)
 
@@ -236,7 +254,12 @@ def _resident_full_hmm(paths, dataset, output, workers, window):
                 for indices, matcher in zip(chunks, matchers, strict=True)
             ]
             results = [result for future in futures for result in future.result()]
-    tables = reference.dump_tables()
+    populations = sample_jobs.populations if len(sample_jobs.populations) > 0 else None
+    prepared = tsinfer.matching.prepare_reference_ts(
+        reference, individuals=sample_jobs.individuals, populations=populations
+    )
+    tables = prepared.dump_tables()
+    del prepared
     nodes = matching._create_sample_nodes(tables, jobs)
     for result in results:
         matching.append_result(tables, nodes[result.job_index], result, mapper)
@@ -262,7 +285,7 @@ def trial(spec_path):
         if run["mode"] == "resident_match":
             cfg = matching._sample_config(paths.config, paths.reference, output)
             reference = tskit.load(paths.reference)
-            jobs = _sample_jobs(cfg, reference)
+            jobs = _sample_jobs(cfg, reference).jobs
             if workers > len(jobs):
                 raise ValueError("Requested workers exceed the sample haplotype count")
             matrix_bytes = reference.num_sites * len(jobs)
@@ -633,7 +656,7 @@ def _manifest(config, allocation):
             requested["mismatch"],
         ):
             raise ValueError("Prepared native configuration disagrees with hmm settings")
-        jobs = _sample_jobs(cfg, reference)
+        jobs = _sample_jobs(cfg, reference).jobs
         if max(config["performance"]["worker_counts"]) > len(jobs):
             raise ValueError(
                 f"Dataset {dataset['name']} has only {len(jobs)} haplotypes; "
@@ -932,12 +955,21 @@ def quality_check(config, dataset_name, folder):
     reference = tskit.load(paths.reference)
     output = tskit.load(folder / "samples_raw.trees")
     cfg = matching._sample_config(paths.config, paths.reference, folder / "unused.trees")
-    jobs = _sample_jobs(cfg, reference)
+    sample_jobs = _sample_jobs(cfg, reference)
+    jobs = sample_jobs.jobs
     if output.tables.nodes[: reference.num_nodes] != reference.tables.nodes:
         raise ValueError("Output changed reference nodes")
+    individuals = reference.tables.individuals.copy()
+    for metadata in sample_jobs.individuals:
+        individuals.add_row(metadata=metadata)
+    populations = reference.tables.populations.copy()
+    if len(sample_jobs.populations) > 0 and len(populations) == 0:
+        populations.metadata_schema = tskit.MetadataSchema.permissive_json()
+    for metadata in sample_jobs.populations:
+        populations.add_row(metadata=metadata)
     if (
-        output.tables.individuals != reference.tables.individuals
-        or output.tables.populations != reference.tables.populations
+        output.tables.individuals != individuals
+        or output.tables.populations != populations
     ):
         raise ValueError("Output changed individual/population metadata")
     sample_nodes = np.arange(reference.num_nodes, output.num_nodes, dtype=np.int32)

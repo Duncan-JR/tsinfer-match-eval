@@ -6,9 +6,10 @@ belongs in separate notebooks.
 
 ## Running
 
-Use phased, biallelic, single-contig VCF Zarr inputs and the editable tsinfer
-checkout at `../tsinfer`. The runner uses its regional `AncestorMatcher`,
-retaining reference topology across independent gap calls, and raw table APIs.
+Use Python 3.12 or newer, phased biallelic single-contig VCF Zarr inputs, and
+the editable tsinfer checkout at `../tsinfer`. The runner uses its regional
+`AncestorMatcher`, retaining reference topology across independent gap calls,
+and raw table APIs.
 
 ```sh
 cp config.yaml.example config.yaml
@@ -58,6 +59,11 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    with sample mutations; missing observations need no mutation. Match remaining
    gaps independently with the full HMM. Append completed results, squash adjacent
    equal-parent/child edges once, then finalise and sort tables.
+
+Both matching runners append sample individual and population metadata after
+the reference rows, using the same IDs as tsinfer reference matching. Existing
+VCZ stores must satisfy vcztools 0.2 variant-chunk alignment requirements;
+rechunk older stores with inconsistent variant chunks before reusing them.
 
 The greedy cover minimises copying runs within each retained exact union.
 Gap matches start independent likelihoods; this does not optimise global HMM

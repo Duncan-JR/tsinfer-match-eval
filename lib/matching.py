@@ -32,9 +32,9 @@ def match_ancestors(
 ) -> None:
     """Match ancestors before samples, preserving the raw reference TS.
 
-    Keeping samples in the configuration preserves their full contig length and
-    pre-created individual rows for :func:`match_samples`. Original ancestor
-    times must put every ancestor group strictly before the first sample group.
+    Ancestor times must put every ancestor group strictly before the first
+    sample group. Sample matching appends its own individual and population
+    metadata after the reference rows, following tsinfer's reference API.
     """
     cfg = tsinfer.config.Config.from_toml(config_path)
     jobs = json.loads(tsinfer.pipeline.compute_groups_json(cfg))
@@ -84,9 +84,9 @@ def match_samples(
 ) -> None:
     """Match samples against the unmodified reference from :func:`match_ancestors`.
 
-    Preserve source selection/order and individual metadata so recreated job
-    individual IDs correspond to the reference rows. Raw parent IDs remain
-    available for comparisons through node metadata.
+    Preserve source selection/order and append sample metadata after the
+    reference rows. Raw parent IDs remain available for comparisons through
+    node metadata.
     """
     sample_cfg = _sample_config(config_path, ancestors_ts_path, output_path)
     ts = tsinfer.pipeline.match(
@@ -193,10 +193,12 @@ def make_worker(inputs, catalog, parameters):
         inputs.num_nodes,
         inputs.sequence_length,
     )
+    hmm = tsinfer.matching.hmm_parameters(parameters, positions)
     matcher = tsinfer.matching.AncestorMatcher(
         indexes,
-        np.full(len(positions), parameters.recombination),
-        np.full(len(positions), parameters.mismatch),
+        hmm.recombination,
+        hmm.mismatch,
+        likelihood_threshold=hmm.likelihood_threshold,
         reuse_topology=True,
     )
     worker = Worker(
@@ -700,7 +702,7 @@ def match_stitched_samples(
         reference = tskit.load(ancestors_ts_path)
         positions = reference.sites_position.astype(np.int32)
         jobs, individuals, populations = tsinfer.pipeline._build_jobs_with_metadata(
-            cfg, positions
+            cfg, positions, reference
         )
         jobs.sort(key=lambda job: job.haplotype_index)
         if len(jobs) == 0 or reference.num_sites == 0:
@@ -714,7 +716,13 @@ def match_stitched_samples(
             min_focal_region_size,
         )
         samples = haplotypes.prepare_samples(cfg.sources["samples"], reference, jobs)
-        tables = reference.dump_tables()
+        prepared = tsinfer.matching.prepare_reference_ts(
+            reference,
+            individuals=individuals,
+            populations=populations if len(populations) > 0 else None,
+        )
+        tables = prepared.dump_tables()
+        del prepared
         metadata = tables.metadata
         metadata["match_eval"] = {
             "af_cutoff": af_cutoff,
@@ -725,14 +733,6 @@ def match_stitched_samples(
         tables.metadata = metadata
         if collector is not None:
             collector.count(min_focal_region_size=min_focal_region_size)
-        if [row.metadata for row in tables.individuals] != individuals:
-            raise ValueError(
-                "Reference individuals disagree with selected sample metadata"
-            )
-        if [row.metadata for row in tables.populations] != populations:
-            raise ValueError(
-                "Reference populations disagree with selected sample metadata"
-            )
         nodes = _create_sample_nodes(tables, jobs)
         del positions, individuals, populations
     if workers > len(jobs):
