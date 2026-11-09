@@ -627,7 +627,10 @@ class TestConditionedGaps:
         haplotypes.close_mapping(worker.exact.packed)
 
     @pytest.mark.parametrize("separate", [False, True])
-    def test_padded_calls_and_boundaries(self, worker, monkeypatch, separate):
+    @pytest.mark.parametrize("condition_gaps", [False, True])
+    def test_padded_calls_and_boundaries(
+        self, worker, monkeypatch, separate, condition_gaps
+    ):
         state = worker.exact
         state.run_left = np.array([2, 3, 8, 11])
         state.run_right = np.array([3, 4, 9, 13])
@@ -660,9 +663,14 @@ class TestConditionedGaps:
         monkeypatch.setattr(worker.matcher, "find_path", find_path)
         collector = performance.Collector()
         h = np.zeros(13, dtype=np.int8)
-        result = matching.match_stitched_haplotype(0, h, worker, 1, collector)
+        result = matching.match_stitched_haplotype(
+            0, h, worker, 1, collector, condition_gaps=condition_gaps
+        )
         parents = state.catalog.parents
-        if separate:
+        if not condition_gaps:
+            gaps = [(0, 2), (4, 6), (6, 8), (9, 11)]
+            expected = [(start, end, {}) for start, end in gaps]
+        elif separate:
             expected = [
                 (0, 3, {"initial_state": None, "final_state": parents[0]}),
                 (4, 6, {}),
@@ -682,8 +690,9 @@ class TestConditionedGaps:
         assert collector.workload["gap_calls"] == 4
         assert collector.workload["gap_sites"] == 8
 
-    def test_real_stitched_output(self, tiny, worker, monkeypatch):
-        # Include a mismatching one-site bridge and residual conditioned gaps.
+    @pytest.mark.parametrize("condition_gaps", [False, True])
+    def test_real_stitched_output(self, tiny, worker, monkeypatch, condition_gaps):
+        # Include a mismatching one-site bridge and residual HMM gaps.
         h = np.array([1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0], dtype=np.int8)
         native = worker.matcher.find_path
         calls = []
@@ -693,8 +702,14 @@ class TestConditionedGaps:
             return native(h, start, end, out, **kwargs)
 
         monkeypatch.setattr(worker.matcher, "find_path", find_path)
-        result = matching.match_stitched_haplotype(0, h, worker, 1)
-        assert any(end - start > 3 and kwargs for start, end, kwargs in calls)
+        result = matching.match_stitched_haplotype(
+            0, h, worker, 1, condition_gaps=condition_gaps
+        )
+        if condition_gaps:
+            assert any(end - start > 3 and kwargs for start, end, kwargs in calls)
+        else:
+            assert len(calls) > 0
+            assert all(kwargs == {} for _, _, kwargs in calls)
         tables = tskit.load(tiny.reference).dump_tables()
         child = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0)
         _, _, samples = smoke_helpers.prepared(tiny, tiny.root)
@@ -712,6 +727,22 @@ class TestConditionedGaps:
         assert np.all(result.left < result.right)
         assert len(result.mutation_site) == len(np.unique(result.mutation_site))
         assert 0 in result.mutation_site
+
+    def test_disabled_in_benchmark(self, tiny, tiny_config):
+        tiny_config["condition_gaps"] = False
+        utils.validate_config(tiny_config)
+        run = next(
+            run for run in benchmark.trial_runs(tiny_config) if run["method"] == "greedy"
+        )
+        folder = tiny.root / "unconditioned_trial"
+        folder.mkdir()
+        spec = folder / "trial.json"
+        spec.write_text(json.dumps({"run": run, "config": tiny_config}))
+        assert benchmark.trial(spec)
+        output = tskit.load(folder / "samples_raw.trees")
+        assert output.metadata["match_eval"]["condition_gaps"] is False
+        result = json.loads((folder / "result.json").read_text())
+        assert result["quality"]["called_allele_errors"] == 0
 
 
 class TestStageTimings:

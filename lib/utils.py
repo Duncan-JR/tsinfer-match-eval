@@ -249,6 +249,8 @@ def validate_config(config):
         )
     if config.get("focal_choice", "left") not in ("left", "right"):
         raise ValueError("focal_choice must be left or right")
+    if type(config.get("condition_gaps", True)) is not bool:
+        raise ValueError("condition_gaps must be true or false")
     obsolete = {"af_cutoff", "min_region_size_kb"} & config.keys()
     if obsolete:
         names = ", ".join(sorted(obsolete))

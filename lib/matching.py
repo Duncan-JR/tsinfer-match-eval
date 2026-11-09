@@ -296,12 +296,15 @@ def _assemble_result(job_index, blocks, mutation_blocks, haplotype, worker, coll
     )
 
 
-def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=None):
+def match_stitched_haplotype(
+    job_index, haplotype, worker, minimum, collector=None, *, condition_gaps=True
+):
     """Match one complete canonical haplotype against a prepared reference.
 
     Filter exact components, then copy supported one-site gaps using
     :func:`lib.greedy.stitched_intervals`. Correct called bridge disagreements
-    with sample mutations. Condition residual HMM gaps on adjacent copied parents.
+    with sample mutations. Optionally condition residual HMM gaps on adjacent
+    copied parents; disabling this also removes flanking observation padding.
     """
     called = np.flatnonzero(haplotype >= 0)
     start, end = 0, len(haplotype)
@@ -327,9 +330,9 @@ def match_stitched_haplotype(job_index, haplotype, worker, minimum, collector=No
             if interval.ancestor is None:
                 initial_state = None
                 final_state = None
-                if interval.left_ancestor is not None:
+                if condition_gaps and interval.left_ancestor is not None:
                     initial_state = state.catalog.parents[interval.left_ancestor]
-                if interval.right_ancestor is not None:
+                if condition_gaps and interval.right_ancestor is not None:
                     final_state = state.catalog.parents[interval.right_ancestor]
                 region = _match_region(
                     haplotype,
@@ -400,6 +403,7 @@ def _worker_main(
     collect,
     diagnostics,
     collect_haplotype_timings,
+    condition_gaps,
 ):
     """Preparation barrier followed by matching, reusing the same processes."""
     worker = None
@@ -446,7 +450,12 @@ def _worker_main(
                     match_start = time.perf_counter()
                     cpu_start = time.thread_time()
                 result = match_stitched_haplotype(
-                    task.job_index, row, worker, minimum, collector
+                    task.job_index,
+                    row,
+                    worker,
+                    minimum,
+                    collector,
+                    condition_gaps=condition_gaps,
                 )
                 if collect_haplotype_timings:
                     match_end = time.perf_counter()
@@ -704,6 +713,7 @@ def match_stitched_samples(
     max_pending_haplotypes: int | None,
     helper_threads: dict,
     focal_choice: str = "left",
+    condition_gaps: bool = True,
     temp_dir: pathlib.Path | None = None,
     collector: performance.Collector | None = None,
     sample_reader_threads: int = 1,
@@ -767,6 +777,7 @@ def match_stitched_samples(
             "min_region_size_kb": min_region_size_kb,
             "min_focal_region_size": min_focal_region_size,
             "focal_choice": focal_choice,
+            "condition_gaps": condition_gaps,
         }
         tables.metadata = metadata
         if collector is not None:
@@ -856,6 +867,7 @@ def match_stitched_samples(
                             collector is not None,
                             diagnostics,
                             collect_haplotype_timings,
+                            condition_gaps,
                         ),
                     )
                     start_started = time.perf_counter()

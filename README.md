@@ -60,8 +60,10 @@ when changing inputs or HMM settings. Logs record the actual tsinfer revision.
    copying decisions fixed. Match residual gaps with the HMM, conditioning on
    available adjacent copied parents at the observations immediately outside each
    gap. Inference boundaries prevent padding across intervals. Retain only the
-   gap's path and mutations, then append completed results, squash adjacent
-   equal-parent/child edges once, and finalise and sort tables.
+   gap's path and mutations. Set `condition_gaps: false` to match residual gaps
+   without anchors or padding, keeping one-site-gap copying unchanged.
+   Then append completed results, squash adjacent equal-parent/child edges once,
+   and finalise and sort tables.
 
 Both matching runners append sample individual and population metadata after
 the reference rows, using the same IDs as tsinfer reference matching. Existing
@@ -98,6 +100,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `data_dir` | Ordinary output root. Use a separate directory for each biological configuration. |
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
+| `condition_gaps` | Default `true`; condition residual greedy HMM gaps on adjacent copied parents. `false` removes conditioning and flanking observation padding. One-site-gap copying is unchanged. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.recombination_rate` | Alternative to `hmm.recombination`: a nonnegative rate per bp per generation, or a HapMap file path. tsinfer converts genetic distances between inference sites to probabilities using Haldane's map function. Choose exactly one recombination setting. |
 | `hmm.mismatch` | Mismatch probability for remaining HMM calls, strictly between 0 and 1. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |

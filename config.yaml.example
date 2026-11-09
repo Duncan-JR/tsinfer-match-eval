@@ -2,6 +2,7 @@ config_name: example
 data_dir: data/match_eval
 progress_dir: .progress
 focal_choice: left
+condition_gaps: true
 hmm:
   recombination: 0.01
   # Or replace recombination with a rate per bp per generation or a HapMap path:

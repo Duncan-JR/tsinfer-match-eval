@@ -299,6 +299,7 @@ def trial(spec_path):
                 "af_cutoff": run["af_cutoff"],
                 "min_region_size_kb": run["min_region_size_kb"],
                 "focal_choice": config.get("focal_choice", "left"),
+                "condition_gaps": config.get("condition_gaps", True),
                 "workers": workers,
                 "helper_threads": config["helper_threads"],
                 "sample_prefetch_chunks": config["sample_prefetch_chunks"],
