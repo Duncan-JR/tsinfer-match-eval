@@ -70,6 +70,7 @@ class ReferenceInputs:
     match_positions: pathlib.Path
     mutation_site: pathlib.Path
     mutation_node: pathlib.Path
+    mutation_state: pathlib.Path
     boundaries: pathlib.Path
     num_nodes: int
     sequence_length: float
@@ -95,9 +96,16 @@ def share_reference(catalog, num_alleles, reference, directory):
 
     Owned construction objects and copied exports die before workers are spawned.
     Matching workers borrow only the two edge buffers and own their site state.
+    Encode biallelic mutations as zero for ancestral reversions and one otherwise.
     """
+    mutation_sites = reference.mutations_site
+    ancestral = reference.sites_ancestral_state[mutation_sites]
+    mutation_state = (reference.mutations_derived_state != ancestral).astype(np.int8)
     indexes = tsinfer.matching.MatcherIndexes(
-        reference, vestigial_root=False, num_alleles=num_alleles
+        reference,
+        vestigial_root=False,
+        num_alleles=num_alleles,
+        derived_state=mutation_state,
     )
     insertion, removal = indexes.export_edge_indexes()
     positions = reference.sites_position
@@ -118,6 +126,7 @@ def share_reference(catalog, num_alleles, reference, directory):
         "match_positions": match_positions,
         "mutation_site": reference.mutations_site,
         "mutation_node": reference.mutations_node,
+        "mutation_state": mutation_state,
         "boundaries": boundaries,
     }
     paths = {}

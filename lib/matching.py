@@ -173,6 +173,7 @@ def make_worker(inputs, catalog, parameters):
             "match_positions",
             "mutation_site",
             "mutation_node",
+            "mutation_state",
             "num_alleles",
             "boundaries",
         )
@@ -192,6 +193,7 @@ def make_worker(inputs, catalog, parameters):
         arrays["num_alleles"],
         inputs.num_nodes,
         inputs.sequence_length,
+        derived_state=arrays["mutation_state"],
     )
     hmm = tsinfer.matching.hmm_parameters(parameters, positions)
     matcher = tsinfer.matching.AncestorMatcher(

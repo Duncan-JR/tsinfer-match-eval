@@ -892,57 +892,193 @@ def run_suite(config, allocation, config_paths=None):
     if config_paths is not None:
         for index, path in enumerate(config_paths):
             shutil.copy2(path, folder / f"source_config_{index}.yaml")
-    settings = config["performance"]
-    rows = []
-    stage_rows = []
-    quality = []
-    for run in trial_runs(config):
+    runs = trial_runs(config)
+    results = {}
+    for run in runs:
         run_id = run["run_id"]
         trial_folder = folder / run_id
         trial_folder.mkdir()
         spec = trial_folder / "trial.json"
         spec.write_text(json.dumps({"config": config, "run": run}, indent=2) + "\n")
         logger.info("Starting %s", run_id)
-        result = _launch(spec, config)
-        row = {
-            **run,
-            "status": result["status"],
-            "error": result.get("error", ""),
-            "trial_peak_private_bytes": result["trial_peak_private_bytes"],
-            "trial_peak_pss_bytes": result["trial_peak_pss_bytes"],
-            "memory_longest_observation_gap_s": result[
-                "memory_longest_observation_gap_s"
-            ],
-            "memory_longest_process_observation_gap_s": result[
-                "memory_longest_process_observation_gap_s"
-            ],
-        }
-        if "window" in result:
-            row.update(
-                {key: result["window"][key] for key in ("wall_s", "user_s", "system_s")}
-            )
-            row.update(result["workload"])
-            row["actual_workers"] = result["actual_workers"]
-            row["window_peak_private_bytes"] = result["window_peak_private_bytes"]
-            row["window_peak_pss_bytes"] = result["window_peak_pss_bytes"]
-            stage_rows.extend(
-                {"run_id": run_id, **record} for record in result["stages"]
-            )
-        if "validation_window" in result:
-            row["validation_wall_s"] = result["validation_window"]["wall_s"]
-        if settings["quality_checks"] and "quality" in result:
-            quality.append({"run_id": run_id, **result["quality"]})
-        rows.append(row)
-        _write_csv(folder / "runs.csv", rows)
-        _write_csv(folder / "stages.csv", stage_rows, ["run_id", "stage", "scope"])
-        if settings["quality_checks"]:
-            (folder / "quality.json").write_text(json.dumps(quality, indent=2) + "\n")
-        logger.info("Finished %s: %s", run_id, result["status"])
-    if any(row["status"] != "ok" for row in [*rows, *quality]):
-        raise RuntimeError(
-            "Benchmark trials or quality checks failed; see runs.csv/quality.json"
+        results[run_id] = _launch(spec, config)
+        _write_suite_results(folder, config, runs, results)
+        logger.info("Finished %s: %s", run_id, results[run_id]["status"])
+    _complete_suite(folder, config, results)
+    return folder
+
+
+def _trial_row(run, result):
+    """Use the same metrics for fresh and resumed suite summaries."""
+    row = {
+        **run,
+        "status": result["status"],
+        "error": result.get("error", ""),
+    }
+    for name in (
+        "trial_peak_private_bytes",
+        "trial_peak_pss_bytes",
+        "memory_longest_observation_gap_s",
+        "memory_longest_process_observation_gap_s",
+    ):
+        row[name] = result[name]
+    if "window" in result:
+        row.update(
+            {key: result["window"][key] for key in ("wall_s", "user_s", "system_s")}
         )
-    (folder / "complete.json").write_text(json.dumps({"runs": len(rows)}) + "\n")
+        row.update(result["workload"])
+        row["actual_workers"] = result["actual_workers"]
+        row["window_peak_private_bytes"] = result["window_peak_private_bytes"]
+        row["window_peak_pss_bytes"] = result["window_peak_pss_bytes"]
+    if "validation_window" in result:
+        row["validation_wall_s"] = result["validation_window"]["wall_s"]
+    return row
+
+
+def _write_suite_results(folder, config, runs, results):
+    """Rebuild aggregates from trial records, retaining all original measurements."""
+    rows = []
+    stages = []
+    quality = []
+    for run in runs:
+        run_id = run["run_id"]
+        if run_id not in results:
+            continue
+        result = results[run_id]
+        rows.append(_trial_row(run, result))
+        stages.extend(
+            {"run_id": run_id, **record} for record in result.get("stages", [])
+        )
+        if config["performance"]["quality_checks"] and "quality" in result:
+            quality.append({"run_id": run_id, **result["quality"]})
+    _write_csv(folder / "runs.csv", rows)
+    _write_csv(folder / "stages.csv", stages, ["run_id", "stage", "scope"])
+    if config["performance"]["quality_checks"]:
+        (folder / "quality.json").write_text(json.dumps(quality, indent=2) + "\n")
+
+
+def _complete_suite(folder, config, results):
+    for result in results.values():
+        valid = result["status"] == "ok"
+        if config["performance"]["quality_checks"]:
+            valid = valid and result.get("quality", {}).get("status") == "ok"
+        if not valid:
+            raise RuntimeError(
+                "Benchmark trials or quality checks failed; see runs.csv/quality.json"
+            )
+    (folder / "complete.json").write_text(json.dumps({"runs": len(results)}) + "\n")
+
+
+def _saved_trial_result(folder):
+    """Recover launcher metrics even when Snakemake removed aggregate outputs."""
+    result = json.loads((folder / "result.json").read_text())
+    summary = json.loads((folder / "memory_summary.json").read_text())
+    result.update(summary)
+    trial_peak = 0
+    window_peak = 0
+    window = result.get("window")
+    with (folder / "memory_samples.csv").open(newline="") as source:
+        for sample in csv.DictReader(source):
+            private = int(sample["private_bytes"])
+            trial_peak = max(trial_peak, private)
+            timestamp = float(sample["timestamp"])
+            if window is not None:
+                if window["start_timestamp"] <= timestamp <= window["end_timestamp"]:
+                    window_peak = max(window_peak, private)
+    result["trial_peak_private_bytes"] = trial_peak
+    if window is not None:
+        result["window_peak_private_bytes"] = window_peak
+    return result
+
+
+def resume_suite(folder, allocation, backup_dir):
+    """Retry failed trials only, backing them up and recording recovery provenance.
+
+    Saved trial specifications are authoritative: preparation and successful
+    trial measurements are reused. Suite summaries can be rebuilt when Snakemake
+    removed them after failure. Each retry must pass the original quality checks.
+    """
+    folder = folder.resolve()
+    specs = [
+        json.loads(path.read_text()) for path in sorted(folder.glob("*/trial.json"))
+    ]
+    if len(specs) == 0:
+        raise ValueError("No saved trial specifications in experiment directory")
+    config = specs[0]["config"]
+    if output_directory(config).resolve() != folder:
+        raise ValueError("Experiment directory disagrees with saved configuration")
+    validate_config(config, allocation)
+    runs = trial_runs(config)
+    expected = {run["run_id"]: run for run in runs}
+    saved = {spec["run"]["run_id"]: spec["run"] for spec in specs}
+    if saved != expected or any(spec["config"] != config for spec in specs):
+        raise ValueError("Saved trial inventory/configuration disagrees with suite")
+    results = {}
+    retry_ids = []
+    for run in runs:
+        run_id = run["run_id"]
+        trial_folder = folder / run_id
+        result = _saved_trial_result(trial_folder)
+        results[run_id] = result
+        valid = result["status"] == "ok"
+        if config["performance"]["quality_checks"]:
+            valid = valid and result.get("quality", {}).get("status") == "ok"
+        if valid and not (trial_folder / "samples_raw.trees").is_file():
+            raise FileNotFoundError(f"Successful trial tree is missing: {trial_folder}")
+        if not valid:
+            retry_ids.append(run_id)
+    manifest = _manifest(config, allocation)
+    manifest_path = folder / "manifest.json"
+    original_manifest = None
+    if manifest_path.exists():
+        original_manifest = json.loads(manifest_path.read_text())
+        if original_manifest["datasets"] != manifest["datasets"]:
+            raise ValueError("Prepared inputs disagree with the original manifest")
+    backup_dir = backup_dir.resolve()
+    if backup_dir == folder or folder in backup_dir.parents:
+        raise ValueError("Backup directory must be outside the experiment directory")
+    backup_dir.mkdir(parents=True, exist_ok=False)
+    for name in (
+        "manifest.json",
+        "config.yaml",
+        "runs.csv",
+        "stages.csv",
+        "quality.json",
+        "complete.json",
+    ):
+        path = folder / name
+        if path.exists():
+            shutil.copy2(path, backup_dir / name)
+    (folder / "complete.json").unlink(missing_ok=True)
+    manifest["recovery"] = {
+        "reused_run_ids": [run_id for run_id in expected if run_id not in retry_ids],
+        "retried_run_ids": retry_ids,
+        "backup_directory": str(backup_dir),
+        "original_manifest_available": original_manifest is not None,
+        "version_scope": (
+            "Current recovery code; reused trials retain their original "
+            "measurements and logs."
+        ),
+    }
+    recovery_path = folder / f"recovery_manifest_{time.time_ns()}.json"
+    recovery_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    if original_manifest is None:
+        manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
+    (folder / "config.yaml").write_text(yaml.safe_dump(config, sort_keys=False))
+    if not (folder / "uv.lock").exists():
+        shutil.copy2("uv.lock", folder / "uv.lock")
+    for run_id in retry_ids:
+        trial_folder = folder / run_id
+        shutil.move(trial_folder, backup_dir / run_id)
+        trial_folder.mkdir()
+        spec = trial_folder / "trial.json"
+        shutil.copy2(backup_dir / run_id / "trial.json", spec)
+        logger.info("Retrying %s; original saved under %s", run_id, backup_dir)
+        results[run_id] = _launch(spec, config)
+        _write_suite_results(folder, config, runs, results)
+        logger.info("Finished %s: %s", run_id, results[run_id]["status"])
+    _write_suite_results(folder, config, runs, results)
+    _complete_suite(folder, config, results)
     return folder
 
 
@@ -1075,10 +1211,17 @@ def main():
     suite_parser.add_argument("--allocation", type=int, required=True)
     trial_parser = commands.add_parser("trial")
     trial_parser.add_argument("spec", type=pathlib.Path)
+    resume_parser = commands.add_parser("resume")
+    resume_parser.add_argument("folder", type=pathlib.Path)
+    resume_parser.add_argument("--allocation", type=int, required=True)
+    resume_parser.add_argument("--backup-dir", type=pathlib.Path, required=True)
     args = parser.parse_args()
     if args.command == "trial":
         return 0 if trial(args.spec) else 1
     logging.basicConfig(level=logging.INFO)
+    if args.command == "resume":
+        resume_suite(args.folder, args.allocation, args.backup_dir)
+        return 0
     config = yaml.safe_load(args.config.read_text())
     run_suite(config, args.allocation, [args.config])
     return 0

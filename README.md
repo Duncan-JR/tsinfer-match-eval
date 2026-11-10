@@ -334,6 +334,35 @@ workers and the loader stop before edge squashing and output finalisation. Both
 methods use identical inputs, biological settings, CPU reservations and requested
 products.
 
+Shared-reference matching must preserve encoded mutation states, including
+reversions to the ancestral allele. For the `fix_reference_ts` checkout at
+`9c8333d`, apply the bundled API fix and rebuild the editable dependency:
+
+```sh
+git -C ../tsinfer apply ../tsinfer-match-eval/patches/tsinfer_prepared_mutation_states.patch
+uv sync --reinstall-package tsinfer
+```
+
+To recover a failed suite, reuse successful trials and retry failed ones with
+their original saved settings:
+
+```sh
+uv run -m lib.benchmark resume data/performance/hpc_perf4 \
+    --allocation 196 --backup-dir data/performance/hpc_perf4_failed_trials
+```
+
+The backup directory must be new and outside the experiment. Recovery preserves
+failed trial files, records current code/input provenance, and rebuilds summary
+files and the completion marker only after quality checks pass. Successful
+trials keep their original trees and measurements. If Snakemake still marks the
+suite incomplete, clear metadata for its files before requesting diagnostics:
+
+```sh
+uv run snakemake --configfile data/performance/hpc_perf4/config.yaml --cleanup-metadata \
+    data/performance/hpc_perf4/{manifest.json,runs.csv,stages.csv,quality.json,complete.json}
+uv run snakemake diagnostics --configfile data/performance/hpc_perf4/config.yaml --cores 196
+```
+
 `resident_match` excludes input decoding and HMM/JIT setup. Greedy includes
 candidate discovery, exact extension, covering, gap matching and immediate
 assembly; final table sorting/writing is outside. Resident trials preload all
