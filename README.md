@@ -334,12 +334,12 @@ workers and the loader stop before edge squashing and output finalisation. Both
 methods use identical inputs, biological settings, CPU reservations and requested
 products.
 
-Shared-reference matching must preserve encoded mutation states, including
-reversions to the ancestral allele. For the `fix_reference_ts` checkout at
-`9c8333d`, apply the bundled API fix and rebuild the editable dependency:
+Shared-reference matching requires a tsinfer checkout whose
+`MatcherIndexes.from_prepared` accepts `derived_state`, including reversions to
+the ancestral allele. After syncing changes to tsinfer, rebuild the editable
+dependency:
 
 ```sh
-git -C ../tsinfer apply ../tsinfer-match-eval/patches/tsinfer_prepared_mutation_states.patch
 uv sync --reinstall-package tsinfer
 ```
 
