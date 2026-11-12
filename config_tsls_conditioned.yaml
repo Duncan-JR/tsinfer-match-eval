@@ -1,0 +1,64 @@
+config_name: tsls_conditioned
+data_dir: /Users/duncan/work/tsinfer-match-eval/data/tsls_inputs
+progress_dir: .progress/tsls_conditioned
+focal_choice: left
+hmm:
+  recombination: 0.01
+  mismatch: 1.0e-20
+datasets:
+- name: tgp_chr20_n100_1mbp
+  zarr_path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/tgp_chr20_n100_1mbp.zarr
+  af_cutoff: 0.03
+  min_region_size_kb: 0
+  ancestral_state:
+    field: variant_ancestral_allele
+  matching_cache_size: 64
+  population:
+    source: csv
+    path: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/inputs/tgp_chr20_n100_1mbp_populations.csv
+    zarr_id_field: sample_id
+    csv_id_field: sample_id
+    field: population
+ancestor_chunk_size: 5000
+inference_threads: 2
+matching_threads: 2
+sample_reader_threads: 1
+sample_prefetch_chunks: 1
+max_pending_haplotypes: null
+temp_dir: /Users/duncan/work/tsinfer-match-eval/data/greedy_smoke/temporary
+helper_threads:
+  blosc_threads: 1
+  zarr_async_concurrency: 1
+  zarr_threading_max_workers: 1
+  blas_threads: 1
+performance:
+  experiment_id: tsls_conditioned
+  datasets:
+  - tgp_chr20_n100_1mbp
+  modes:
+  - from_reference
+  - resident_match
+  methods:
+  - full_hmm
+  - greedy
+  worker_counts:
+  - 1
+  - 4
+  repeats: 1
+  seed: 20261020
+  rss_sample_interval_s: 0.05
+  trial_timeout_s: 300
+  collect_haplotype_timings: true
+  collect_stages: true
+  quality_checks: true
+  resident_max_matrix_mib: 512
+  resident_max_private_mib: 16384
+  quality_max_matrix_mib: 256
+  diagnostics_run:
+    mode: from_reference
+    workers: 4
+    repeat: 0
+regional_profile:
+  haplotypes: 200
+  overlap_probe_sites: 5
+condition_gaps: true

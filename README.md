@@ -341,7 +341,7 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `seed` | Randomises method/worker order within each repeat. |
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
-| `collect_haplotype_timings` | Default `false`; save greedy task service times independently of regional stage timers. Available for both matching methods. |
+| `collect_haplotype_timings` | Default `false`; save task service times independently of regional stage timers. Available for both matching methods. |
 | `collect_stages` | Enable aggregate preparation, coordinator, loading, native gap matching and assembly timings. `false` retains workload counts without stage timers. Record one staged run at every new scale, including one million haplotypes; use whole `from_reference` windows for method-level comparisons. |
 | `diagnostics_run` | Explicit `mode`, `workers` and zero-based `repeat` selecting completed trees for diagnostics; must belong to the suite. Diagnostic coverage is checked only when diagnostics is requested. |
 | `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
@@ -356,14 +356,10 @@ workers and the loader stop before edge squashing and output finalisation. Both
 methods use identical inputs, biological settings, CPU reservations and requested
 products.
 
-Shared-reference matching requires a tsinfer checkout whose
-`MatcherIndexes.from_prepared` accepts `derived_state`, including reversions to
-the ancestral allele. After syncing changes to tsinfer, rebuild the editable
-dependency:
-
-```sh
-uv sync --reinstall-package tsinfer
-```
+Matching uses the tsinfer and tsls revisions pinned in `pyproject.toml`. Both
+use the same per-site allele codebook, including reversions. When updating
+either sibling repository, commit its changes, update the source revision,
+then run `uv lock` and `uv sync`.
 
 To recover a failed suite, reuse successful trials and retry failed ones with
 their original saved settings:
