@@ -220,13 +220,13 @@ def configure_helpers(helpers):
 def cpu_allocation(workers, helpers, sample_reader_threads=1):
     """Reserve match/loader CPUs and the simultaneously active decoding helpers."""
     decoding = helpers["zarr_threading_max_workers"] + helpers["blosc_threads"]
-    packing = workers * decoding
     # Zarr's async limit controls outstanding I/O, not an extra CPU pool.
     # Its thread executor and codec helpers are shared by the outer readers.
     readers = sample_reader_threads if sample_reader_threads > 1 else 0
-    matching = workers + 1 + readers + decoding
-    numerical_threads = workers + 1 + readers
-    return max(packing, matching) + numerical_threads * (helpers["blas_threads"] - 1)
+    # The coordinator and loader can run while native worker calls release the GIL.
+    matching = workers + 2 + readers + decoding
+    numerical_threads = workers + 2 + readers
+    return matching + numerical_threads * (helpers["blas_threads"] - 1)
 
 
 def parameter_values(value):

@@ -695,7 +695,10 @@ def _coordinate(
             first_result = False
             chunk, result = payload
             with performance.measure(
-                collector, "assembly_output", parent_stage="coordinator_matching_drain"
+                collector,
+                "assembly_output",
+                "thread",
+                parent_stage="coordinator_matching_drain",
             ):
                 append_result(
                     tables, nodes[result.job_index], result, samples.allele_mapper

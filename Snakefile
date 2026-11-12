@@ -280,14 +280,19 @@ rule match_samples:
         trees=data_dir / "matches" / "{name}_{kind}_samples_raw.trees",
     log:
         progress_dir / "match_samples" / "{name}_{kind}_match_samples.log",
-    threads: config["matching_threads"]
+    params:
+        workers=config["matching_threads"],
+    threads: utils.cpu_allocation(config["matching_threads"], helpers, config.get("sample_reader_threads", 1))
     run:
         utils.setup_log(pathlib.Path(log[0]))
+        required = utils.cpu_allocation(params.workers, helpers, config.get("sample_reader_threads", 1))
+        if threads < required:
+            raise ValueError(f"Full HMM matching needs {required} CPUs including helpers; got {threads}")
         matching.match_samples(
             pathlib.Path(input.config),
             pathlib.Path(input.reference),
             pathlib.Path(output.trees),
-            threads,
+            params.workers,
             sample_reader_threads=config.get("sample_reader_threads", 1),
             sample_prefetch_chunks=config["sample_prefetch_chunks"],
             max_pending_haplotypes=config["max_pending_haplotypes"],

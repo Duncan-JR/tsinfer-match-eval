@@ -25,8 +25,8 @@ dependencies = [
 package = false
 
 [tool.uv.sources]
-tsinfer = { git = "file:///Users/duncan/work/tsinfer", rev = "f063dfd8dc6a32ce95f83a7236c9bb9ab8778db9" }
-tsls = { git = "file:///Users/duncan/work/tsls", rev = "4f411ed1d68308edc6caf0a35e17faff148b0ba4" }
+tsinfer = { git = "file:///Users/duncan/work/tsinfer", rev = "e2f8de7c950179215ece27e1d31c7b096308b4c8" }
+tsls = { git = "file:///Users/duncan/work/tsls", rev = "c560b405761ae09625e266d39c2356ccc4b54b69" }
 
 [dependency-groups]
 dev = [

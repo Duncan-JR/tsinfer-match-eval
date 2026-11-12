@@ -848,7 +848,10 @@ class TestStageTimings:
         drain = records["coordinator_matching_drain"].wall_s
         assert 0 <= slab <= result <= drain
         assert records["coordinator_result_wait"].wall_s <= drain
-        assert records["assembly_output"].wall_s <= drain
+        assembly = records["assembly_output"]
+        assert assembly.scope == "thread"
+        assert assembly.service_s <= drain
+        assert assembly.thread_cpu_s >= 0
         native = records["gap_native_find_path"]
         assert native.call_count == collectors[1].workload["gap_calls"]
         assert records["gap_path_conversion"].call_count == native.call_count

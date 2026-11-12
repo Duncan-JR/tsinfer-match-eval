@@ -1585,8 +1585,8 @@ wheels = [
 
 [[package]]
 name = "tsinfer"
-version = "0.5.2.dev363"
-source = { git = "file:///Users/duncan/work/tsinfer?rev=f063dfd8dc6a32ce95f83a7236c9bb9ab8778db9#f063dfd8dc6a32ce95f83a7236c9bb9ab8778db9" }
+version = "0.5.2.dev364"
+source = { git = "file:///Users/duncan/work/tsinfer?rev=e2f8de7c950179215ece27e1d31c7b096308b4c8#e2f8de7c950179215ece27e1d31c7b096308b4c8" }
 dependencies = [
     { name = "bio2zarr" },
     { name = "click" },
@@ -1638,9 +1638,9 @@ requires-dist = [
     { name = "pyyaml" },
     { name = "snakemake", specifier = ">=9" },
     { name = "tomli-w" },
-    { name = "tsinfer", git = "file:///Users/duncan/work/tsinfer?rev=f063dfd8dc6a32ce95f83a7236c9bb9ab8778db9" },
+    { name = "tsinfer", git = "file:///Users/duncan/work/tsinfer?rev=e2f8de7c950179215ece27e1d31c7b096308b4c8" },
     { name = "tskit", specifier = ">=1" },
-    { name = "tsls", git = "file:///Users/duncan/work/tsls?rev=4f411ed1d68308edc6caf0a35e17faff148b0ba4" },
+    { name = "tsls", git = "file:///Users/duncan/work/tsls?rev=c560b405761ae09625e266d39c2356ccc4b54b69" },
     { name = "tszip", specifier = ">=0.3.1" },
     { name = "zarr", specifier = ">=3" },
 ]
@@ -1683,8 +1683,8 @@ wheels = [
 
 [[package]]
 name = "tsls"
-version = "0.1.dev120"
-source = { git = "file:///Users/duncan/work/tsls?rev=4f411ed1d68308edc6caf0a35e17faff148b0ba4#4f411ed1d68308edc6caf0a35e17faff148b0ba4" }
+version = "0.1.dev121"
+source = { git = "file:///Users/duncan/work/tsls?rev=c560b405761ae09625e266d39c2356ccc4b54b69#c560b405761ae09625e266d39c2356ccc4b54b69" }
 dependencies = [
     { name = "numpy" },
     { name = "tskit" },
