@@ -43,7 +43,7 @@ class Measurement:
 class HaplotypeTiming:
     """Scalar service-time boundaries captured around one matching call."""
 
-    worker_pid: int
+    worker_index: int
     match_start_s: float
     match_end_s: float
     match_wall_s: float
@@ -209,7 +209,7 @@ def sample_memory():
     """Benchmark-only self sampling; macOS forbids inspecting another task's USS.
 
     The launcher aggregates atomic per-process snapshots. An inherited benchmark
-    environment enables this in its trial and matching workers only.
+    environment enables this once in each trial process.
     """
     folder = os.environ.get("MATCH_EVAL_MEMORY_DIR")
     if folder is None:

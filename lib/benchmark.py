@@ -1,7 +1,6 @@
 """Isolated, sequential runner measurements: ``uv run -m lib.benchmark suite``."""
 
 import argparse
-import concurrent.futures as cf
 import csv
 import dataclasses
 import hashlib
@@ -186,86 +185,6 @@ def _native_reader(cfg, reference, jobs, cache_size, workers):
     )
 
 
-def _resident_full_hmm(paths, dataset, output, workers, window):
-    """Native HMM baseline with decoded input and indexes outside its window."""
-    cfg = matching._sample_config(paths.config, paths.reference, output)
-    reference = tskit.load(paths.reference)
-    sample_jobs = _sample_jobs(cfg, reference)
-    jobs = sample_jobs.jobs
-    reader = _native_reader(
-        cfg, reference, jobs, dataset.get("matching_cache_size"), workers
-    )
-    try:
-        calls = {job.haplotype_index: reader.read_haplotype(job).copy() for job in jobs}
-        mapper = reader.allele_mapper
-        num_alleles = reader.get_num_alleles()
-    finally:
-        reader.shutdown()
-    indexes = tsinfer.matching.MatcherIndexes(
-        reference, vestigial_root=False, num_alleles=num_alleles
-    )
-    parameters = tsinfer.matching.hmm_parameters(
-        cfg.match.sources["samples"], reference.sites_position
-    )
-    # Native matchers are private to the executor threads; initialise all before timing.
-    matchers = [
-        tsinfer.matching.AncestorMatcher(
-            indexes,
-            parameters.recombination,
-            parameters.mismatch,
-            likelihood_threshold=parameters.likelihood_threshold,
-        )
-        for _ in range(workers)
-    ]
-    chunks = np.array_split(np.arange(len(jobs)), workers)
-
-    def match_chunk(indices, matcher):
-        results = []
-        scratch = np.empty(reference.num_sites, dtype=np.int8)
-        for index in indices:
-            haplotype = calls[int(index)]
-            called = np.flatnonzero(haplotype >= 0)
-            start, end = 0, len(haplotype)
-            if len(called) > 0:
-                start, end = int(called[0]), int(called[-1]) + 1
-            left, right, parents = matcher.find_path(haplotype, start, end, scratch)
-            mutation_sites = (
-                np.flatnonzero(
-                    (haplotype[start:end] >= 0)
-                    & (haplotype[start:end] != scratch[start:end])
-                )
-                + start
-            )
-            result = matching.HaplotypeResult(
-                int(index),
-                left.copy(),
-                right.copy(),
-                parents.copy(),
-                mutation_sites,
-                haplotype[mutation_sites].copy(),
-            )
-            results.append(result)
-        return results
-
-    with cf.ThreadPoolExecutor(max_workers=workers) as executor:
-        with window:
-            futures = [
-                executor.submit(match_chunk, indices, matcher)
-                for indices, matcher in zip(chunks, matchers, strict=True)
-            ]
-            results = [result for future in futures for result in future.result()]
-    populations = sample_jobs.populations if len(sample_jobs.populations) > 0 else None
-    prepared = tsinfer.matching.prepare_reference_ts(
-        reference, individuals=sample_jobs.individuals, populations=populations
-    )
-    tables = prepared.dump_tables()
-    del prepared
-    nodes = matching._create_sample_nodes(tables, jobs)
-    for result in results:
-        matching.append_result(tables, nodes[result.job_index], result, mapper)
-    tsinfer.matching.finalise_match_tables(tables).dump(output)
-
-
 @performance.sample_memory()
 def trial(spec_path):
     """Measure in a fresh process, recording dependency revisions in the suite."""
@@ -293,60 +212,42 @@ def trial(spec_path):
                 raise ValueError("Resident sample calls exceed resident_max_matrix_mib")
             del reference, cfg, jobs
         window = performance.Window()
-        if run["method"] == "greedy":
-            temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
-            kwargs = {
-                "af_cutoff": run["af_cutoff"],
-                "min_region_size_kb": run["min_region_size_kb"],
-                "focal_choice": config.get("focal_choice", "left"),
-                "condition_gaps": config.get("condition_gaps", True),
-                "workers": workers,
-                "helper_threads": config["helper_threads"],
-                "sample_prefetch_chunks": config["sample_prefetch_chunks"],
-                "sample_reader_threads": config.get("sample_reader_threads", 1),
-                "max_pending_haplotypes": config["max_pending_haplotypes"],
-                "temp_dir": None
-                if temp_parent is None
-                else pathlib.Path(temp_parent).expanduser(),
-                "collector": collector,
-                "collect_haplotype_timings": config["performance"].get(
-                    "collect_haplotype_timings", False
-                ),
-            }
-            if run["mode"] == "from_reference":
-                with window:
-                    workers = matching.match_stitched_samples(
-                        paths.config, paths.reference, output, **kwargs
-                    )
-            else:
-                workers = matching.match_stitched_samples(
-                    paths.config,
-                    paths.reference,
-                    output,
-                    resident=True,
-                    window=window,
-                    **kwargs,
-                )
-        elif run["mode"] == "from_reference":
+        temp_parent = os.environ.get("MATCH_EVAL_TEMP_DIR", config["temp_dir"])
+        kwargs = {
+            "af_cutoff": 0 if run["method"] == "full_hmm" else run["af_cutoff"],
+            "min_region_size_kb": 0
+            if run["method"] == "full_hmm"
+            else run["min_region_size_kb"],
+            "focal_choice": config.get("focal_choice", "left"),
+            "condition_gaps": config.get("condition_gaps", True),
+            "workers": workers,
+            "helper_threads": config["helper_threads"],
+            "sample_prefetch_chunks": config["sample_prefetch_chunks"],
+            "sample_reader_threads": config.get("sample_reader_threads", 1),
+            "max_pending_haplotypes": config["max_pending_haplotypes"],
+            "temp_dir": None
+            if temp_parent is None
+            else pathlib.Path(temp_parent).expanduser(),
+            "collector": collector,
+            "collect_haplotype_timings": config["performance"].get(
+                "collect_haplotype_timings", False
+            ),
+            "full_hmm": run["method"] == "full_hmm",
+        }
+        if run["mode"] == "from_reference":
             with window:
-                matching.match_samples(
-                    paths.config,
-                    paths.reference,
-                    output,
-                    workers,
-                    dataset.get("matching_cache_size"),
-                    read_workers=1,
+                workers = matching.match_stitched_samples(
+                    paths.config, paths.reference, output, **kwargs
                 )
         else:
-            _resident_full_hmm(paths, dataset, output, workers, window)
-        if run["method"] == "full_hmm":
-            matched_ts = tskit.load(output)
-            reference = tskit.load(paths.reference)
-            count = matched_ts.num_nodes - reference.num_nodes
-            if workers > count:
-                raise ValueError("Requested workers exceed the matched haplotype count")
-            collector.count(matched_haplotypes=count, full_calls=count)
-            del matched_ts, reference
+            workers = matching.match_stitched_samples(
+                paths.config,
+                paths.reference,
+                output,
+                resident=True,
+                window=window,
+                **kwargs,
+            )
         if workers != run["requested_workers"]:
             raise ValueError("Actual worker count differs from requested_workers")
         timing_path = None
@@ -639,7 +540,16 @@ def _manifest(config, allocation):
     source_paths = [pathlib.Path("Snakefile"), *pathlib.Path("lib").glob("*.py")]
     versions = {
         name: importlib.metadata.version(name)
-        for name in ("numpy", "numba", "tsinfer", "tskit", "zarr", "numcodecs", "psutil")
+        for name in (
+            "numpy",
+            "numba",
+            "tsinfer",
+            "tsls",
+            "tskit",
+            "zarr",
+            "numcodecs",
+            "psutil",
+        )
     }
     datasets = {}
     for dataset in config["datasets"]:
@@ -685,6 +595,7 @@ def _manifest(config, allocation):
             "reference_nodes": reference.num_nodes,
             "reference_edges": reference.num_edges,
             "sequence_intervals": reference.metadata["sequence_intervals"],
+            "numerical_settings": matching.numerical_settings(parameters),
         }
     return {
         "config": config,
@@ -692,7 +603,8 @@ def _manifest(config, allocation):
         "datasets": datasets,
         "repositories": {
             "pipeline": _revision(pathlib.Path.cwd()),
-            "tsinfer": _revision(pathlib.Path(tsinfer.__file__).resolve().parent.parent),
+            "tsinfer": utils.package_revision("tsinfer"),
+            "tsls": utils.package_revision("tsls"),
         },
         "packages": versions,
         "python": sys.version,

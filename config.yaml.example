@@ -9,6 +9,10 @@ hmm:
   # recombination_rate: 1.0e-8
   # recombination_rate: ~/work/dphil-analysis/data/HapMapII_GRCh38/genetic_map_Hg38_chr20.txt
   mismatch: 1.0e-20
+  # Optional numerical settings; null retains tsls defaults.
+  # likelihood_threshold: 1.0e-13
+  # prune_threshold: 1.0e-8
+  # relative_prune_threshold: 1.0e-9
 
 datasets:
   - name: out_of_africa_n300_1mbp

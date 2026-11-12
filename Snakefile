@@ -280,8 +280,6 @@ rule match_samples:
         trees=data_dir / "matches" / "{name}_{kind}_samples_raw.trees",
     log:
         progress_dir / "match_samples" / "{name}_{kind}_match_samples.log",
-    params:
-        cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
     threads: config["matching_threads"]
     run:
         utils.setup_log(pathlib.Path(log[0]))
@@ -290,7 +288,11 @@ rule match_samples:
             pathlib.Path(input.reference),
             pathlib.Path(output.trees),
             threads,
-            params.cache_size,
+            sample_reader_threads=config.get("sample_reader_threads", 1),
+            sample_prefetch_chunks=config["sample_prefetch_chunks"],
+            max_pending_haplotypes=config["max_pending_haplotypes"],
+            helper_threads=config["helper_threads"],
+            temp_dir=None if config["temp_dir"] is None else pathlib.Path(config["temp_dir"]).expanduser(),
         )
 
 

@@ -1,15 +1,13 @@
 """Native baseline and streamed, complete-haplotype greedy stitched matching."""
 
 import collections
+import concurrent.futures as cf
 import contextlib
 import dataclasses
 import json
 import logging
-import multiprocessing as mp
-import multiprocessing.connection
-import os
 import pathlib
-import statistics
+import queue
 import tempfile
 import threading
 import time
@@ -18,6 +16,7 @@ import traceback
 import numpy as np
 import tsinfer
 import tskit
+import tsls
 
 from . import greedy, haplotypes, performance, utils
 
@@ -79,24 +78,28 @@ def match_samples(
     ancestors_ts_path: pathlib.Path,
     output_path: pathlib.Path,
     threads: int,
-    cache_size: int | None = None,
-    read_workers: int | None = None,
-) -> None:
-    """Match samples against the unmodified reference from :func:`match_ancestors`.
-
-    Preserve source selection/order and append sample metadata after the
-    reference rows. Raw parent IDs remain available for comparisons through
-    node metadata.
-    """
-    sample_cfg = _sample_config(config_path, ancestors_ts_path, output_path)
-    ts = tsinfer.pipeline.match(
-        sample_cfg,
-        num_threads=threads,
-        cache_size=cache_size,
-        read_workers=read_workers,
+    *,
+    sample_reader_threads: int = 1,
+    sample_prefetch_chunks: int = 1,
+    max_pending_haplotypes: int | None = None,
+    helper_threads: dict | None = None,
+    temp_dir: pathlib.Path | None = None,
+) -> int:
+    """Stream full-HMM jobs through the shared-panel worker runner."""
+    return match_stitched_samples(
+        config_path,
+        ancestors_ts_path,
+        output_path,
+        af_cutoff=0,
+        min_region_size_kb=0,
+        workers=threads,
+        sample_prefetch_chunks=sample_prefetch_chunks,
+        max_pending_haplotypes=max_pending_haplotypes,
+        helper_threads=helper_threads,
+        sample_reader_threads=sample_reader_threads,
+        temp_dir=temp_dir,
+        full_hmm=True,
     )
-    ts.dump(output_path)
-    logger.info("Wrote raw samples to %s", output_path)
 
 
 @dataclasses.dataclass
@@ -149,75 +152,108 @@ class HaplotypeTask:
 
 
 @dataclasses.dataclass
-class Worker:
-    """One private HMM and reusable numeric scratch per matching process."""
+class MatchingModel:
+    """One immutable panel, codebook and set of rates shared by all workers."""
 
-    exact: greedy.ExactState
+    panel: tsls.TreeSequence
+    parameters: tsinfer.matching.HmmParameters
+    positions: np.ndarray
+    boundaries: np.ndarray
+
+
+def prepare_model(reference, allele_mapper, parameters):
+    """Keep complete reference IDs and use the sample codebook at every site."""
+    tsinfer.matching.check_ultimate_root(reference)
+    positions = reference.sites_position.astype(np.int32)
+    intervals = np.asarray(reference.metadata["sequence_intervals"])
+    boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
+    panel = tsls.TreeSequence(reference, alleles=allele_mapper.forward_map())
+    rates = tsinfer.matching.hmm_parameters(parameters, positions)
+    return MatchingModel(panel, rates, positions, boundaries)
+
+
+def numerical_settings(parameters):
+    """Resolve the native defaults for recorded benchmark/error context."""
+    threshold = parameters.likelihood_threshold
+    if threshold is None:
+        threshold = np.finfo(float).tiny
+    return {
+        "likelihood_threshold": threshold,
+        "prune_threshold": 0.0
+        if parameters.prune_threshold is None
+        else parameters.prune_threshold,
+        "relative_prune_threshold": 0.0
+        if parameters.relative_prune_threshold is None
+        else parameters.relative_prune_threshold,
+    }
+
+
+def make_hmm(model):
+    """Create private native state without changing numerical defaults."""
+    params = model.parameters
+    return tsls.Hmm(
+        model.panel,
+        params.recombination,
+        params.mismatch,
+        likelihood_threshold=params.likelihood_threshold,
+        prune_threshold=params.prune_threshold,
+        relative_prune_threshold=params.relative_prune_threshold,
+    )
+
+
+@dataclasses.dataclass
+class Worker:
+    """One HMM and reusable numeric scratch owned exclusively by one thread."""
+
+    exact: greedy.ExactState | None
     positions: np.ndarray
     sequence_length: float
     boundaries: np.ndarray
-    indexes: tsinfer.matching.MatcherIndexes
-    matcher: tsinfer.matching.AncestorMatcher
+    matcher: tsls.Hmm
     match_out: np.ndarray
-    reference_mappings: list[np.ndarray]
+    numerical_settings: dict
 
 
-def make_worker(inputs, catalog, parameters):
-    """Borrow mapped native edges and warm the actual read-only Numba signatures."""
-    arrays = {
-        name: np.load(getattr(inputs, name), mmap_mode="r", allow_pickle=False)
-        for name in (
-            "insertion",
-            "removal",
-            "positions",
-            "match_positions",
-            "mutation_site",
-            "mutation_node",
-            "mutation_state",
-            "num_alleles",
-            "boundaries",
-        )
-    }
-    positions = arrays["match_positions"]
-    boundaries = arrays["boundaries"]
-    if positions.dtype != np.int32 or positions.shape != arrays["positions"].shape:
-        raise ValueError("Invalid matching site positions")
-    if boundaries.dtype != np.int64 or boundaries.ndim != 1:
-        raise ValueError("Invalid inference boundaries")
-    indexes = tsinfer.matching.MatcherIndexes.from_prepared(
-        arrays["insertion"],
-        arrays["removal"],
-        arrays["positions"],
-        arrays["mutation_site"],
-        arrays["mutation_node"],
-        arrays["num_alleles"],
-        inputs.num_nodes,
-        inputs.sequence_length,
-        derived_state=arrays["mutation_state"],
-    )
-    hmm = tsinfer.matching.hmm_parameters(parameters, positions)
-    matcher = tsinfer.matching.AncestorMatcher(
-        indexes,
-        hmm.recombination,
-        hmm.mismatch,
-        likelihood_threshold=hmm.likelihood_threshold,
-        reuse_topology=True,
-    )
+def make_worker(model, catalog=None, packed=None):
+    """Warm the read-only Numba signatures before workers report readiness."""
+    exact = None if catalog is None else greedy.make_state(catalog, packed)
     worker = Worker(
-        greedy.make_state(catalog),
-        positions,
-        inputs.sequence_length,
-        boundaries,
-        indexes,
-        matcher,
-        np.empty(len(positions), dtype=np.int8),
-        list(arrays.values()),
+        exact,
+        model.positions,
+        model.panel.ts.sequence_length,
+        model.boundaries,
+        make_hmm(model),
+        np.empty(len(model.positions), dtype=np.int8),
+        numerical_settings(model.parameters),
     )
-    dummy = np.full(len(positions), -1, dtype=np.int8)
-    dummy.flags.writeable = False
-    order = greedy.candidates(dummy, worker.exact, 0, len(dummy))
-    greedy.cover(worker.exact, order, 1)
+    if exact is not None:
+        dummy = np.full(len(model.positions), -1, dtype=np.int8)
+        dummy.flags.writeable = False
+        order = greedy.candidates(dummy, exact, 0, len(dummy))
+        greedy.cover(exact, order, 1)
     return worker
+
+
+def match_full_haplotype(job_index, haplotype, worker, collector=None):
+    """Run the full window using the worker's reusable HMM and owned results."""
+    called = np.flatnonzero(haplotype >= 0)
+    start, end = 0, len(haplotype)
+    if len(called) > 0:
+        start, end = int(called[0]), int(called[-1]) + 1
+    region = _match_region(haplotype, worker, start, end, collector)
+    result = _assemble_result(
+        job_index, [region.runs], [region.mutation_site], haplotype, worker, collector
+    )
+    if collector is not None:
+        collector.count(
+            matched_haplotypes=1,
+            full_calls=1,
+            domain_sites=end - start,
+            focal_sites=0,
+            gap_sites=end - start,
+            gap_calls=1,
+        )
+    return result
 
 
 def _match_region(
@@ -240,11 +276,7 @@ def _match_region(
     with performance.measure(
         collector, "gap_native_find_path", "thread", parent_stage="gap_matching_assembly"
     ):
-        if initial_state is None and final_state is None:
-            left, right, parents = worker.matcher.find_path(
-                haplotype, match_start, match_end, worker.match_out
-            )
-        else:
+        try:
             left, right, parents = worker.matcher.find_path(
                 haplotype,
                 match_start,
@@ -252,7 +284,17 @@ def _match_region(
                 worker.match_out,
                 initial_state=initial_state,
                 final_state=final_state,
+                preserve_outside=True,
             )
+        except tsls.MatchImpossible as error:
+            raise tsls.MatchImpossible(
+                f"window=[{match_start}, {match_end}), "
+                f"initial_state={initial_state}, final_state={final_state}, "
+                f"parameters={worker.numerical_settings}: {error}"
+            ) from error
+        left, right, parents = tsinfer.matching.copy_node1_for_node0(
+            left, right, parents
+        )
     with performance.measure(
         collector, "gap_path_conversion", "thread", parent_stage="gap_matching_assembly"
     ):
@@ -392,29 +434,26 @@ def match_stitched_haplotype(
     return result
 
 
-@performance.sample_memory()
 def _worker_main(
     work,
     events,
     start_matching,
+    stopping,
+    worker_index,
     panel_path,
-    inputs,
-    parameters,
+    model,
+    catalog,
+    packed,
     minimum,
-    helpers,
     collect,
     diagnostics,
     collect_haplotype_timings,
     condition_gaps,
+    full_hmm,
 ):
-    """Preparation barrier followed by matching, reusing the same processes."""
-    worker = None
-    catalog = None
+    """Persistent packing and matching loop with a readiness barrier."""
     try:
-        utils.configure_helpers(helpers)
-        worker_pid = os.getpid()
-        catalog = inputs.open_catalog()
-        while True:
+        while not stopping.is_set():
             chunk = work.get()
             if chunk is None:
                 break
@@ -428,6 +467,8 @@ def _worker_main(
                 count = haplotypes.pack_reference_chunk(panel_path, catalog, chunk)
             collector.count(ancestor_blocks_read=count)
             events.put(("packed", collector))
+        if stopping.is_set():
+            return
         collector = performance.Collector(stages=diagnostics)
         with performance.measure(
             collector,
@@ -435,10 +476,10 @@ def _worker_main(
             "thread",
             parent_stage="coordinator_worker_readiness",
         ):
-            worker = make_worker(inputs, catalog, parameters)
+            worker = make_worker(model, catalog, packed)
         events.put(("worker_ready", collector))
         start_matching.wait()
-        while True:
+        while not stopping.is_set():
             task = work.get()
             if task is None:
                 break
@@ -451,62 +492,42 @@ def _worker_main(
                 if collect_haplotype_timings:
                     match_start = time.perf_counter()
                     cpu_start = time.thread_time()
-                result = match_stitched_haplotype(
-                    task.job_index,
-                    row,
-                    worker,
-                    minimum,
-                    collector,
-                    condition_gaps=condition_gaps,
-                )
+                if full_hmm:
+                    result = match_full_haplotype(task.job_index, row, worker, collector)
+                else:
+                    result = match_stitched_haplotype(
+                        task.job_index,
+                        row,
+                        worker,
+                        minimum,
+                        collector,
+                        condition_gaps=condition_gaps,
+                    )
                 if collect_haplotype_timings:
                     match_end = time.perf_counter()
-                    thread_cpu = time.thread_time() - cpu_start
                     counts = collector.workload
                     result.timing = performance.HaplotypeTiming(
-                        worker_pid,
+                        worker_index,
                         match_start,
                         match_end,
                         match_end - match_start,
-                        thread_cpu,
+                        time.thread_time() - cpu_start,
                         counts["domain_sites"],
                         counts["focal_sites"],
                         counts["gap_sites"],
                         counts["gap_calls"],
                     )
+                if collector is not None:
+                    collector.diagnostics["worker_index"] = worker_index
+                    collector.diagnostics["traceback_allocator_bytes"] = (
+                        worker.matcher.total_memory
+                    )
                 del row
             finally:
                 haplotypes.close_mapping(calls)
-            # Every numeric output owns its data; the sample map is already closed.
             events.put(("result", (task.chunk, result)))
     except Exception:
         events.put(("error", traceback.format_exc()))
-    finally:
-        if worker is not None:
-            haplotypes.close_mapping(worker.exact.packed)
-            worker.matcher = None
-            worker.indexes = None
-            worker.positions = None
-            worker.boundaries = None
-            for array in worker.reference_mappings:
-                haplotypes.close_mapping(array)
-            del worker
-        if catalog is not None:
-            for field in dataclasses.fields(catalog):
-                haplotypes.close_mapping(getattr(catalog, field.name))
-
-
-def _watch_workers(processes, events, stopping):
-    """Turn even a native crash into an event, without polling the work queues."""
-    waiting = {process.sentinel: process for process in processes}
-    while len(waiting) > 0:
-        ready = multiprocessing.connection.wait(list(waiting))
-        for sentinel in ready:
-            process = waiting.pop(sentinel)
-            if not stopping.is_set():
-                events.put(
-                    ("error", f"Matching worker {process.pid} exited unexpectedly")
-                )
 
 
 def _event(events):
@@ -691,6 +712,15 @@ def _coordinate(
                     }
                 )
             if collector is not None and result.measurements is not None:
+                details = result.measurements.diagnostics
+                worker_index = details["worker_index"]
+                worker_details = collector.diagnostics.setdefault(
+                    "traceback_allocator_bytes_by_worker", {}
+                )
+                previous = worker_details.get(worker_index, 0)
+                worker_details[worker_index] = max(
+                    previous, details["traceback_allocator_bytes"]
+                )
                 collector.merge(result.measurements)
             pending -= 1
             completed += 1
@@ -713,7 +743,7 @@ def match_stitched_samples(
     workers: int,
     sample_prefetch_chunks: int,
     max_pending_haplotypes: int | None,
-    helper_threads: dict,
+    helper_threads: dict | None,
     focal_choice: str = "left",
     condition_gaps: bool = True,
     temp_dir: pathlib.Path | None = None,
@@ -722,13 +752,14 @@ def match_stitched_samples(
     collect_haplotype_timings: bool = False,
     resident: bool = False,
     window: performance.Window | None = None,
+    full_hmm: bool = False,
 ) -> int:
-    """Pack once, stream slabs and append completed full-haplotype jobs immediately.
+    """Share one immutable tsls panel and stream bounded whole-haplotype jobs.
 
-    The entry point receives validated configuration. One spawn pool handles
-    packing and matching; a loader owns bounded sample Zarr reader threads. Outstanding
+    One persistent thread pool handles packing and matching; a loader owns
+    bounded sample Zarr reader threads. Outstanding
     jobs and live decoded slabs have separate bounds. Temporary inputs are
-    removed only after loader and children stop. Returns the actual worker count.
+    removed only after the loader and workers stop. Returns the actual worker count.
 
     Diagnostic resident runs preload all slabs and initialise workers before
     ``window``; the benchmark limits their total size. Normal end-to-end timing
@@ -747,7 +778,8 @@ def match_stitched_samples(
     panel_path = native.ancestors[0].path
     del native
     cfg = _sample_config(config_path, ancestors_ts_path, output_path)
-    utils.configure_helpers(helper_threads)
+    if helper_threads is not None:
+        utils.configure_helpers(helper_threads)
     with performance.measure(collector, "input_setup"):
         reference = tskit.load(ancestors_ts_path)
         positions = reference.sites_position.astype(np.int32)
@@ -788,16 +820,17 @@ def match_stitched_samples(
         del positions, individuals, populations
     if workers > len(jobs):
         raise ValueError(f"Requested {workers} workers for only {len(jobs)} haplotypes")
-    ctx = mp.get_context("spawn")
-    work = ctx.Queue(maxsize=max_pending_haplotypes)
-    events = ctx.Queue()
-    start_matching = ctx.Event()
+    work = queue.Queue(maxsize=max_pending_haplotypes)
+    events = queue.Queue()
+    start_matching = threading.Event()
     stopping = threading.Event()
     slots = threading.Semaphore(sample_prefetch_chunks)
-    processes = []
+    futures = []
+    executor = None
+    packed = None
+    model = None
+    catalog = None
     loader = None
-    watcher = None
-    matched = False
     diagnostics = collector is not None and collector.stages
     if temp_dir is not None:
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -806,40 +839,37 @@ def match_stitched_samples(
         directory = pathlib.Path(temporary)
         try:
             with performance.measure(collector, "reference_catalog"):
-                catalog = haplotypes.prepare_reference(
-                    panel_path,
-                    samples,
-                    reference,
-                    af_cutoff,
-                    focal_choice,
-                    directory,
+                model = prepare_model(
+                    reference, samples.allele_mapper, cfg.match.sources["samples"]
                 )
-                num_alleles = samples.allele_mapper.num_alleles_array()
-                inputs = haplotypes.share_reference(
-                    catalog, num_alleles, reference, directory
-                )
+                catalog = None
+                chunks = []
+                if not full_hmm:
+                    catalog = haplotypes.prepare_reference(
+                        panel_path,
+                        samples,
+                        reference,
+                        af_cutoff,
+                        focal_choice,
+                        directory,
+                    )
+                    chunks = haplotypes.reference_chunks(panel_path, catalog)
+                    packed = catalog.packed.open()
             if collector is not None:
-                slab_sizes = [
-                    len(chunk.job_indices) * reference.num_sites
-                    for chunk in samples.chunks
-                ]
-                slab_sizes.sort(reverse=True)
+                slab_sizes = sorted(
+                    [
+                        len(chunk.job_indices) * reference.num_sites
+                        for chunk in samples.chunks
+                    ],
+                    reverse=True,
+                )
                 live_count = len(slab_sizes) if resident else sample_prefetch_chunks
-                mapped_bound = (
-                    catalog.packed.shape[0]
-                    + inputs.mapped_bytes
-                    + sum(slab_sizes[:live_count])
-                )
+                packed_bytes = 0 if catalog is None else catalog.packed.shape[0]
                 collector.count(
-                    mapped_input_bound_bytes=mapped_bound,
-                    shared_reference_bytes=inputs.mapped_bytes,
-                    shared_native_edge_bytes=inputs.edge_bytes,
-                    avoided_worker_edge_bytes=workers * inputs.edge_bytes,
-                    native_index_constructions=1,
-                    packed_calls=catalog.packed.shape[0],
-                    eligible_ancestors=len(catalog.seeds),
+                    mapped_input_bound_bytes=packed_bytes + sum(slab_sizes[:live_count]),
+                    packed_calls=packed_bytes,
+                    eligible_ancestors=0 if catalog is None else len(catalog.seeds),
                 )
-            if collector is not None:
                 collector.diagnostics.update(
                     sample_chunk_shape=samples.chunk_shape,
                     haplotypes_per_slab=[
@@ -849,75 +879,51 @@ def match_stitched_samples(
                 )
             del reference
             with performance.measure(
-                collector, "coordinator_process_startup", "coordinator"
+                collector, "coordinator_thread_startup", "coordinator"
             ):
-                launches = []
-                starts = []
-                for _ in range(workers):
-                    launch_started = time.perf_counter()
-                    process = ctx.Process(
-                        target=_worker_main,
-                        args=(
+                executor = cf.ThreadPoolExecutor(
+                    max_workers=workers, thread_name_prefix="matching"
+                )
+                for worker_index in range(workers):
+                    futures.append(
+                        executor.submit(
+                            _worker_main,
                             work,
                             events,
                             start_matching,
+                            stopping,
+                            worker_index,
                             panel_path,
-                            inputs,
-                            cfg.match.sources["samples"],
+                            model,
+                            catalog,
+                            packed,
                             min_focal_region_size,
-                            helper_threads,
                             collector is not None,
                             diagnostics,
                             collect_haplotype_timings,
                             condition_gaps,
-                        ),
+                            full_hmm,
+                        )
                     )
-                    start_started = time.perf_counter()
-                    process.start()
-                    launched = time.perf_counter()
-                    if diagnostics:
-                        launches.append(launched - launch_started)
-                        starts.append(launched - start_started)
-                    processes.append(process)
-                if diagnostics:
-                    for name, durations in (
-                        ("launch", launches),
-                        ("process_start", starts),
-                    ):
-                        collector.diagnostics[name] = {
-                            "total_s": sum(durations),
-                            "median_s": statistics.median(durations),
-                            "max_s": max(durations),
-                            "worker_s": durations,
-                        }
-                del cfg
-                watcher = threading.Thread(
-                    target=_watch_workers, args=(processes, events, stopping)
-                )
-                watcher.start()
             with performance.measure(
                 collector,
                 "coordinator_packing_completion",
                 "coordinator",
                 inclusive=True,
             ):
-                _pack_reference(
-                    work,
-                    events,
-                    haplotypes.reference_chunks(panel_path, catalog),
-                    max_pending_haplotypes,
-                    collector,
-                )
+                _pack_reference(work, events, chunks, max_pending_haplotypes, collector)
             with performance.measure(
-                collector, "coordinator_worker_readiness", "coordinator", inclusive=True
+                collector,
+                "coordinator_worker_readiness",
+                "coordinator",
+                inclusive=True,
             ):
-                for _ in processes:
+                for _ in futures:
                     work.put(None)
-                for _ in processes:
+                for _ in futures:
                     _, measurements = _event(events)
                     if collector is not None:
                         collector.merge(measurements)
-            del catalog
             resident_slabs = None
             if resident:
                 with performance.measure(
@@ -970,7 +976,6 @@ def match_stitched_samples(
                         resident_slabs,
                         admitted,
                     )
-            matched = True
         finally:
             with performance.measure(collector, "coordinator_shutdown", "coordinator"):
                 stopping.set()
@@ -978,27 +983,24 @@ def match_stitched_samples(
                     slots.release()
                 if loader is not None:
                     loader.join()
-                if matched:
-                    for _ in processes:
-                        work.put(None)
-                else:
-                    for process in processes:
-                        process.terminate()
-                for process in processes:
-                    process.join()
-                if watcher is not None:
-                    watcher.join()
-                for channel in (work, events):
-                    if not matched:
-                        channel.cancel_join_thread()
-                    channel.close()
-                    if matched:
-                        channel.join_thread()
+                start_matching.set()
+                while True:
+                    try:
+                        work.get_nowait()
+                    except queue.Empty:
+                        break
+                for _ in futures:
+                    work.put(None)
+                if executor is not None:
+                    executor.shutdown(wait=True)
+                for future in futures:
+                    future.result()
+                if packed is not None:
+                    haplotypes.close_mapping(packed)
+                del model, catalog, cfg
         with performance.measure(collector, "finalise_output"):
             tables.edges.squash()
             ts = tsinfer.matching.finalise_match_tables(tables)
             ts.dump(output_path)
-    logger.info(
-        "Wrote greedy stitched samples to %s using %d workers", output_path, workers
-    )
+    logger.info("Wrote samples to %s using %d matching threads", output_path, workers)
     return workers

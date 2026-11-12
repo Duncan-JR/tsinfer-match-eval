@@ -1,11 +1,14 @@
 """Small helpers for the sample VCZ and native tsinfer configuration."""
 
+import importlib.metadata
+import json
 import logging
 import os
 import pathlib
 import re
 import shutil
 import subprocess
+import urllib.parse
 
 import numcodecs
 import numpy as np
@@ -20,11 +23,25 @@ def setup_log(path: pathlib.Path) -> None:
     """Send this Snakemake job's Python and tsinfer messages to its rule log."""
     path.parent.mkdir(parents=True, exist_ok=True)
     logging.basicConfig(filename=path, level=logging.INFO, force=True)
-    checkout = pathlib.Path(tsinfer.__file__).resolve().parent.parent
+    for name in ["tsinfer", "tsls"]:
+        logger.info(
+            "%s %s: %s", name, importlib.metadata.version(name), package_revision(name)
+        )
+
+
+def package_revision(name):
+    """Identify the installed source, including wheels built from pinned Git."""
+    distribution = importlib.metadata.distribution(name)
+    source = json.loads(distribution.read_text("direct_url.json"))
+    if "vcs_info" in source:
+        return {"url": source["url"], "commit": source["vcs_info"]["commit_id"]}
+    checkout = pathlib.Path(
+        urllib.parse.unquote(urllib.parse.urlparse(source["url"]).path)
+    )
     commit = subprocess.check_output(
         ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
     ).strip()
-    logger.info("tsinfer %s at %s, commit %s", tsinfer.__version__, checkout, commit)
+    return {"url": source["url"], "commit": commit}
 
 
 def annotate_derived_counts(
@@ -182,7 +199,7 @@ def read_recombination_map(path):
 
 
 def configure_helpers(helpers):
-    """Apply numerical/codec limits before spawning and inside each child."""
+    """Apply numerical and codec limits before starting matching threads."""
     for name in (
         "OPENBLAS_NUM_THREADS",
         "MKL_NUM_THREADS",

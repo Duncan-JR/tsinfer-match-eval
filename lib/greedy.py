@@ -29,9 +29,11 @@ class ExactState:
     run_ids: np.ndarray
 
 
-def make_state(catalog):
-    """Open the shared packed reference and allocate process-local scratch."""
+def make_state(catalog, packed=None):
+    """Allocate private scratch around immutable catalog and packed calls."""
     catalog.make_readonly()
+    if packed is None:
+        packed = catalog.packed.open()
     capacity = len(catalog.seeds)
     support_order = np.argsort(catalog.starts, kind="stable")
     support_starts = catalog.starts[support_order]
@@ -41,7 +43,7 @@ def make_state(catalog):
     scratch = [np.empty(capacity, dtype=np.int64) for _ in range(6)]
     return ExactState(
         catalog,
-        catalog.packed.open(),
+        packed,
         support_order,
         support_starts,
         prefix_best,

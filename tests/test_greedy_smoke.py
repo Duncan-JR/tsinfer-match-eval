@@ -433,6 +433,27 @@ class TestReferencePacking:
 
 
 class TestRecombinationSettings:
+    def test_numerical_settings_pass_through(self, tiny, tmp_path):
+        reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
+        cfg = matching._sample_config(tiny.config, tiny.reference, tmp_path / "unused")
+        source = dataclasses.replace(
+            cfg.match.sources["samples"],
+            likelihood_threshold=1e-12,
+            prune_threshold=1e-8,
+            relative_prune_threshold=1e-9,
+        )
+        model = matching.prepare_model(reference, samples.allele_mapper, source)
+        assert matching.numerical_settings(model.parameters) == {
+            "likelihood_threshold": 1e-12,
+            "prune_threshold": 1e-8,
+            "relative_prune_threshold": 1e-9,
+        }
+        worker = matching.make_worker(model)
+        h = np.zeros(reference.num_sites, dtype=np.int8)
+        result = matching._match_region(h, worker, 1, 11, initial_state=2, final_state=3)
+        assert result.runs.left[0] == 1
+        assert result.runs.right[-1] == 11
+
     @pytest.mark.parametrize("rate", [0, 1e-8])
     def test_rate(self, smoke_config, rate):
         smoke_config["hmm"] = {
@@ -510,12 +531,11 @@ class TestMatchingLifetime:
         finalised = []
 
         def finalise(tables):
-            assert len(lifetime_records["processes"]) == workers
+            assert len(lifetime_records["matching_threads"]) == workers
             assert all(
-                p.exitcode == 0 and not p.is_alive()
-                for p in lifetime_records["processes"]
+                not thread.is_alive() for thread in lifetime_records["matching_threads"]
             )
-            assert len(lifetime_records["threads"]) == 2
+            assert len(lifetime_records["threads"]) == 1
             assert all(not thread.is_alive() for thread in lifetime_records["threads"])
             assert len(lifetime_records["references"]) == 1
             assert all(ref() is None for ref in lifetime_records["references"])
@@ -539,7 +559,7 @@ class TestMatchingLifetime:
         assert finalised == [True]
         assert not list(tiny.root.glob("greedy_*"))
 
-    @pytest.mark.parametrize("failure", ["seed", "finalise"])
+    @pytest.mark.parametrize("failure", ["seed", "finalise", "loader", "worker"])
     def test_failure_cleans_workers_and_slabs(
         self, tiny, tiny_config, lifetime_records, monkeypatch, failure
     ):
@@ -547,10 +567,22 @@ class TestMatchingLifetime:
             panel = zarr.open_group(tiny.panel, mode="a", use_consolidated=False)
             panel["call_genotype"][1, 0, 0] = 0
             message = "not called and derived"
+        elif failure in ["loader", "worker"]:
+
+            def fail(*args):
+                raise RuntimeError(f"{failure} failure")
+
+            target = "load_sample_chunk" if failure == "loader" else "make_worker"
+            module = haplotypes if failure == "loader" else matching
+            monkeypatch.setattr(module, target, fail)
+            message = f"{failure} failure"
         else:
 
             def fail(tables):
-                assert all(not p.is_alive() for p in lifetime_records["processes"])
+                assert all(
+                    not thread.is_alive()
+                    for thread in lifetime_records["matching_threads"]
+                )
                 raise RuntimeError("finaliser failure")
 
             monkeypatch.setattr(tsinfer.matching, "finalise_match_tables", fail)
@@ -568,7 +600,9 @@ class TestMatchingLifetime:
                 helper_threads=tiny_config["helper_threads"],
                 temp_dir=tiny.root,
             )
-        assert all(not p.is_alive() for p in lifetime_records["processes"])
+        assert all(
+            not thread.is_alive() for thread in lifetime_records["matching_threads"]
+        )
         assert all(not thread.is_alive() for thread in lifetime_records["threads"])
         assert not list(tiny.root.glob("greedy_*"))
 
@@ -579,11 +613,15 @@ class TestMatchingLifetime:
 
         @contextlib.contextmanager
         def window():
-            assert all(p.is_alive() for p in lifetime_records["processes"])
+            assert all(
+                thread.is_alive() for thread in lifetime_records["matching_threads"]
+            )
             assert list(tiny.root.glob("greedy_*/samples_*.bin"))
             boundaries.append("start")
             yield
-            assert all(p.is_alive() for p in lifetime_records["processes"])
+            assert all(
+                thread.is_alive() for thread in lifetime_records["matching_threads"]
+            )
             assert not list(tiny.root.glob("greedy_*/samples_*.bin"))
             boundaries.append("end")
 
@@ -602,7 +640,9 @@ class TestMatchingLifetime:
             window=window(),
         )
         assert boundaries == ["start", "end"]
-        assert all(not p.is_alive() for p in lifetime_records["processes"])
+        assert all(
+            not thread.is_alive() for thread in lifetime_records["matching_threads"]
+        )
         assert all(not thread.is_alive() for thread in lifetime_records["threads"])
         assert not list(tiny.root.glob("greedy_*"))
 
@@ -616,13 +656,13 @@ class TestConditionedGaps:
         )
         for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
             haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
-        inputs = haplotypes.share_reference(
-            catalog, samples.allele_mapper.num_alleles_array(), reference, tmp_path
-        )
         cfg = matching._sample_config(
             tiny.config, tiny.reference, tmp_path / "unused.trees"
         )
-        worker = matching.make_worker(inputs, catalog, cfg.match.sources["samples"])
+        model = matching.prepare_model(
+            reference, samples.allele_mapper, cfg.match.sources["samples"]
+        )
+        worker = matching.make_worker(model, catalog)
         yield worker
         haplotypes.close_mapping(worker.exact.packed)
 
@@ -684,6 +724,19 @@ class TestConditionedGaps:
                 (6, 9, {"initial_state": None, "final_state": parents[2]}),
                 (8, 12, {"initial_state": parents[2], "final_state": parents[2]}),
             ]
+        expected = [
+            (
+                start,
+                end,
+                {
+                    "initial_state": None,
+                    "final_state": None,
+                    **pins,
+                    "preserve_outside": True,
+                },
+            )
+            for start, end, pins in expected
+        ]
         assert calls == expected
         assert np.all(result.left < result.right)
         assert len(result.parent) == len(result.left)
@@ -709,7 +762,10 @@ class TestConditionedGaps:
             assert any(end - start > 3 and kwargs for start, end, kwargs in calls)
         else:
             assert len(calls) > 0
-            assert all(kwargs == {} for _, _, kwargs in calls)
+            assert all(
+                kwargs["initial_state"] is None and kwargs["final_state"] is None
+                for _, _, kwargs in calls
+            )
         tables = tskit.load(tiny.reference).dump_tables()
         child = tables.nodes.add_row(flags=tskit.NODE_IS_SAMPLE, time=0)
         _, _, samples = smoke_helpers.prepared(tiny, tiny.root)
@@ -773,7 +829,7 @@ class TestStageTimings:
         assert collectors[0].records == {}
         records = {record.stage: record for record in collectors[1].records.values()}
         phases = [
-            "coordinator_process_startup",
+            "coordinator_thread_startup",
             "coordinator_packing_completion",
             "coordinator_worker_readiness",
             "coordinator_matching_drain",
@@ -833,10 +889,10 @@ class TestStageTimings:
         cfg = matching._sample_config(
             tiny.config, tiny.reference, tiny.root / "unused.trees"
         )
-        inputs = haplotypes.share_reference(
-            catalog, samples.allele_mapper.num_alleles_array(), reference, tmp_path
+        model = matching.prepare_model(
+            reference, samples.allele_mapper, cfg.match.sources["samples"]
         )
-        worker = matching.make_worker(inputs, catalog, cfg.match.sources["samples"])
+        worker = matching.make_worker(model, catalog)
         native = smoke_helpers.CountingMatcher(worker.matcher)
         worker.matcher = native
         calls = tsinfer.vcz.open_store(tiny.panel)["call_genotype"][:]

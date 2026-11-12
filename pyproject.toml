@@ -13,6 +13,7 @@ dependencies = [
     "snakemake>=9",
     "tomli-w",
     "tsinfer",
+    "tsls",
     "tskit>=1",
     "zarr>=3",
     "numba",
@@ -24,7 +25,8 @@ dependencies = [
 package = false
 
 [tool.uv.sources]
-tsinfer = { path = "../tsinfer", editable = true }
+tsinfer = { git = "file:///Users/duncan/work/tsinfer", rev = "f063dfd8dc6a32ce95f83a7236c9bb9ab8778db9" }
+tsls = { git = "file:///Users/duncan/work/tsls", rev = "4f411ed1d68308edc6caf0a35e17faff148b0ba4" }
 
 [dependency-groups]
 dev = [

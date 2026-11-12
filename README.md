@@ -7,9 +7,10 @@ belongs in separate notebooks.
 ## Running
 
 Use Python 3.12 or newer, phased biallelic single-contig VCF Zarr inputs, and
-the editable tsinfer checkout at `../tsinfer`. The runner uses its regional
-`AncestorMatcher`, retaining reference topology across independent gap calls,
-and raw table APIs.
+the sibling `../tsinfer` and `../tsls` repositories. Dependencies are pinned to
+commits in these local Git repositories; `uv.lock` records the exact revisions.
+The runner shares one immutable tsls panel and retains tree topology across
+independent regional calls.
 
 ```sh
 cp config.yaml.example config.yaml
@@ -81,13 +82,14 @@ change runtime. Storage chunks never limit extension.
 The matching domain runs from first through last called site, or the full
 reference axis for an all-missing haplotype.
 
-One persistent spawn pool prepares the reference and then matches samples.
+One persistent thread pool prepares the reference and then matches samples.
 One loader thread supplies complete slabs; the coordinator owns outputs.
 `max_pending_haplotypes` bounds submitted jobs whose results have not yet been
 appended. `sample_prefetch_chunks` separately bounds every live slab, including
-loading, ready and in-use slabs. Temporary files disappear after children stop.
-Mappings share input pages but still incur filesystem I/O. Native indexes are
-private to workers, and final tables grow with output size.
+loading, ready and in-use slabs. Temporary files disappear after workers stop.
+Each worker owns one HMM, exact-copying state and matched-output buffer. Shared
+reference mappings stay alive until all workers stop. Only the coordinator
+appends output and finalizes the tables once; output tables grow with results.
 
 ## Configuration
 
@@ -104,6 +106,9 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.recombination_rate` | Alternative to `hmm.recombination`: a nonnegative rate per bp per generation, or a HapMap file path. tsinfer converts genetic distances between inference sites to probabilities using Haldane's map function. Choose exactly one recombination setting. |
 | `hmm.mismatch` | Mismatch probability for remaining HMM calls, strictly between 0 and 1. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
+| `hmm.likelihood_threshold` | Optional floor on normalized likelihoods; omitted/null retains the native default. |
+| `hmm.prune_threshold` | Optional Viterbi pruning cutoff; omitted/null uses zero (disabled). |
+| `hmm.relative_prune_threshold` | Optional relative pruning cutoff; omitted/null uses zero. All numerical settings pass through unchanged with gap conditioning. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
 | `inference_threads` | Native ancestor inference workers and requested diagnostics CPU budget. Diagnostics uses the actual Snakemake-granted threads. |
 | `matching_threads` | Native ancestor/baseline threads and greedy process workers. |
@@ -114,7 +119,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `helper_threads.blosc_threads` | Codec threads per process; start with `1`. |
 | `helper_threads.zarr_async_concurrency` | Zarr async I/O concurrency per process; start with `1`. |
 | `helper_threads.zarr_threading_max_workers` | Zarr helper pool size per process; start with `1`. |
-| `helper_threads.blas_threads` | Numerical-library threads inherited by spawned children; start with `1`. Numba kernels are serial. |
+| `helper_threads.blas_threads` | Numerical-library thread limit; start with `1`. Numba kernels are serial. |
 
 `config.yaml.greedy_smoke` uses `hmm.recombination: 0.01` and
 `hmm.mismatch: 0.01` as convenient example probabilities, not fitted biological
@@ -153,7 +158,7 @@ Each `datasets` entry has:
 | `population.path` | Population CSV path when `source: csv`. |
 | `population.zarr_id_field` | Sample-dimensioned Zarr join identifier when `source: csv`, e.g. `sample_id`. |
 | `population.csv_id_field` | CSV identifier column when `source: csv`, e.g. `sample_id`. Selected identifiers and labels must exist and be unique. |
-| `matching_cache_size` | Native ancestor/full-HMM reader cache in MiB; `null` uses tsinfer's default. Greedy uses its slab bound instead. |
+| `matching_cache_size` | Ancestor reader cache in MiB; `null` uses tsinfer's default. Both sample runners use bounded decoded slabs. |
 
 Coordinates remain absolute when selecting a region. Main products are:
 
@@ -265,6 +270,23 @@ uv run snakemake performance --cores 12
 uv run -m lib.benchmark suite config.yaml --allocation 12
 ```
 
+`config_tsls_conditioned.yaml` and `config_tsls_unconditioned.yaml` compare
+one and four workers using the same prepared real reference and cohort.
+Their `data_dir` points to a separate chunk-aligned input copy. Replay actual
+padded windows with fresh and retained HMMs, checking scores, endpoint IDs and
+allele reconstruction:
+
+```sh
+uv run -m lib.profile_regions config_tsls_conditioned.yaml tgp_chr20_n100_1mbp data/performance/tsls_conditioned/regional_replay
+```
+
+`regional_profile.haplotypes` bounds the selected cohort for replay.
+`regional_profile.overlap_probe_sites` sets the width of two additional,
+explicitly labeled overlapping probes cut from a real gap. Outputs include
+requests, per-call timings/scores, rates/codebook/query arrays and a Python
+profile. A disposable instrumented tsls build can also supply native phase,
+traversal and allocation counters.
+
 Performance is opt-in and runs fresh trial processes sequentially. Each
 experiment directory must be empty. Output is under
 `data/performance/{experiment_id}/`: configuration and dependency/source
@@ -319,7 +341,7 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `seed` | Randomises method/worker order within each repeat. |
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
-| `collect_haplotype_timings` | Default `false`; save greedy task service times independently of regional stage timers. Full HMM timing rows are unavailable. |
+| `collect_haplotype_timings` | Default `false`; save greedy task service times independently of regional stage timers. Available for both matching methods. |
 | `collect_stages` | Enable aggregate preparation, coordinator, loading, native gap matching and assembly timings. `false` retains workload counts without stage timers. Record one staged run at every new scale, including one million haplotypes; use whole `from_reference` windows for method-level comparisons. |
 | `diagnostics_run` | Explicit `mode`, `workers` and zero-based `repeat` selecting completed trees for diagnostics; must belong to the suite. Diagnostic coverage is checked only when diagnostics is requested. |
 | `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
@@ -395,28 +417,27 @@ add overlapping latencies. Validation has its own window in each trial result
 and `validation_wall_s` in `runs.csv`, outside matching timings.
 
 Benchmark stage records include monotonic phase boundaries. Trial `result.json`
-contains compact worker launch/start summaries and the physical sample chunk
+contains worker traceback allocator sizes and the physical sample chunk
 shape, slab widths and temporary mapping location. Memory observers write to
 trial-owned scratch before copying timestamped histories into `memory_history/`.
 `memory_samples.csv` records USS, PSS where available, stale/missing observations
 and sample ages; `memory_summary.json` reports launcher and per-process
 observation gaps and whether each process history completed. Snapshot scratch
 uses `TMPDIR` independently of the mapped-input `temp_dir` setting.
-Greedy workload records include all reference mappings, shared native edge
-capacity and the removed per-worker edge capacity. Native edge buffers are
-prepared once in the coordinator and borrowed by workers; their mutable HMM
-state stays private. Mapped input capacity is separate from physical memory.
+Mapped input capacity is separate from physical process memory. The shared
+tsls panel is built once; each worker keeps private HMM state. Reported
+`traceback_allocator_bytes` measures the HMM traceback allocator, not worker RAM.
 Nested service measurements must not be added to coordinator elapsed time.
 
 When enabled, each trial's `haplotype_timings.csv` contains one row per completed
-greedy haplotype, ordered by `job_index`, and is included in the performance
+haplotype, ordered by `job_index`, and is included in the performance
 archive. Older archives have no such data. Columns are:
 
 | Fields | Meaning |
 | --- | --- |
 | `run_id`, `job_index` | Trial and canonical job; include the experiment ID when combining suites. |
 | `source`, `sample_id`, `ploidy_index` | Stable haplotype identity. |
-| `worker_pid` | Worker identity within this trial. |
+| `worker_index` | Matching thread identity within this trial. |
 | `match_start_s`, `match_end_s` | Monotonic offsets from the measured trial-window start (including preparation in `from_reference`). |
 | `match_wall_s`, `match_thread_cpu_s` | Elapsed and executing-thread CPU time inside the matching call. |
 | `domain_sites`, `focal_sites`, `gap_sites`, `gap_calls` | Existing per-haplotype workload counters. |
