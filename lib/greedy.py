@@ -31,7 +31,6 @@ class ExactState:
 
 def make_state(catalog, packed=None):
     """Allocate private scratch around immutable catalog and packed calls."""
-    catalog.make_readonly()
     if packed is None:
         packed = catalog.packed.open()
     capacity = len(catalog.seeds)

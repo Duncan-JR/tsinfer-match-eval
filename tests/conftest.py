@@ -26,33 +26,41 @@ def smoke_config():
     ):
         dataset.update(name=name, af_cutoff=cutoff, min_region_size_kb=minimum)
     config.update(
-        {'hmm': {'recombination': 0.01, 'mismatch': 0.01},
-         'performance': {'experiment_id': 'tiny_checks',
-                         'datasets': ['out_of_africa_n100_1mbp', 'tgp_chr20_n100_1mbp'],
-                         'modes': ['from_reference'],
-                         'methods': ['full_hmm', 'greedy'],
-                         'worker_counts': [1, 2],
-                         'repeats': 1,
-                         'seed': 20261020,
-                         'rss_sample_interval_s': 0.05,
-                         'trial_timeout_s': 300,
-                         'collect_haplotype_timings': False,
-                         'collect_stages': True,
-                         'quality_checks': True,
-                         'resident_max_matrix_mib': 512,
-                         'resident_max_private_mib': 16384,
-                         'quality_max_matrix_mib': 256,
-                         'diagnostics_run': {'mode': 'from_reference',
-                                             'workers': 2,
-                                             'repeat': 0}},
-         'smoke': {'seed': 20261023,
-                   'fixtures': {'tiny': {'variants': 13,
-                                         'individuals': 7,
-                                         'genotype_chunks': [4, 2, 1],
-                                         'selected_samples': ['s0', 's1', 's4', 's6'],
-                                         'panel_chunks': [4, 2, 1],
-                                         'quality_max_matrix_mib': 3e-05}},
-                   'validation_delay': {'timeout_s': 60, 'delay_s': 120}}}
+        {
+            "hmm": {"recombination": 0.01, "mismatch": 0.01},
+            "performance": {
+                "experiment_id": "tiny_checks",
+                "datasets": ["out_of_africa_n100_1mbp", "tgp_chr20_n100_1mbp"],
+                "modes": ["from_reference"],
+                "methods": ["full_hmm", "greedy"],
+                "worker_counts": [1, 2],
+                "repeats": 1,
+                "seed": 20261020,
+                "rss_sample_interval_s": 0.05,
+                "trial_timeout_s": 300,
+                "collect_haplotype_timings": False,
+                "collect_stages": True,
+                "quality_checks": True,
+                "resident_max_matrix_mib": 512,
+                "resident_max_private_mib": 16384,
+                "quality_max_matrix_mib": 256,
+                "diagnostics_run": {"mode": "from_reference", "workers": 2, "repeat": 0},
+            },
+            "smoke": {
+                "seed": 20261023,
+                "fixtures": {
+                    "tiny": {
+                        "variants": 13,
+                        "individuals": 7,
+                        "genotype_chunks": [4, 2, 1],
+                        "selected_samples": ["s0", "s1", "s4", "s6"],
+                        "panel_chunks": [4, 2, 1],
+                        "quality_max_matrix_mib": 3e-05,
+                    }
+                },
+                "validation_delay": {"timeout_s": 60, "delay_s": 120},
+            },
+        }
     )
     return config
 

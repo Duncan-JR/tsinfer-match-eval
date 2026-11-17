@@ -7,6 +7,7 @@ import logging
 import pathlib
 import time
 
+import numba
 import numpy as np
 import tsinfer
 
@@ -83,6 +84,7 @@ class SampleInput:
     num_sites: int
     source_rows: np.ndarray
     chunk_shape: tuple[int, ...]
+    ancestral: np.ndarray
 
 
 @dataclasses.dataclass
@@ -156,7 +158,15 @@ def prepare_samples(source, reference, jobs):
         max(widths),
     )
     return SampleInput(
-        source.path, blocks, chunks, remap, mapper, len(rows), rows, genotypes.chunks
+        source.path,
+        blocks,
+        chunks,
+        remap,
+        mapper,
+        len(rows),
+        rows,
+        genotypes.chunks,
+        ancestral,
     )
 
 
@@ -170,7 +180,11 @@ def _load_variant_block(genotypes, inputs, chunk, block, slab):
     encoded = remap[np.arange(len(remap))[:, None, None], safe]
     encoded[raw < 0] = -1
     selected = encoded.reshape(len(remap), -1)
-    slab[:, block.output_rows] = selected.T
+    # Sorted reference sites make this block's output rows contiguous.
+    # A basic slice writes sample-major spans instead of scattering by site.
+    output_start = int(block.output_rows[0])
+    output_stop = int(block.output_rows[-1]) + 1
+    slab[:, output_start:output_stop] = selected.T
     return genotypes.cdata_shape[2]
 
 
@@ -218,8 +232,7 @@ def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, di
     positions = reference.sites_position.astype(np.int32)
     if not np.array_equal(panel["variant_position"][:], positions):
         raise ValueError("Ancestor panel and reference site axes disagree")
-    ancestral = np.asarray([site.ancestral_state for site in reference.sites()])
-    if not np.array_equal(panel["variant_allele"][:, 0], ancestral):
+    if not np.array_equal(panel["variant_allele"][:, 0], sample_input.ancestral):
         raise ValueError("Ancestor panel and reference polarisation disagree")
     intervals = np.asarray(reference.metadata["sequence_intervals"])
     if not np.array_equal(panel["sequence_intervals"][:], intervals):
@@ -231,21 +244,31 @@ def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, di
     ids = np.asarray(panel["sample_id"][:].tolist(), dtype=str)
     if len(set(ids)) != len(ids) or not set(ids) <= nodes.keys():
         raise ValueError("Ancestor panel identities disagree with reference nodes")
-    seeds = np.full(len(ids), -1, dtype=np.int64)
-    for column, focal_positions in enumerate(panel["sample_focal_positions"][:]):
-        focal_positions = focal_positions[focal_positions >= 0]
-        if len(focal_positions) > 0:
-            focal = min(focal_positions) if choice == "left" else max(focal_positions)
-            seed = np.searchsorted(positions, focal)
-            if seed == len(positions) or positions[seed] != focal:
-                raise ValueError("An ancestor seed is absent from the reference")
-            seeds[column] = seed
-    columns = np.flatnonzero(seeds >= 0)
+    focal_positions = panel["sample_focal_positions"][:]
+    has_focal = np.any(focal_positions >= 0, axis=1)
+    columns = np.flatnonzero(has_focal)
+    if choice == "left":
+        focal = np.min(
+            focal_positions,
+            axis=1,
+            where=focal_positions >= 0,
+            initial=np.iinfo(focal_positions.dtype).max,
+        )
+    else:
+        focal = np.max(focal_positions, axis=1, initial=-1)
+    selected_focal = focal[columns]
+    selected_seeds = np.searchsorted(positions, selected_focal)
+    if np.any(selected_seeds == len(positions)):
+        raise ValueError("An ancestor seed is absent from the reference")
+    if np.any(positions[selected_seeds] != selected_focal):
+        raise ValueError("An ancestor seed is absent from the reference")
+    seeds = selected_seeds
     sample_rows = sample_input.source_rows
-    seed_rows = sample_rows[seeds[columns]]
+    seed_rows = sample_rows[seeds]
     frequencies = samples["variant_match_eval_derived_af"].oindex[seed_rows]
-    columns = columns[frequencies <= af_cutoff]
-    seeds = seeds[columns]
+    eligible = frequencies <= af_cutoff
+    columns = columns[eligible]
+    seeds = seeds[eligible]
     containing = np.searchsorted(intervals[:, 0], positions[seeds], side="right") - 1
     supports = intervals[containing]
     start_positions = np.maximum(
@@ -277,46 +300,53 @@ def reference_chunks(panel_path, catalog):
     return np.unique(catalog.columns // width).tolist()
 
 
-def pack_reference_chunk(panel_path, catalog, chunk):
+def pack_reference_chunk(genotypes, catalog, chunk, packed):
     """Copy disjoint spans in catalog order, decoding each required tile once.
 
     Sorted columns bound each job by binary search; numeric support masks keep
     Python copying proportional to actual ancestor/block overlaps.
     """
-    panel = tsinfer.vcz.open_store(panel_path)
-    genotypes = panel["call_genotype"]
     height, width, _ = genotypes.chunks
     first = np.searchsorted(catalog.columns, chunk * width)
     last = np.searchsorted(catalog.columns, (chunk + 1) * width)
     ancestors = np.arange(first, last)
-    starts = catalog.starts[first:last]
-    stops = catalog.stops[first:last]
     required = set()
     for ancestor in ancestors:
         first = catalog.starts[ancestor] // height
         last = (catalog.stops[ancestor] - 1) // height
         required.update(range(first, last + 1))
-    packed = catalog.packed.open("r+")
-    try:
-        for block in sorted(required):
-            tile = genotypes.blocks[block, chunk, 0]
-            block_start = block * height
-            block_stop = block_start + tile.shape[0]
-            overlapping = (starts < block_stop) & (stops > block_start)
-            for ancestor in ancestors[overlapping]:
-                start = max(catalog.starts[ancestor], block_start)
-                stop = min(catalog.stops[ancestor], block_stop)
-                column = catalog.columns[ancestor] - chunk * width
-                offset = catalog.offsets[ancestor] + start - catalog.starts[ancestor]
-                packed[offset : offset + stop - start] = tile[
-                    start - block_start : stop - block_start, column, 0
-                ]
-            del tile
-        for ancestor in ancestors:
-            offset = catalog.offsets[ancestor]
-            seed_offset = catalog.seeds[ancestor] - catalog.starts[ancestor]
-            if packed[offset + seed_offset] != 1:
-                raise ValueError("An eligible ancestor seed is not called and derived")
-    finally:
-        close_mapping(packed)
+    for block in sorted(required):
+        tile = genotypes.blocks[block, chunk, 0]
+        block_start = block * height
+        _pack_tile(
+            tile,
+            packed,
+            catalog.columns,
+            catalog.starts,
+            catalog.stops,
+            catalog.offsets,
+            ancestors,
+            block_start,
+            chunk * width,
+        )
+        del tile
+    seed_offsets = catalog.offsets[ancestors]
+    seed_offsets = seed_offsets + catalog.seeds[ancestors] - catalog.starts[ancestors]
+    if np.any(packed[seed_offsets] != 1):
+        raise ValueError("An eligible ancestor seed is not called and derived")
     return len(required)
+
+
+@numba.njit(cache=True, nogil=True)
+def _pack_tile(
+    tile, packed, columns, starts, stops, offsets, ancestors, block_start, column_start
+):
+    """Copy only supported spans while releasing the GIL for other readers."""
+    block_stop = block_start + tile.shape[0]
+    for ancestor in ancestors:
+        start = max(starts[ancestor], block_start)
+        stop = min(stops[ancestor], block_stop)
+        column = columns[ancestor] - column_start
+        offset = offsets[ancestor] + start - starts[ancestor]
+        for site in range(start, stop):
+            packed[offset + site - start] = tile[site - block_start, column, 0]

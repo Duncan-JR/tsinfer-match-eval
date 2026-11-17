@@ -452,3 +452,7 @@ count measures throughput. Never add summed service times to run wall time.
 Sample epsilon is calibrated on selected source sites before singleton exclusion.
 Ancestor matching uses stock probabilities and the selected haploid cohort size;
 sample map and numerical overrides apply only to sample matching.
+
+Reference packing shares open genotypes and a writable mapped destination.
+Workers finish packing and setup before the bounded sample loader starts;
+sample loading then continues during matching.

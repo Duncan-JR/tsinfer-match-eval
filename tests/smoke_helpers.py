@@ -242,21 +242,12 @@ def frozen_pack_reference(panel_path, catalog, chunk):
 
 def pack_job(task):
     panel, catalog, chunk = task
-    return haplotypes.pack_reference_chunk(panel, catalog, chunk)
-
-
-class TrackedOffsets(np.ndarray):
-    """Count Python scalar copying/seed visits without timing instrumentation."""
-
-    def __new__(cls, values):
-        result = np.asarray(values).view(cls)
-        result.visits = 0
-        return result
-
-    def __getitem__(self, index):
-        if np.isscalar(index):
-            self.visits += 1
-        return super().__getitem__(index)
+    array = tsinfer.vcz.open_store(panel)["call_genotype"]
+    packed = catalog.packed.open("r+")
+    try:
+        return haplotypes.pack_reference_chunk(array, catalog, chunk, packed)
+    finally:
+        haplotypes.close_mapping(packed)
 
 
 class CountingMatcher:

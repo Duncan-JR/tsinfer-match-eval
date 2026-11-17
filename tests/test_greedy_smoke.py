@@ -379,20 +379,17 @@ class TestReferencePacking:
 
         monkeypatch.setattr(block_type, "__getitem__", read)
         monkeypatch.setattr(haplotypes.np, "searchsorted", searchsorted)
-        offsets = smoke_helpers.TrackedOffsets(catalog.offsets)
-        catalog.offsets = offsets
-        actual_blocks = sum(
-            haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
-            for chunk in chunks
-        )
+        packed = catalog.packed.open("r+")
+        try:
+            actual_blocks = sum(
+                haplotypes.pack_reference_chunk(array, catalog, chunk, packed)
+                for chunk in chunks
+            )
+        finally:
+            haplotypes.close_mapping(packed)
         assert actual_blocks == expected_blocks == len(reads)
         assert len(searches) == 2 * len(chunks)
         assert len(set(reads)) == len(reads)
-        height = array.chunks[0]
-        overlaps = 0
-        for start, stop in zip(catalog.starts, catalog.stops, strict=True):
-            overlaps += (stop - 1) // height - start // height + 1
-        assert offsets.visits == overlaps + len(catalog.seeds)
         actual = catalog.packed.open()
         expected = frozen.packed.open()
         np.testing.assert_array_equal(actual, expected)
@@ -408,8 +405,14 @@ class TestReferencePacking:
         )
         panel = zarr.open_group(tiny.panel, mode="a", use_consolidated=False)
         panel["call_genotype"][catalog.seeds[0], catalog.columns[0], 0] = 0
-        with pytest.raises(ValueError, match="not called and derived"):
-            haplotypes.pack_reference_chunk(tiny.panel, catalog, 0)
+        packed = catalog.packed.open("r+")
+        try:
+            with pytest.raises(ValueError, match="not called and derived"):
+                haplotypes.pack_reference_chunk(
+                    panel["call_genotype"], catalog, 0, packed
+                )
+        finally:
+            haplotypes.close_mapping(packed)
 
     def test_one_and_two_packing_workers(self, tiny, tmp_path):
         reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
@@ -654,8 +657,13 @@ class TestConditionedGaps:
         catalog = haplotypes.prepare_reference(
             tiny.panel, samples, reference, 1, "left", tmp_path
         )
-        for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
-            haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
+        genotypes = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
+        packed = catalog.packed.open("r+")
+        try:
+            for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
+                haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)
+        finally:
+            haplotypes.close_mapping(packed)
         cfg = matching._sample_config(
             tiny.config, tiny.reference, tmp_path / "unused.trees"
         )
@@ -879,8 +887,13 @@ class TestStageTimings:
         catalog = haplotypes.prepare_reference(
             tiny.panel, samples, reference, 1, "left", tmp_path
         )
-        for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
-            haplotypes.pack_reference_chunk(tiny.panel, catalog, chunk)
+        genotypes = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
+        packed = catalog.packed.open("r+")
+        try:
+            for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
+                haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)
+        finally:
+            haplotypes.close_mapping(packed)
         if kind == "all_gap":
             empty = haplotypes.MappedCalls(tmp_path / "empty.bin", (0,))
             fields = {

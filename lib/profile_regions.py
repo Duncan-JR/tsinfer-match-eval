@@ -9,6 +9,7 @@ import tempfile
 import time
 
 import numpy as np
+import tsinfer
 import tskit
 import yaml
 
@@ -205,7 +206,7 @@ def run(config_path, dataset_name, output):
     queries = {}
     collector = performance.Collector()
     profiler = cProfile.Profile()
-    with tempfile.TemporaryDirectory() as temporary:
+    with tempfile.TemporaryDirectory(dir=config["temp_dir"]) as temporary:
         directory = pathlib.Path(temporary)
         catalog = haplotypes.prepare_reference(
             paths.ancestors,
@@ -215,10 +216,13 @@ def run(config_path, dataset_name, output):
             config["focal_choice"],
             directory,
         )
-        for chunk in haplotypes.reference_chunks(paths.ancestors, catalog):
-            haplotypes.pack_reference_chunk(paths.ancestors, catalog, chunk)
-        packed = catalog.packed.open()
+        panel = tsinfer.vcz.open_store(paths.ancestors)
+        genotypes = panel["call_genotype"]
+        packed = catalog.packed.open("r+")
         try:
+            for chunk in haplotypes.reference_chunks(paths.ancestors, catalog):
+                haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)
+            packed.flags.writeable = False
             worker = matching.make_worker(model, catalog, packed)
             recorder = RecordingMatcher(worker.matcher)
             worker.matcher = recorder

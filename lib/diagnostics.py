@@ -8,6 +8,7 @@ import concurrent.futures as cf
 import csv
 import dataclasses
 import datetime
+import functools
 import importlib.metadata
 import json
 import logging
@@ -689,7 +690,6 @@ class WorkerData:
 
     samples: haplotypes.SampleInput
     directory: pathlib.Path
-    panel_path: pathlib.Path
     exact: greedy.ExactState
     axis: SiteAxis
     boundaries: np.ndarray
@@ -727,7 +727,6 @@ def _serial_helpers(helpers):
 def _initialise_worker(
     samples,
     directory,
-    panel_path,
     axis,
     full_index,
     stitched_indexes,
@@ -743,7 +742,6 @@ def _initialise_worker(
     _worker = WorkerData(
         samples,
         directory,
-        panel_path,
         greedy.make_state(catalog),
         axis,
         boundaries,
@@ -751,12 +749,6 @@ def _initialise_worker(
         runs,
         full_index.open(),
         {minimum: index.open() for minimum, index in stitched_indexes.items()},
-    )
-
-
-def _pack_chunk(chunk):
-    return haplotypes.pack_reference_chunk(
-        _worker.panel_path, _worker.exact.catalog, chunk
     )
 
 
@@ -1305,6 +1297,23 @@ def run(config, workers):
                         config.get("focal_choice", "left"),
                         directory,
                     )
+                    panel = tsinfer.vcz.open_store(native.ancestors[0].path)
+                    genotypes = panel["call_genotype"]
+                    chunks = haplotypes.reference_chunks(
+                        native.ancestors[0].path, catalog
+                    )
+                    packed = catalog.packed.open("r+")
+                    try:
+                        pack = functools.partial(
+                            haplotypes.pack_reference_chunk,
+                            genotypes,
+                            catalog,
+                            packed=packed,
+                        )
+                        with cf.ThreadPoolExecutor(max_workers=workers) as packing_pool:
+                            list(packing_pool.map(pack, chunks))
+                    finally:
+                        haplotypes.close_mapping(packed)
                     results = {
                         item.min_region_size_kb: [None] * len(jobs) for item in runs
                     }
@@ -1318,7 +1327,6 @@ def run(config, workers):
                         initargs=(
                             samples,
                             directory,
-                            native.ancestors[0].path,
                             axis,
                             full_index,
                             stitched_indexes,
@@ -1328,11 +1336,6 @@ def run(config, workers):
                             config["helper_threads"],
                         ),
                     ) as pool:
-                        chunks = haplotypes.reference_chunks(
-                            native.ancestors[0].path, catalog
-                        )
-                        for _ in pool.map(_pack_chunk, chunks):
-                            pass
                         logger.info(
                             "Diagnostic reference preparation/packing "
                             "(including worker startup): %.3fs",

@@ -441,7 +441,7 @@ def _worker_main(
     start_matching,
     stopping,
     worker_index,
-    panel_path,
+    panel_genotypes,
     model,
     catalog,
     packed,
@@ -465,7 +465,9 @@ def _worker_main(
                 "thread",
                 parent_stage="coordinator_packing_completion",
             ):
-                count = haplotypes.pack_reference_chunk(panel_path, catalog, chunk)
+                count = haplotypes.pack_reference_chunk(
+                    panel_genotypes, catalog, chunk, packed
+                )
             collector.count(ancestor_blocks_read=count)
             events.put(("packed", collector))
         if stopping.is_set():
@@ -834,6 +836,7 @@ def match_stitched_samples(
     packed = None
     model = None
     catalog = None
+    panel_genotypes = None
     loader = None
     diagnostics = collector is not None and collector.stages
     if temp_dir is not None:
@@ -858,7 +861,9 @@ def match_stitched_samples(
                         directory,
                     )
                     chunks = haplotypes.reference_chunks(panel_path, catalog)
-                    packed = catalog.packed.open()
+                    panel = tsinfer.vcz.open_store(panel_path)
+                    panel_genotypes = panel["call_genotype"]
+                    packed = catalog.packed.open("r+")
             if collector is not None:
                 slab_sizes = sorted(
                     [
@@ -897,7 +902,7 @@ def match_stitched_samples(
                             start_matching,
                             stopping,
                             worker_index,
-                            panel_path,
+                            panel_genotypes,
                             model,
                             catalog,
                             packed,
@@ -916,6 +921,8 @@ def match_stitched_samples(
                 inclusive=True,
             ):
                 _pack_reference(work, events, chunks, max_pending_haplotypes, collector)
+                if packed is not None:
+                    packed.flags.writeable = False
             with performance.measure(
                 collector,
                 "coordinator_worker_readiness",
