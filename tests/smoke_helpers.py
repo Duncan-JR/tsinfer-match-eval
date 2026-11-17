@@ -256,7 +256,13 @@ class CountingMatcher:
     def __init__(self, matcher):
         self.matcher = matcher
         self.calls = 0
+        self.batches = 0
 
     def find_path(self, *args, **kwargs):
         self.calls += 1
         return self.matcher.find_path(*args, **kwargs)
+
+    def find_paths(self, h, windows, out):
+        self.calls += len(windows)
+        self.batches += 1
+        return self.matcher.find_paths(h, windows, out)

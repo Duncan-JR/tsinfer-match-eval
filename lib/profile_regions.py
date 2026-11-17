@@ -48,6 +48,19 @@ class RecordingMatcher:
         )
         return self.matcher.find_path(h, start, end, out, **kwargs)
 
+    def find_paths(self, h, windows, match_out):
+        for start, end, initial, final in windows:
+            self.requests.append(
+                Request(
+                    self.job_index,
+                    int(start),
+                    int(end),
+                    None if initial == -1 else int(initial),
+                    None if final == -1 else int(final),
+                )
+            )
+        return self.matcher.find_paths(h, windows, match_out)
+
 
 def path_score(model, mapper, h, out, path, request):
     """Check the path's alleles and score its actual transitions and emissions."""

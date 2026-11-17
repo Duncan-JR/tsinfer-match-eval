@@ -11,7 +11,7 @@ resolution-markers = [
 ]
 
 [manifest]
-overrides = [{ name = "tsls", git = "file:///well/kelleher/users/uuc395/tsls?rev=e4cf2333b99eb6b104ff44cbb34625f22a16e880" }]
+overrides = [{ name = "tsls", git = "file:///well/kelleher/users/uuc395/tsls?rev=925be379cb9e94d8e7de6e2f0cc5926da292f170" }]
 
 [[package]]
 name = "annotated-types"
@@ -1588,7 +1588,7 @@ wheels = [
 
 [[package]]
 name = "tsinfer"
-version = "0.5.2.dev366"
+version = "0.5.2.dev365"
 source = { git = "file:///well/kelleher/users/uuc395/tsinfer?rev=63837fd44b661714c774c3c5957904eea25d7210#63837fd44b661714c774c3c5957904eea25d7210" }
 dependencies = [
     { name = "bio2zarr" },
@@ -1643,7 +1643,7 @@ requires-dist = [
     { name = "tomli-w" },
     { name = "tsinfer", git = "file:///well/kelleher/users/uuc395/tsinfer?rev=63837fd44b661714c774c3c5957904eea25d7210" },
     { name = "tskit", specifier = ">=1" },
-    { name = "tsls", git = "file:///well/kelleher/users/uuc395/tsls?rev=e4cf2333b99eb6b104ff44cbb34625f22a16e880" },
+    { name = "tsls", git = "file:///well/kelleher/users/uuc395/tsls?rev=925be379cb9e94d8e7de6e2f0cc5926da292f170" },
     { name = "tszip", specifier = ">=0.3.1" },
     { name = "zarr", specifier = ">=3" },
 ]
@@ -1686,8 +1686,8 @@ wheels = [
 
 [[package]]
 name = "tsls"
-version = "0.1.dev122"
-source = { git = "file:///well/kelleher/users/uuc395/tsls?rev=e4cf2333b99eb6b104ff44cbb34625f22a16e880#e4cf2333b99eb6b104ff44cbb34625f22a16e880" }
+version = "0.1.dev125"
+source = { git = "file:///well/kelleher/users/uuc395/tsls?rev=925be379cb9e94d8e7de6e2f0cc5926da292f170#925be379cb9e94d8e7de6e2f0cc5926da292f170" }
 dependencies = [
     { name = "numpy" },
     { name = "tskit" },

@@ -77,7 +77,7 @@ Each residual gap has a conditional HMM optimum under the existing numerical
 approximation, with either, both or neither flanking copied state available.
 The HMM selects the first and last gap parents and pays transition costs to
 available anchors; it can accept a mismatch instead of switching. This does
-not globally reoptimise the greedy cover. Each gap still makes one HMM call,
+not globally reoptimise the greedy cover. Each gap contributes one window to its haplotype's native batch,
 with up to two extra flanking observations. Compression and chosen paths can
 change runtime. Storage chunks never limit extension.
 The matching domain runs from first through last called site, or the full
@@ -456,3 +456,7 @@ sample map and numerical overrides apply only to sample matching.
 Reference packing shares open genotypes and a writable mapped destination.
 Workers finish packing and setup before the bounded sample loader starts;
 sample loading then continues during matching.
+
+Residual-window preparation uses separate partition, one-site, coalescing and
+conditioning passes. Submit all windows of a haplotype in one native batch,
+resetting likelihoods independently, then clip and assemble paths once.

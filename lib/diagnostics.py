@@ -290,24 +290,19 @@ class MaskRuns:
     end: int
 
 
-def mask_runs(state, order, minimum, start, end, boundaries):
+def mask_runs(state, order, minimum, start, end, boundaries, haplotype):
     """Coalesce the same copying/HMM decisions used by stitched matching."""
     count = greedy.cover(state, order, minimum)
-    lefts, rights, gaps = [], [], []
-    for interval in greedy.stitched_intervals(state, count, start, end, boundaries):
-        is_gap = interval.ancestor is None
-        if len(gaps) > 0 and gaps[-1] == is_gap:
-            rights[-1] = interval.right
-        else:
-            lefts.append(interval.left)
-            rights.append(interval.right)
-            gaps.append(is_gap)
+    partition = greedy.partition_intervals(state, count, start, end, boundaries)
+    greedy.resolve_one_site_gaps(state, partition, haplotype)
+    intervals = greedy.coalesce_copied(partition)
+    is_gap = intervals.ancestor < 0
+    first = np.ones(len(is_gap), dtype=bool)
+    last = np.ones(len(is_gap), dtype=bool)
+    first[1:] = is_gap[1:] != is_gap[:-1]
+    last[:-1] = is_gap[:-1] != is_gap[1:]
     return MaskRuns(
-        np.asarray(lefts, dtype=np.int64),
-        np.asarray(rights, dtype=np.int64),
-        np.asarray(gaps, dtype=bool),
-        start,
-        end,
+        intervals.left[first], intervals.right[last], is_gap[first], start, end
     )
 
 
@@ -775,7 +770,9 @@ def _analyse_haplotype(task):
         full_support = full_path.support()
         for run in state.runs:
             minimum = run.min_focal_region_size
-            mask = mask_runs(state.exact, order, minimum, start, end, state.boundaries)
+            mask = mask_runs(
+                state.exact, order, minimum, start, end, state.boundaries, haplotype
+            )
             stitched_path = state.stitched[run.min_region_size_kb][index]
             stitched = stitched_path.parents_at_sites(state.axis.positions)
             analysis = comparison_metrics(

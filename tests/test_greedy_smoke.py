@@ -708,7 +708,25 @@ class TestConditionedGaps:
                 parents[::-1],
             )
 
-        monkeypatch.setattr(worker.matcher, "find_path", find_path)
+        def find_paths(h, windows, out):
+            offsets = [0]
+            paths = []
+            for start, end, initial, final in windows:
+                path = find_path(
+                    h,
+                    start,
+                    end,
+                    out,
+                    initial_state=None if initial == -1 else initial,
+                    final_state=None if final == -1 else final,
+                    preserve_outside=True,
+                )
+                paths.append(path)
+                offsets.append(offsets[-1] + len(path[0]))
+            arrays = [np.concatenate([path[j] for path in paths]) for j in range(3)]
+            return np.asarray(offsets, dtype=np.uint64), *arrays
+
+        monkeypatch.setattr(worker.matcher, "find_paths", find_paths)
         collector = performance.Collector()
         h = np.zeros(13, dtype=np.int8)
         result = matching.match_stitched_haplotype(
@@ -755,14 +773,24 @@ class TestConditionedGaps:
     def test_real_stitched_output(self, tiny, worker, monkeypatch, condition_gaps):
         # Include a mismatching one-site bridge and residual HMM gaps.
         h = np.array([1, 1, 0, 1, 0, 0, 0, 1, 1, 0, 0, 1, 0], dtype=np.int8)
-        native = worker.matcher.find_path
+        native = worker.matcher.find_paths
         calls = []
 
-        def find_path(h, start, end, out, **kwargs):
-            calls.append((start, end, kwargs))
-            return native(h, start, end, out, **kwargs)
+        def find_paths(h, windows, out):
+            for start, end, initial, final in windows:
+                calls.append(
+                    (
+                        start,
+                        end,
+                        {
+                            "initial_state": None if initial == -1 else initial,
+                            "final_state": None if final == -1 else final,
+                        },
+                    )
+                )
+            return native(h, windows, out)
 
-        monkeypatch.setattr(worker.matcher, "find_path", find_path)
+        monkeypatch.setattr(worker.matcher, "find_paths", find_paths)
         result = matching.match_stitched_haplotype(
             0, h, worker, 1, condition_gaps=condition_gaps
         )
@@ -861,9 +889,11 @@ class TestStageTimings:
         assert assembly.service_s <= drain
         assert assembly.thread_cpu_s >= 0
         native = records["gap_native_find_path"]
-        assert native.call_count == collectors[1].workload["gap_calls"]
-        assert records["gap_path_conversion"].call_count == native.call_count
-        assert records["gap_mutation_extraction"].call_count == native.call_count
+        assert native.call_count == collectors[1].workload["hmm_batches"]
+        assert (
+            records["gap_interval_preparation"].call_count
+            == collectors[1].workload["matched_haplotypes"]
+        )
         assert (
             records["gap_final_concatenation"].call_count
             == collectors[1].workload["matched_haplotypes"]
@@ -871,8 +901,7 @@ class TestStageTimings:
         assert records["gap_matching_assembly"].inclusive
         for name in (
             "gap_native_find_path",
-            "gap_path_conversion",
-            "gap_mutation_extraction",
+            "gap_interval_preparation",
             "gap_final_concatenation",
         ):
             record = records[name]
@@ -923,7 +952,7 @@ class TestStageTimings:
         counts = collector.workload
         assert counts["gap_calls"] == native.calls
         recorded = collector.records.get(("gap_native_find_path", "thread"))
-        assert (0 if recorded is None else recorded.call_count) == native.calls
+        assert (0 if recorded is None else recorded.call_count) == native.batches
         if kind == "all_gap":
             assert counts["gap_sites"] == reference.num_sites
             assert counts["focal_sites"] == 0

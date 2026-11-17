@@ -232,6 +232,32 @@ def make_worker(model, catalog=None, packed=None):
         dummy.flags.writeable = False
         order = greedy.candidates(dummy, exact, 0, len(dummy))
         greedy.cover(exact, order, 1)
+        catalog = exact.catalog
+        partition = greedy.partition_intervals(exact, 0, 0, 0, worker.boundaries)
+        bridges = greedy.resolve_one_site_gaps(exact, partition, dummy)
+        intervals = greedy.coalesce_copied(partition)
+        residual = greedy.residual_windows(
+            intervals, catalog.parents, worker.boundaries, True
+        )
+        empty_float = np.empty(0, dtype=np.float64)
+        empty_int = np.empty(0, dtype=np.int32)
+        greedy.assemble_intervals(
+            intervals.left,
+            intervals.right,
+            intervals.ancestor,
+            catalog.parents,
+            np.zeros(1, dtype=np.uint64),
+            empty_float,
+            empty_float,
+            empty_int,
+            residual.gap_left,
+            residual.gap_right,
+            bridges.corrections,
+            dummy,
+            worker.match_out,
+            worker.positions,
+            worker.sequence_length,
+        )
     return worker
 
 
@@ -249,6 +275,7 @@ def match_full_haplotype(job_index, haplotype, worker, collector=None):
         collector.count(
             matched_haplotypes=1,
             full_calls=1,
+            hmm_batches=1,
             domain_sites=end - start,
             focal_sites=0,
             gap_sites=end - start,
@@ -346,8 +373,8 @@ def match_stitched_haplotype(
 ):
     """Match one complete canonical haplotype against a prepared reference.
 
-    Filter exact components, then copy supported one-site gaps using
-    :func:`lib.greedy.stitched_intervals`. Correct called bridge disagreements
+    Filter exact components by size, then copy supported one-site gaps.
+    Correct called bridge disagreements
     with sample mutations. Optionally condition residual HMM gaps on adjacent
     copied parents; disabling this also removes flanking observation padding.
     """
@@ -359,78 +386,73 @@ def match_stitched_haplotype(
     with performance.measure(collector, "candidate_extension_cover", "thread"):
         order = greedy.candidates(haplotype, state, start, end)
         count = greedy.cover(state, order, minimum)
-    blocks = []
-    mutations = []
-    focal_sites = 0
-    focal_runs = 0
-    gap_calls = 0
-    one_site_gap_sites = 0
+    catalog = state.catalog
     with performance.measure(
         collector, "gap_matching_assembly", "thread", inclusive=True
     ):
-        intervals = greedy.stitched_intervals(
-            state, count, start, end, worker.boundaries
-        )
-        for interval in intervals:
-            if interval.ancestor is None:
-                initial_state = None
-                final_state = None
-                if condition_gaps and interval.left_ancestor is not None:
-                    initial_state = state.catalog.parents[interval.left_ancestor]
-                if condition_gaps and interval.right_ancestor is not None:
-                    final_state = state.catalog.parents[interval.right_ancestor]
-                region = _match_region(
-                    haplotype,
-                    worker,
-                    interval.left,
-                    interval.right,
-                    collector,
-                    initial_state=initial_state,
-                    final_state=final_state,
+        with performance.measure(
+            collector,
+            "gap_interval_preparation",
+            "thread",
+            parent_stage="gap_matching_assembly",
+        ):
+            partition = greedy.partition_intervals(
+                state, count, start, end, worker.boundaries
+            )
+            bridges = greedy.resolve_one_site_gaps(state, partition, haplotype)
+            intervals = greedy.coalesce_copied(partition)
+            residual = greedy.residual_windows(
+                intervals, catalog.parents, worker.boundaries, condition_gaps
+            )
+        if len(residual.windows) > 0:
+            with performance.measure(
+                collector,
+                "gap_native_find_path",
+                "thread",
+                parent_stage="gap_matching_assembly",
+            ):
+                offsets, path_left, path_right, path_parent = worker.matcher.find_paths(
+                    haplotype, residual.windows, worker.match_out
                 )
-                blocks.append(region.runs)
-                mutations.append(region.mutation_site)
-                gap_calls += 1
-            else:
-                ancestor = interval.ancestor
-                parent = state.catalog.parents[ancestor]
-                blocks.append(
-                    CopyingRuns(
-                        np.asarray([interval.left], dtype=np.int64),
-                        np.asarray([interval.right], dtype=np.int64),
-                        np.asarray([parent], dtype=np.int32),
-                    )
-                )
-                focal_sites += interval.right - interval.left
-                focal_runs += 1
-                one_site_gap_sites += len(interval.bridged_sites)
-                corrections = []
-                for site in interval.bridged_sites:
-                    offset = state.catalog.offsets[ancestor]
-                    offset += site - state.catalog.starts[ancestor]
-                    sample_call = haplotype[site]
-                    if sample_call >= 0 and sample_call != state.packed[offset]:
-                        corrections.append(site)
-                if len(corrections) > 0:
-                    mutations.append(np.asarray(corrections, dtype=np.int64))
+        else:
+            offsets = np.zeros(1, dtype=np.uint64)
+            path_left = np.empty(0, dtype=np.float64)
+            path_right = path_left
+            path_parent = np.empty(0, dtype=np.int32)
         with performance.measure(
             collector,
             "gap_final_concatenation",
             "thread",
             parent_stage="gap_matching_assembly",
         ):
-            result = _assemble_result(
-                job_index, blocks, mutations, haplotype, worker, collector
+            result_arrays = greedy.assemble_intervals(
+                intervals.left,
+                intervals.right,
+                intervals.ancestor,
+                catalog.parents,
+                offsets,
+                path_left,
+                path_right,
+                path_parent,
+                residual.gap_left,
+                residual.gap_right,
+                bridges.corrections,
+                haplotype,
+                worker.match_out,
+                worker.positions,
+                worker.sequence_length,
             )
+            result = HaplotypeResult(job_index, *result_arrays, collector)
     if collector is not None:
         collector.count(
             matched_haplotypes=1,
             domain_sites=end - start,
-            focal_sites=focal_sites,
-            gap_sites=end - start - focal_sites,
-            focal_runs=focal_runs,
-            gap_calls=gap_calls,
-            one_site_gap_sites=one_site_gap_sites,
+            focal_sites=residual.focal_sites,
+            gap_sites=end - start - residual.focal_sites,
+            focal_runs=residual.focal_runs,
+            gap_calls=len(residual.windows),
+            hmm_batches=int(len(residual.windows) > 0),
+            one_site_gap_sites=bridges.sites,
         )
     return result
 
