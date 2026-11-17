@@ -41,7 +41,10 @@ def package_revision(name):
     commit = subprocess.check_output(
         ["git", "-C", str(checkout), "rev-parse", "HEAD"], text=True
     ).strip()
-    return {"url": source["url"], "commit": commit}
+    status = subprocess.check_output(
+        ["git", "-C", str(checkout), "status", "--porcelain"], text=True
+    )
+    return {"url": source["url"], "commit": commit, "status": status.splitlines()}
 
 
 def annotate_derived_counts(
@@ -116,7 +119,10 @@ def sample_hmm_settings(samples, hmm, include=None, exclude=None, selection=None
     span = settings.pop("mismatch_span_bp", None)
     if epsilon is not None:
         source = tsinfer.config.Source(
-            name="samples", path=samples, include=include, exclude=exclude,
+            name="samples",
+            path=samples,
+            include=include,
+            exclude=exclude,
             samples=selection,
         )
         resolved = tsinfer.vcz.resolve_sources([source], None, None)
@@ -129,7 +135,11 @@ def sample_hmm_settings(samples, hmm, include=None, exclude=None, selection=None
             raise ValueError("Calibrated mismatch probability must be between 0 and 1")
         logger.info(
             "Sample epsilon=%g, span=%g bp, source sites=%d, mismatch=%g, n=%d",
-            epsilon, span, num_sites, settings["mismatch"], settings["sample_size"],
+            epsilon,
+            span,
+            num_sites,
+            settings["mismatch"],
+            settings["sample_size"],
         )
     return settings
 

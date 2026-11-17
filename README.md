@@ -1,101 +1,77 @@
 # tsinfer matching evaluation
 
-This Snakemake pipeline generates ancestor references and compares full-HMM
-sample matching with greedy exact copying plus full-HMM gap matching. Analysis
-belongs in separate notebooks.
+This pipeline generates ancestor references and compares full-HMM sample matching
+with greedy exact copying followed by HMM gap matching. Analysis belongs in
+separate notebooks.
 
 ## Running
 
 Use Python 3.12 or newer, phased biallelic single-contig VCF Zarr inputs, and
-the sibling `../tsinfer` and `../tsls` repositories. Dependencies are pinned to
-commits in these local Git repositories; `uv.lock` records the exact revisions.
-The runner shares one immutable tsls panel and retains tree topology across
-independent regional calls.
+the sibling TSInfer and TSLS repositories. Both native dependencies are pinned
+to committed local Git sources in `pyproject.toml` and `uv.lock`. Set those
+source locations for your checkout before resolving dependencies.
 
 ```sh
 mkdir -p configs
 cp config.yaml.example configs/my_run.yaml
-# Set input paths and the options below.
-uv sync
+# Set input paths and configuration options.
+uv sync --locked
 uv run snakemake --configfile configs/my_run.yaml --dry-run --cores all
 uv run snakemake --configfile configs/my_run.yaml --cores all
 ```
 
-`af_cutoff` and `min_region_size_kb` accept a scalar or a list. The default
-target runs their Cartesian product, sharing annotated samples, ancestor panels,
-references and one full-HMM baseline per dataset. Use separate output directories
-when changing inputs or HMM settings. Logs record the actual tsinfer revision.
+Personal configurations live in ignored `configs/`. Paths are relative to the
+repository working directory; input paths, `data_dir`, `progress_dir` and
+`temp_dir` expand `~`. Use fresh outputs when changing inputs or HMM settings.
+VCZ arrays must have consistent variant chunks.
 
 ## Matching
 
-1. Copy each input store and annotate derived allele counts and frequencies for
-   the selected cohort. Missing calls are excluded; singletons are excluded from
-   inference. The annotated store retains both original axes.
-2. Infer ancestors and match them to make a raw reference tree sequence. True
-   ancestor extraction remains available through explicit `true` targets.
-3. Run the independent native full-HMM baseline.
-4. Select each ancestor's leftmost or rightmost focal site as its seed. Keep
-   ancestors with annotated derived AF at most `af_cutoff`. AF is derived copies
-   divided by called haplotypes in the selected cohort at the seed. Pack their supports,
-   clipped to the containing inference interval, into one temporary mapped file.
-5. Load selected samples by physical Zarr chunks into temporary mapped slabs.
-   Each worker matches one complete haplotype. A derived sample seed activates
-   its ancestor. Skip missing sample observations while extending in both
-   directions; called disagreements and unknown ancestor calls stop extension,
-   as do support ends and inference boundaries. Clip supports to the sample's
-   called domain before extension and minimum filtering. Different ancestors
-   may share a seed; missing seeds activate none.
-6. Convert `min_region_size_kb` once per matching run to a rounded mean site
-   count: `max(1, round(kb * 1000 * num_sites / (last_position - first_position)))`,
-   using the reference's `sites_position` array. Stable-sort intervals by left
-   bound and repeatedly copy the interval reaching furthest from the current
-   cursor. Filter complete connected unions by that site count, including
-   touching intervals. Short intervals can bridge a retained union. Equal
-   reaches keep the first interval in stable panel order. This wrapper uses
-   genome-wide mean density, rather than checking each union's physical length.
-7. Split uncovered gaps at inference boundaries. For a one-site gap (one
-   inference-site index), copy a supported parent with a known allele: prefer
-   the left retained parent, then the right, then the activated ancestor with
-   the furthest support end in stable support-start order. Candidates rejected
-   by the minimum remain eligible for this choice. Correct called disagreements
-   with sample mutations; missing observations need no mutation. Keep these focal
-   copying decisions fixed. Match residual gaps with the HMM, conditioning on
-   available adjacent copied parents at the observations immediately outside each
-   gap. Inference boundaries prevent padding across intervals. Retain only the
-   gap's path and mutations. Set `condition_gaps: false` to match residual gaps
-   without anchors or padding, keeping one-site-gap copying unchanged.
-   Then append completed results, squash adjacent equal-parent/child edges once,
-   and finalise and sort tables.
+1. Annotate derived allele counts and frequencies for the selected cohort.
+   Missing calls do not enter counts. Exclude singletons from inference.
+2. Infer and match ancestors to create a reference. Explicit `true` targets
+   can extract true ancestors when a truth tree sequence is available.
+3. Run an independent full-HMM sample baseline.
+4. Select each eligible ancestor's leftmost or rightmost focal seed, applying
+   the selected-cohort derived-AF cutoff. Pack support clipped to its containing
+   inference interval. A derived sample call at the seed activates the ancestor.
+5. Extend exact matches, skipping missing observations and stopping at called
+   disagreements, unknown reference calls, support ends or the called domain.
+   Stable-sort intervals and greedily take the furthest reach. Equal reaches
+   keep the first ancestor in stable panel order. Apply the minimum to whole
+   touching focal unions, so short intervals can bridge retained unions.
+6. Partition copied spans and gaps within the domain and inference boundaries.
+   Resolve supported one-site gaps separately: prefer the original left
+   neighbour, then the original right neighbour, then the activated ancestor
+   with furthest support end in stable support-start order. An unsupported
+   fallback leaves an HMM gap. Correct called disagreements with mutations;
+   missing observations need no correction.
+7. Merge compatible copied spans and construct residual windows. Condition on
+   adjacent copied parents with one flanking observation per available anchor.
+   Inference boundaries prevent padding. `condition_gaps: false` removes pins
+   and padding while retaining one-site copying.
+8. Match all residual windows of one haplotype in one native batch, with
+   independent likelihood resets. Clip paths to true gaps and assemble paths
+   and mutations once. Append results, squash edges, sort and finalise output.
 
-Both matching runners append sample individual and population metadata after
-the reference rows, using the same IDs as tsinfer reference matching. Existing
-VCZ stores must satisfy vcztools 0.2 variant-chunk alignment requirements;
-rechunk older stores with inconsistent variant chunks before reusing them.
+The minimum in kb becomes
+`max(1, round(kb * 1000 * num_sites / (last_position - first_position)))`
+on the reference site axis. This uses mean site density. The domain spans the
+first through last called site, or the full axis for an all-missing haplotype.
+Greedy copying stays fixed; each residual HMM optimum is conditional on its
+available anchors and native numerical settings.
 
-The greedy cover minimises copying runs within each retained exact union.
-Each residual gap has a conditional HMM optimum under the existing numerical
-approximation, with either, both or neither flanking copied state available.
-The HMM selects the first and last gap parents and pays transition costs to
-available anchors; it can accept a mismatch instead of switching. This does
-not globally reoptimise the greedy cover. Each gap contributes one window to its haplotype's native batch,
-with up to two extra flanking observations. Compression and chosen paths can
-change runtime. Storage chunks never limit extension.
-The matching domain runs from first through last called site, or the full
-reference axis for an all-missing haplotype.
-
-One persistent thread pool prepares the reference and then matches samples.
-One loader thread supplies complete slabs; the coordinator owns outputs.
-`max_pending_haplotypes` bounds submitted jobs whose results have not yet been
-appended. `sample_prefetch_chunks` separately bounds every live slab, including
-loading, ready and in-use slabs. Temporary files disappear after workers stop.
-Each worker owns one HMM, exact-copying state and matched-output buffer. Shared
-reference mappings stay alive until all workers stop. Only the coordinator
-appends output and finalizes the tables once; output tables grow with results.
+The coordinator opens the shared genotypes and writable reference mapping.
+Packing and worker setup finish before bounded sample loading starts; the
+mapping is read-only during matching. One persistent matching thread pool owns
+private HMMs and scratch. Loading continues while matching. Queue and live-slab
+limits are separate, and temporary mappings close after workers stop.
+Only the coordinator appends output tables.
 
 ## Configuration
 
-Paths are relative to the working directory; input paths, `data_dir`,
-`progress_dir` and `temp_dir` expand `~`.
+`af_cutoff` and `min_region_size_kb` accept scalars or lists on each dataset.
+Ordinary matching runs their Cartesian product and shares one full-HMM baseline.
 
 | Option | Meaning |
 | --- | --- |
@@ -114,33 +90,31 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `hmm.relative_prune_threshold` | Optional relative pruning cutoff; omitted/null uses zero. All numerical settings pass through unchanged with gap conditioning. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
 | `inference_threads` | Native ancestor inference workers and requested diagnostics CPU budget. Diagnostics uses the actual Snakemake-granted threads. |
-| `matching_threads` | Native ancestor/baseline threads and greedy process workers. |
-| `sample_reader_threads` | Greedy physical variant-block readers per slab; default `1`. Blocks write disjoint columns and publish together. Pilot `2`, then `4` only while useful; allow extra decode scratch. Shared Zarr async and thread limits remain separate from reader count and are included in the CPU budget. |
+| `matching_threads` | Native ancestor/baseline threads and greedy matching threads. |
+| `sample_reader_threads` | Greedy physical variant-block readers per slab; default `1`. Blocks write disjoint columns and publish together. Allow for decoder scratch. Shared Zarr async and thread limits remain separate from reader count and are included in the CPU budget. |
 | `sample_prefetch_chunks` | Maximum live decoded sample slabs; start with `2`. |
 | `max_pending_haplotypes` | Maximum queued, running and completed-but-unappended haplotype jobs; also bounds preparation admission. `null` uses the requested worker count. An explicit limit must be at least that count. |
 | `temp_dir` | Temporary mapped-file parent, or `null` for the system temporary directory. |
 | `helper_threads.blosc_threads` | Codec threads per process; start with `1`. |
-| `helper_threads.zarr_async_concurrency` | Zarr async I/O concurrency per process; start with `1`. |
-| `helper_threads.zarr_threading_max_workers` | Zarr helper pool size per process; start with `1`. |
+| `helper_threads.zarr_async_concurrency` | Maximum concurrent Zarr requests within an array read. |
+| `helper_threads.zarr_threading_max_workers` | Shared I/O/decode pool per process. Multiple workers permit parallel chunk reads; the pool is included in the CPU reservation. |
 | `helper_threads.blas_threads` | Numerical-library thread limit; start with `1`. Numba kernels are serial. |
 
-`configs/my_run.yaml` uses `hmm.recombination: 0.01` and
-`hmm.mismatch: 0.01` as convenient example probabilities, not fitted biological
-parameters. Both full-HMM and gap matching use the configured probabilities.
-Use fresh output directories and regenerate native TOML and prepared references
-when changing these settings.
+Sample mismatch calibration uses selected source sites before singleton
+exclusion and an explicit positive finite span. Choose exactly one of mismatch
+or epsilon, with probabilities strictly between zero and one. Ancestor matching
+uses stock probabilities without sample maps or numerical overrides. Both
+stages use the selected haploid cohort size.
 
-HapMap files have a header and columns for chromosome, position (bp), rate
-(cM/Mb), and optionally cumulative map position (cM). Three-column files are
-integrated from the first position, using each row's rate up to the next row.
-Native configuration generation saves a four-column copy beside each TOML;
-ancestor, full-HMM and greedy matching all use that map. Physical coordinates
-must match the input variants; keep chromosome coordinates when selecting a region.
-When overlaying YAML configurations, set the unused recombination setting to `null`.
+HapMap files have a header and chromosome, position (bp), rate (cM/Mb), and
+optional cumulative position (cM) columns. Three-column maps are integrated
+using each row's rate until the next row. Native configuration writes a
+four-column map beside the TOML. Coordinates stay absolute under site selection.
+Set the unused recombination or mismatch choice to `null` when overlaying YAML.
 
-Snakemake reserves matching workers plus loader/decoding helpers. With all helper
-limits set to `1`, greedy requires `max(2 * workers, workers + 3)` CPUs. Increase
-`--cores` to meet this reservation, or reduce `matching_threads`.
+Snakemake reserves matching workers plus loader and decoder helpers. With all
+helper limits at one, greedy reserves `max(2 * workers, workers + 3)` CPUs.
+Worker counts are never silently reduced.
 
 Each `datasets` entry has:
 
@@ -148,7 +122,7 @@ Each `datasets` entry has:
 | --- | --- |
 | `name` | Unique lowercase label with underscores, used in filenames. |
 | `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
-| `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. Replace the old `min_focal_region_size` config key rather than reusing its site-count values as kb. |
+| `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. |
 | `zarr_path` | Input VCZ store. |
 | `ts_path` | Optional truth tree sequence, used for explicit true-ancestor extraction, configured population joins and archive inclusion; otherwise `null`. |
 | `ancestral_state.field` | Array of ancestral allele strings. |
@@ -163,175 +137,53 @@ Each `datasets` entry has:
 | `population.csv_id_field` | CSV identifier column when `source: csv`, e.g. `sample_id`. Selected identifiers and labels must exist and be unique. |
 | `matching_cache_size` | Ancestor reader cache in MiB; `null` uses tsinfer's default. Both sample runners use bounded decoded slabs. |
 
-Coordinates remain absolute when selecting a region. Main products are:
-
-- `samples/{name}_samples_masked.zarr`: count-annotated sample copy. Annotation
-  counts selected columns one physical variant/sample tile at a time.
-- `configs/{name}_ancestor_inference.toml`: native inference/matching config.
-- `ancestors/{name}_inferred_ancestors.zarr` and `.trees`: panel and raw reference.
-- `matches/{name}_inferred_samples_raw.trees`: native full-HMM baseline.
-- `matches/af_{af_cutoff}/min_region_kb_{min_region_size_kb}/{name}_inferred_greedy_samples_raw.trees`: greedy stitched samples for each parameter pair.
-
-Each greedy tree stores the requested kb minimum and resolved site count in
-`ts.metadata["match_eval"]["min_region_size_kb"]` and
-`ts.metadata["match_eval"]["min_focal_region_size"]`, alongside AF and focal
-choice. Logs and greedy benchmark workload records also report the site count.
-
-For a parameter search, configure for example:
-
-```yaml
-datasets:
-  - name: example_dataset
-    af_cutoff: [0.01, 0.03, 0.05]
-    min_region_size_kb: [0, 50, 100, 200]
-    # Existing paths and metadata follow.
-```
-
-`performance: null` disables the benchmark target. Ordinary matching does not
-collect benchmark timings or memory samples.
+Products beneath `data_dir` include annotated `samples/`, native TOML in
+`configs/`, ancestor panels/references in `ancestors/`, and raw sample trees
+in `matches/`. Greedy outputs use
+`matches/af_{af_cutoff}/min_region_kb_{min_region_size_kb}/`.
+Their `match_eval` metadata records the requested minimum and resolved site count.
 
 ## Diagnostics
 
-With performance enabled, diagnostics reuses completed trial trees selected by
-`performance.diagnostics_run` (`mode`, `workers`, zero-based `repeat`). The suite
-must cover every diagnostic dataset and its settings with both methods. Missing
-coverage or trees raises an error. Diagnostics depends on suite completion and
-prepared inputs, and schedules no ordinary sample matching. With
-`performance: null`, it uses ordinary trees under `matches/`. Selected saved run
-specifications are recorded in the archive manifest. The ordinary `all` target
-always enumerates ordinary outputs independently of this selection.
-
-Ordinary matching writes raw trees only. Reconstruct focal masks and compare raw
-copying parents across the configured dataset/AF/minimum grid explicitly.
-Regenerate stitched trees before rebuilding masks or diagnostics with this policy:
-
 ```sh
-uv run snakemake --configfile configs/my_run.yaml diagnostics --cores all
+uv run snakemake diagnostics --configfile configs/my_run.yaml --cores all
 ```
 
-Install `pigz` on PATH and sync the Python dependencies (including `tszip`). The
-driver prepares shared copying-path indexes once, then uses spawn workers to decode
-bounded waves of physical sample chunks and analyse individual haplotypes. Exact
-extension, sorting, activated-support lookup and baseline support are shared across
-minimum sizes. It does
-not run HMM matching. Numerical/codec
-helpers are serial; tree compression and level-1 pigz run after analysis workers
-exit, within the granted CPU budget. An enabled `performance` suite is a required
-dependency and is included in full. `performance: null` schedules and includes no
-benchmarks, regardless of other experiments on disk. The archived `config.yaml`
-is the effective merged Snakemake configuration, including command-line overrides.
+Install `pigz` on PATH. Diagnostics reconstructs the same copying mask without
+running HMM matching, then compares saved paths. With `performance: null`, it
+uses ordinary matching outputs. Otherwise `performance.diagnostics_run` selects
+completed trial trees; every diagnostic dataset and setting must have both
+methods in the selected mode, worker count and repeat.
 
-Outputs under `{data_dir}/diagnostics/{config_name}/` are:
+Outputs beneath `diagnostics/{config_name}/` include `haplotype_results.csv`,
+`region_lengths.csv`, `run_summary.csv`, `sample_populations.csv`, shared site
+axes, effective configuration and a provenance manifest. Masks in `focal_masks/`
+contain canonical haplotype identities, ragged half-open site-index intervals,
+`is_gap`, domain bounds and matching parameters. Load NPZ files with
+`allow_pickle=False`. Site comparisons require parents in both paths; excluded
+inference intervals break switch adjacency.
 
-| File | Schema/content |
-| --- | --- |
-| `haplotype_results.csv` | Keys `dataset, af_cutoff, min_region_size_kb, source, sample_id, ploidy_index`; resolved integer `min_focal_region_size`; original `population`; domain/evaluated/excluded/unmatched site counts; full/stitched total and focal/gap/seam switches; disagreement counts, agreement percentages and `parents_identical`; focal/gap/unmatched bp spans and coverage percentages. |
-| `region_lengths.csv` | The same keys/population, mask `region_index`, `is_gap`, half-open site-index bounds, `num_sites`, clipped `left_bp`, `right_bp`, and `span_bp`. Regions split at excluded or unmatched physical intervals. |
-| `run_summary.csv` | One row per grid run: sample/haplotype and empty-region counts; per-haplotype metric `_mean`, `_sem`, `_count`; explicit `_undefined_count` for percentages/fractions. |
-| `sample_populations.csv` | Selected roster keyed by dataset/source/sample/ploidy, original population, and available `truth_node_id`, `truth_individual_id`, `population_id`. |
-| `{name}_sites.npz` | Shared `positions`, reference `inference_intervals`, clipped `analysis_intervals`, observed `analysis_start`/`analysis_end`, and `sequence_length` for interpreting matcher endpoints. |
-| `config.yaml`, `manifest.json` | Effective config, run/file map, cohort and population provenance, observed extents, and explicitly labelled diagnostics-time versions/revisions. |
+Archives contain selected trees compressed with TSZip, tables, masks, effective
+configuration, provenance and configured truth inputs. Use `tszip.decompress`
+to load archived tree sequences. Fresh matching or mask reconstruction requires
+the original input stores.
 
-Masks are ordinary NPZ files at
-`focal_masks/af_{af_cutoff}/min_region_kb_{min_region_size_kb}/{name}_focal_mask.npz`.
-Each contains canonical `source`, `sample_id`, `ploidy_index`, ragged `offsets`,
-flat `left_site_index`, `right_site_index`, `is_gap`, per-haplotype `domain_start`
-and `domain_end`, plus `num_sites`, `af_cutoff`, `min_region_size_kb`, the resolved
-`min_focal_region_size` and
-`focal_choice`. Bounds are half-open on the original inference-site axis;
-`is_gap=True` excludes focal coverage. Load NPZs with `allow_pickle=False`.
-
-Site comparisons include both observed endpoint sites and require a parent in
-both paths within the matched domain. Switches are adjacent valid parent changes,
-partitioned by the same focal mask; excluded inference intervals break adjacency.
-`num_extra_switches = stitched_switches - full_switches`;
-`switch_increase_percentage` divides by full switches, while
-`extra_switch_fraction` divides by stitched switches. Region agreement uses that
-region's evaluated site count. Undefined ratios are CSV `nan` (and counted in
-summaries); an unevaluated `parents_identical` is blank. Physical coverage uses
-the span between observed endpoint positions intersected with inference intervals,
-not chromosome length. Focal, gap and unmatched spans reconcile to that denominator.
-Summary means weight haplotypes equally; SEM describes haplotype variability and
-does not account for within-individual dependence.
-
-The final `{data_dir}/diagnostics/{config_name}_diagnostics.tar.gz` contains
-`config.yaml`, `manifest.json`, native `configs/`, `matches/`, raw reference
-`ancestors/`, optional `truth/`, `focal_masks/`, `diagnostics/`, and the configured
-`performance/` experiment. Trees are losslessly tszipped `.trees.tsz` copies;
-original raw outputs remain. The manifest maps source filenames to portable
-archive paths, deduplicating shared baselines/references/truth without merging
-benchmark trial identities. No Zarr stores or temporary mapped inputs are included.
-Use `tszip.decompress(path)` to load trees after extraction. The archive supports
-path, region, population and tree analysis without Zarr; regenerating exact masks
-or restoring omitted/non-inference sites for fresh dating requires original stores.
-
-## Performance
+## Performance and regional profiling
 
 ```sh
-uv run snakemake --configfile configs/my_run.yaml performance --cores 12
-# Or use already prepared references:
+uv run snakemake performance --configfile configs/my_run.yaml --cores all
+# Or measure already prepared references:
 uv run -m lib.benchmark suite configs/my_run.yaml --allocation 12
+# Replay a bounded selection of regional windows:
+uv run -m lib.profile_regions configs/my_run.yaml example_dataset data/regional_replay
 ```
 
-`configs/my_run.yaml` and `configs/my_run.yaml` compare
-one and four workers using the same prepared real reference and cohort.
-Their `data_dir` points to a separate chunk-aligned input copy. Replay actual
-padded windows with fresh and retained HMMs, checking scores, endpoint IDs and
-allele reconstruction:
-
-```sh
-uv run -m lib.profile_regions configs/my_run.yaml tgp_chr20_n100_1mbp data/performance/tsls_conditioned/regional_replay
-```
-
-`regional_profile.haplotypes` bounds the selected cohort for replay.
-`regional_profile.overlap_probe_sites` sets the width of two additional,
-explicitly labeled overlapping probes cut from a real gap. Outputs include
-requests, per-call timings/scores, rates/codebook/query arrays and a Python
-profile. A disposable instrumented tsls build can also supply native phase,
-traversal and allocation counters.
-
-Performance is opt-in and runs fresh trial processes sequentially. Each
-experiment directory must be empty. Output is under
-`data/performance/{experiment_id}/`: configuration and dependency/source
-manifest, `runs.csv`, `stages.csv`, optional `quality.json`, trial logs,
-process-tree memory samples and matched trees. Whole-trial memory includes
-validation; use `window_peak_private_bytes` for matching-memory comparisons.
-Validation timing is recorded separately, and completed matching measurements
-are retained if validation fails.
-Each performance dataset accepts scalar or list `af_cutoff` and requires scalar
-`min_region_size_kb`. Ordinary matching and diagnostics use each dataset's own
-Cartesian product. Both keys are required on datasets; top-level keys are rejected. Each greedy cutoff gets a separate trial; Full HMM runs
-once per dataset/mode/worker/repeat and supplies the baseline for all cutoffs.
-`runs.csv` records each greedy trial's AF and kb setting, plus its resolved
-`min_focal_region_size` in sites. AF and kb are blank for Full HMM trials.
-
-Worker counts are never silently reduced. Every dataset must have at least as
-many haplotypes as the largest requested worker count. The suite checks its CPU
-reservation against the process's effective CPU affinity on Linux. Its manifest
-records host CPU/memory information, allowed CPU/core/socket/NUMA topology and
-selected scheduler allocation and binding variables.
-
-For the 100, 1,000 and 10,000-individual simulated cohorts in
-`../tsinfer-anc-eval/config.yaml.matching`, `configs/my_run.yaml` measures greedy
-AF cutoffs 0.01 and 0.1 at 150 kb, plus one Full HMM baseline, at 32 workers
-(nine trials). Generate their inputs from the `tsinfer-anc-eval` directory:
-
-```sh
-uv run snakemake --configfile configs/my_run.yaml --configfile config.yaml.matching --cores 196 \
-    --resources mem_mb=950000 --until add_errors
-```
-
-Inside an exclusive 196-CPU allocation, set `TMPDIR` to node-local scratch, then
-run from this directory:
-
-```sh
-uv run snakemake --configfile configs/my_run.yaml performance --configfile configs/my_run.yaml --cores 196
-```
-
-This target prepares all references before starting sequential measurements.
-The ordinary default target can run matching jobs concurrently and should not
-be used for benchmark timings. Keep CPU binding, cache size, queue limits and
-storage policy fixed across cohorts; use a new experiment ID for each attempt.
+Performance is opt-in; `performance: null` disables it. References are prepared
+before fresh trial processes run sequentially. Each experiment directory must
+be new. Results under `data/performance/{experiment_id}/` contain manifests,
+matched trees, logs, workload/stage CSVs and memory observations.
+Benchmark datasets require a scalar minimum and may have multiple AF cutoffs.
+Full HMM runs once per dataset/mode/workers/repeat, shared across cutoffs.
 
 | Performance option | Meaning |
 | --- | --- |
@@ -345,118 +197,45 @@ storage policy fixed across cohorts; use a new experiment ID for each attempt.
 | `rss_sample_interval_s` | Launcher sampling interval in seconds for private process-tree memory. |
 | `trial_timeout_s` | Timeout in seconds; terminates the whole trial process group, including workers. |
 | `collect_haplotype_timings` | Default `false`; save task service times independently of regional stage timers. Available for both matching methods. |
-| `collect_stages` | Enable aggregate preparation, coordinator, loading, native gap matching and assembly timings. `false` retains workload counts without stage timers. Record one staged run at every new scale, including one million haplotypes; use whole `from_reference` windows for method-level comparisons. |
+| `collect_stages` | Enable aggregate preparation, coordinator, loading, native gap matching and assembly timings. `false` retains workload counts without stage timers. |
 | `diagnostics_run` | Explicit `mode`, `workers` and zero-based `repeat` selecting completed trees for diagnostics; must belong to the suite. Diagnostic coverage is checked only when diagnostics is requested. |
 | `quality_checks` | Exhaustive reference/sample metadata and called-allele reconstruction checks in the isolated trial, after the matching window. The trial timeout covers validation. |
 | `quality_max_matrix_mib` | Positive decoded validation-call matrix budget in MiB, batching whole samples within physical chunks. Must fit one sample. Excludes reference/output trees, one decoded source tile, remapping buffers and decoder scratch. Splitting a chunk may reread tiles. |
 | `resident_max_matrix_mib` | Maximum decoded sample matrix for resident trials. |
 | `resident_max_private_mib` | Maximum summed private process-tree memory for resident trials. |
 
-`from_reference` is the primary comparison: it times the deployed runner from
-existing ancestor trees through finished outputs, including startup, packing,
-loading, JIT cache loading/compilation, worker shutdown and output. Matching
-workers and the loader stop before edge squashing and output finalisation. Both
-methods use identical inputs, biological settings, CPU reservations and requested
-products.
+`regional_profile.haplotypes` bounds replay selection;
+`regional_profile.overlap_probe_sites` sets additional overlapping probe widths.
+Replay records windows, scores, matched alleles, rates, queries and a Python profile.
 
-Matching uses the tsinfer and tsls revisions pinned in `pyproject.toml`. Both
-use the same per-site allele codebook, including reversions. When updating
-either sibling repository, commit its changes, update the source revision,
-then run `uv lock` and `uv sync`.
+`from_reference` includes preparation, packing, sample loading, HMM/JIT setup,
+matching, shutdown and final output. `resident_match` preloads samples and
+excludes decoding/setup and final table writing; greedy still includes
+candidate discovery, covering, bridges, HMM matching and immediate assembly.
+Validation runs after the measured matching window.
 
-To recover a failed suite, reuse successful trials and retry failed ones with
-their original saved settings:
+Coordinator stages measure elapsed phase windows. Worker stages report summed
+service time and executing-thread CPU, which overlap coordinator time.
+`gap_matching_assembly` includes interval preparation, the regional batch and
+final assembly; do not add it to its children. `gap_calls` counts logical
+windows and `hmm_batches` counts native calls. Optional
+`haplotype_timings.csv` records identities, workers, call start/end offsets,
+service/CPU times and workload counts.
+
+Private process-tree memory is sampled separately from mapped-input capacity.
+Shared reference pages are not multiplied by worker count. Traceback allocator
+bytes measure that allocator alone. Sampling can miss short peaks; filesystem
+and Numba caches are reused.
+
+## Recovery
 
 ```sh
-uv run -m lib.benchmark resume data/performance/hpc_perf4 \
-    --allocation 196 --backup-dir data/performance/hpc_perf4_failed_trials
+uv run -m lib.benchmark resume data/performance/my_run \
+    --allocation 12 --backup-dir data/performance/my_run_failed_trials
 ```
 
-The backup directory must be new and outside the experiment. Recovery preserves
-failed trial files, records current code/input provenance, and rebuilds summary
-files and the completion marker only after quality checks pass. Successful
-trials keep their original trees and measurements. If Snakemake still marks the
-suite incomplete, clear metadata for its files before requesting diagnostics:
-
-```sh
-uv run snakemake --configfile configs/my_run.yaml --configfile data/performance/hpc_perf4/config.yaml --cleanup-metadata \
-    data/performance/hpc_perf4/{manifest.json,runs.csv,stages.csv,quality.json,complete.json}
-uv run snakemake --configfile configs/my_run.yaml diagnostics --configfile data/performance/hpc_perf4/config.yaml --cores 196
-```
-
-`resident_match` excludes input decoding and HMM/JIT setup. Greedy includes
-candidate discovery, exact extension, covering, gap matching and immediate
-assembly; final table sorting/writing is outside. Resident trials preload all
-sample slabs and therefore use the explicit matrix limit instead of the ordinary
-slab bound. Native resident HMM retains results until assembly. Historical
-resident greedy numbers excluded precomputed candidate/interval work and are
-not equal-work comparisons.
-
-Totals include process-tree CPU. Benchmark processes self-sample private USS;
-the launcher sums their snapshots and reports mapped-input capacity separately,
-avoiding multiplication of shared input pages by worker count. Sampling threads
-add measurement overhead and can miss short peaks. Filesystem
-caches are uncontrolled and the on-disk Numba cache is reused; fresh processes
-do not imply cold caches. Diagnostic worker service times overlap and must not
-be added to wall time. Performance improvements require measurement.
-
-With stages enabled, `coordinator_*` records elapsed startup, packing completion,
-worker readiness, matching/drain, result waiting and shutdown. First-slab and
-first-result latencies start at matching admission and end when the coordinator
-observes each event. Resident slabs are already loaded, so first-slab latency is
-zero and preload timing is separate. `assembly_output` measures coordinator append
-work. Worker records use their executing thread's CPU and summed service time;
-they overlap coordinator windows and are not additive to wall time.
-
-`gap_matching_assembly` is inclusive. Its children separate native `find_path`,
-path conversion, mutation extraction and final concatenation. Native call counts
-exclude one-site copying shortcuts. `parent_stage` and `inclusive` label totals
-and children in `stages.csv`; never add an inclusive total to its children or
-add overlapping latencies. Validation has its own window in each trial result
-and `validation_wall_s` in `runs.csv`, outside matching timings.
-
-Benchmark stage records include monotonic phase boundaries. Trial `result.json`
-contains worker traceback allocator sizes and the physical sample chunk
-shape, slab widths and temporary mapping location. Memory observers write to
-trial-owned scratch before copying timestamped histories into `memory_history/`.
-`memory_samples.csv` records USS, PSS where available, stale/missing observations
-and sample ages; `memory_summary.json` reports launcher and per-process
-observation gaps and whether each process history completed. Snapshot scratch
-uses `TMPDIR` independently of the mapped-input `temp_dir` setting.
-Mapped input capacity is separate from physical process memory. The shared
-tsls panel is built once; each worker keeps private HMM state. Reported
-`traceback_allocator_bytes` measures the HMM traceback allocator, not worker RAM.
-Nested service measurements must not be added to coordinator elapsed time.
-
-When enabled, each trial's `haplotype_timings.csv` contains one row per completed
-haplotype, ordered by `job_index`, and is included in the performance
-archive. Older archives have no such data. Columns are:
-
-| Fields | Meaning |
-| --- | --- |
-| `run_id`, `job_index` | Trial and canonical job; include the experiment ID when combining suites. |
-| `source`, `sample_id`, `ploidy_index` | Stable haplotype identity. |
-| `worker_index` | Matching thread identity within this trial. |
-| `match_start_s`, `match_end_s` | Monotonic offsets from the measured trial-window start (including preparation in `from_reference`). |
-| `match_wall_s`, `match_thread_cpu_s` | Elapsed and executing-thread CPU time inside the matching call. |
-| `domain_sites`, `focal_sites`, `gap_sites`, `gap_calls` | Existing per-haplotype workload counters. |
-
-The timed call includes domain/candidate detection, extension, cover, bridges,
-independent HMM gaps and owned output construction, including scheduling or page
-fault delays inside it. It excludes startup, decoding, queue wait, mapping
-open/close, result transfer, coordinator append and final output. For an
-individual service time, sum its two haplotype times; neither that sum nor their
-maximum is individual end-to-end latency. Run wall time divided by haplotype
-count measures throughput. Never add summed service times to run wall time.
-
-Sample epsilon is calibrated on selected source sites before singleton exclusion.
-Ancestor matching uses stock probabilities and the selected haploid cohort size;
-sample map and numerical overrides apply only to sample matching.
-
-Reference packing shares open genotypes and a writable mapped destination.
-Workers finish packing and setup before the bounded sample loader starts;
-sample loading then continues during matching.
-
-Residual-window preparation uses separate partition, one-site, coalescing and
-conditioning passes. Submit all windows of a haplotype in one native batch,
-resetting likelihoods independently, then clip and assemble paths once.
+Recovery reuses successful trials and retries failed ones with saved settings.
+The new backup directory must be outside the experiment. It preserves failed
+files and records current provenance before rebuilding summaries and completion
+markers. If Snakemake retains incomplete metadata, clear it for the saved suite
+files before requesting diagnostics with that suite's effective configuration.
