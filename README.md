@@ -13,11 +13,12 @@ The runner shares one immutable tsls panel and retains tree topology across
 independent regional calls.
 
 ```sh
-cp config.yaml.example config.yaml
+mkdir -p configs
+cp config.yaml.example configs/my_run.yaml
 # Set input paths and the options below.
 uv sync
-uv run snakemake --dry-run --cores all
-uv run snakemake --cores all
+uv run snakemake --configfile configs/my_run.yaml --dry-run --cores all
+uv run snakemake --configfile configs/my_run.yaml --cores all
 ```
 
 `af_cutoff` and `min_region_size_kb` accept a scalar or a list. The default
@@ -121,7 +122,7 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `helper_threads.zarr_threading_max_workers` | Zarr helper pool size per process; start with `1`. |
 | `helper_threads.blas_threads` | Numerical-library thread limit; start with `1`. Numba kernels are serial. |
 
-`config.yaml.greedy_smoke` uses `hmm.recombination: 0.01` and
+`configs/my_run.yaml` uses `hmm.recombination: 0.01` and
 `hmm.mismatch: 0.01` as convenient example probabilities, not fitted biological
 parameters. Both full-HMM and gap matching use the configured probabilities.
 Use fresh output directories and regenerate native TOML and prepared references
@@ -203,7 +204,7 @@ copying parents across the configured dataset/AF/minimum grid explicitly.
 Regenerate stitched trees before rebuilding masks or diagnostics with this policy:
 
 ```sh
-uv run snakemake diagnostics --cores all
+uv run snakemake --configfile configs/my_run.yaml diagnostics --cores all
 ```
 
 Install `pigz` on PATH and sync the Python dependencies (including `tszip`). The
@@ -265,19 +266,19 @@ or restoring omitted/non-inference sites for fresh dating requires original stor
 ## Performance
 
 ```sh
-uv run snakemake performance --cores 12
+uv run snakemake --configfile configs/my_run.yaml performance --cores 12
 # Or use already prepared references:
-uv run -m lib.benchmark suite config.yaml --allocation 12
+uv run -m lib.benchmark suite configs/my_run.yaml --allocation 12
 ```
 
-`config_tsls_conditioned.yaml` and `config_tsls_unconditioned.yaml` compare
+`configs/my_run.yaml` and `configs/my_run.yaml` compare
 one and four workers using the same prepared real reference and cohort.
 Their `data_dir` points to a separate chunk-aligned input copy. Replay actual
 padded windows with fresh and retained HMMs, checking scores, endpoint IDs and
 allele reconstruction:
 
 ```sh
-uv run -m lib.profile_regions config_tsls_conditioned.yaml tgp_chr20_n100_1mbp data/performance/tsls_conditioned/regional_replay
+uv run -m lib.profile_regions configs/my_run.yaml tgp_chr20_n100_1mbp data/performance/tsls_conditioned/regional_replay
 ```
 
 `regional_profile.haplotypes` bounds the selected cohort for replay.
@@ -309,12 +310,12 @@ records host CPU/memory information, allowed CPU/core/socket/NUMA topology and
 selected scheduler allocation and binding variables.
 
 For the 100, 1,000 and 10,000-individual simulated cohorts in
-`../tsinfer-anc-eval/config.yaml.matching`, `config.yaml.hpc_perf1` measures greedy
+`../tsinfer-anc-eval/config.yaml.matching`, `configs/my_run.yaml` measures greedy
 AF cutoffs 0.01 and 0.1 at 150 kb, plus one Full HMM baseline, at 32 workers
 (nine trials). Generate their inputs from the `tsinfer-anc-eval` directory:
 
 ```sh
-uv run snakemake --configfile config.yaml.matching --cores 196 \
+uv run snakemake --configfile configs/my_run.yaml --configfile config.yaml.matching --cores 196 \
     --resources mem_mb=950000 --until add_errors
 ```
 
@@ -322,7 +323,7 @@ Inside an exclusive 196-CPU allocation, set `TMPDIR` to node-local scratch, then
 run from this directory:
 
 ```sh
-uv run snakemake performance --configfile config.yaml.hpc_perf1 --cores 196
+uv run snakemake --configfile configs/my_run.yaml performance --configfile configs/my_run.yaml --cores 196
 ```
 
 This target prepares all references before starting sequential measurements.
@@ -376,9 +377,9 @@ trials keep their original trees and measurements. If Snakemake still marks the
 suite incomplete, clear metadata for its files before requesting diagnostics:
 
 ```sh
-uv run snakemake --configfile data/performance/hpc_perf4/config.yaml --cleanup-metadata \
+uv run snakemake --configfile configs/my_run.yaml --configfile data/performance/hpc_perf4/config.yaml --cleanup-metadata \
     data/performance/hpc_perf4/{manifest.json,runs.csv,stages.csv,quality.json,complete.json}
-uv run snakemake diagnostics --configfile data/performance/hpc_perf4/config.yaml --cores 196
+uv run snakemake --configfile configs/my_run.yaml diagnostics --configfile data/performance/hpc_perf4/config.yaml --cores 196
 ```
 
 `resident_match` excludes input decoding and HMM/JIT setup. Greedy includes

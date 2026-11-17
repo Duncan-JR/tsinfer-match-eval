@@ -40,3 +40,6 @@ target-version = "py312"
 
 [tool.ruff.lint]
 select = ["E", "F", "B", "W", "I", "N", "UP", "A", "PLC0415"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
