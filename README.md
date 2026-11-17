@@ -106,8 +106,10 @@ Paths are relative to the working directory; input paths, `data_dir`,
 | `condition_gaps` | Default `true`; condition residual greedy HMM gaps on adjacent copied parents. `false` removes conditioning and flanking observation padding. One-site-gap copying is unchanged. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.recombination_rate` | Alternative to `hmm.recombination`: a nonnegative rate per bp per generation, or a HapMap file path. tsinfer converts genetic distances between inference sites to probabilities using Haldane's map function. Choose exactly one recombination setting. |
-| `hmm.mismatch` | Mismatch probability for remaining HMM calls, strictly between 0 and 1. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
-| `hmm.likelihood_threshold` | Optional floor on normalized likelihoods; omitted/null retains the native default. |
+| `hmm.mismatch` | Sample mismatch probability, strictly between 0 and 1. Mutually exclusive with `hmm.mismatch_epsilon`. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
+| `hmm.mismatch_epsilon` | Alternative per-haploid-base epsilon. Resolve sample mismatch as `epsilon * mismatch_span_bp / selected_source_sites`, before singleton exclusion. |
+| `hmm.mismatch_span_bp` | Positive calibration span in bp, required with epsilon. Set explicitly for the simulated/selected interval rather than using whole-contig length. |
+| `hmm.likelihood_threshold` | Optional sample likelihood floor; omitted/null retains the native default. Zero disables flooring. |
 | `hmm.prune_threshold` | Optional Viterbi pruning cutoff; omitted/null uses zero (disabled). |
 | `hmm.relative_prune_threshold` | Optional relative pruning cutoff; omitted/null uses zero. All numerical settings pass through unchanged with gap conditioning. |
 | `ancestor_chunk_size` | Physical ancestor-column chunk size for explicit true-ancestor extraction only. |
@@ -446,3 +448,7 @@ open/close, result transfer, coordinator append and final output. For an
 individual service time, sum its two haplotype times; neither that sum nor their
 maximum is individual end-to-end latency. Run wall time divided by haplotype
 count measures throughput. Never add summed service times to run wall time.
+
+Sample epsilon is calibrated on selected source sites before singleton exclusion.
+Ancestor matching uses stock probabilities and the selected haploid cohort size;
+sample map and numerical overrides apply only to sample matching.

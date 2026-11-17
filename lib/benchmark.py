@@ -561,7 +561,10 @@ def _manifest(config, allocation):
             paths.config, paths.reference, pathlib.Path("unused.trees")
         )
         parameters = cfg.match.sources["samples"]
-        requested = config["hmm"]
+        requested = utils.sample_hmm_settings(
+            paths.samples, config["hmm"], dataset.get("include"),
+            dataset.get("exclude"), cfg.sources["samples"].samples,
+        )
         requested_rate = requested.get("recombination_rate")
         prepared_rate = parameters.recombination_rate
         if isinstance(requested_rate, (str, pathlib.Path)) and isinstance(
@@ -575,6 +578,7 @@ def _manifest(config, allocation):
         if (
             parameters.recombination != requested.get("recombination")
             or parameters.mismatch != requested["mismatch"]
+            or parameters.sample_size != requested["sample_size"]
             or not rate_matches
         ):
             raise ValueError("Prepared native configuration disagrees with hmm settings")

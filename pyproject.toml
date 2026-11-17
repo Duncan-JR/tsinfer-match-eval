@@ -23,10 +23,14 @@ dependencies = [
 
 [tool.uv]
 package = false
+# Override tsinfer's older transitive Git pin with the same TSLS as this runner.
+override-dependencies = [
+    "tsls @ git+file:///well/kelleher/users/uuc395/tsls@e4cf2333b99eb6b104ff44cbb34625f22a16e880",
+]
 
 [tool.uv.sources]
-tsinfer = { git = "file:///Users/duncan/work/tsinfer", rev = "e2f8de7c950179215ece27e1d31c7b096308b4c8" }
-tsls = { git = "file:///Users/duncan/work/tsls", rev = "c560b405761ae09625e266d39c2356ccc4b54b69" }
+tsinfer = { git = "file:///well/kelleher/users/uuc395/tsinfer", rev = "63837fd44b661714c774c3c5957904eea25d7210" }
+tsls = { git = "file:///well/kelleher/users/uuc395/tsls", rev = "e4cf2333b99eb6b104ff44cbb34625f22a16e880" }
 
 [dependency-groups]
 dev = [

@@ -101,6 +101,39 @@ def annotate_derived_counts(
     )
 
 
+def sample_hmm_settings(samples, hmm, include=None, exclude=None, selection=None):
+    """Resolve epsilon on source sites before singleton exclusion, and fixed n.
+
+    Epsilon is per haploid base; divide its expected count over the explicit
+    calibration span by the number of retained input variant sites. Both
+    sample matchers and ancestor matching use the selected haploid cohort size.
+    """
+    settings = {name: value for name, value in hmm.items() if value is not None}
+    store = tsinfer.vcz.open_store(samples)
+    columns = tsinfer.vcz.resolve_samples_selection(store, selection)
+    settings["sample_size"] = len(columns) * store["call_genotype"].shape[2]
+    epsilon = settings.pop("mismatch_epsilon", None)
+    span = settings.pop("mismatch_span_bp", None)
+    if epsilon is not None:
+        source = tsinfer.config.Source(
+            name="samples", path=samples, include=include, exclude=exclude,
+            samples=selection,
+        )
+        resolved = tsinfer.vcz.resolve_sources([source], None, None)
+        variants = tsinfer.vcz.select_source_variants(store, resolved.sources[0])
+        num_sites = len(variants.positions)
+        if num_sites == 0:
+            raise ValueError("Epsilon calibration requires retained input sites")
+        settings["mismatch"] = epsilon * span / num_sites
+        if not 0 < settings["mismatch"] < 1:
+            raise ValueError("Calibrated mismatch probability must be between 0 and 1")
+        logger.info(
+            "Sample epsilon=%g, span=%g bp, source sites=%d, mismatch=%g, n=%d",
+            epsilon, span, num_sites, settings["mismatch"], settings["sample_size"],
+        )
+    return settings
+
+
 def make_inference_config(
     samples: pathlib.Path,
     ancestors: pathlib.Path,
@@ -114,10 +147,11 @@ def make_inference_config(
     """Write native inference/matching TOML for the selected ancestor panel.
 
     Exclude selected-cohort singletons using the annotated derived counts.
+    Ancestor matching retains native stock probabilities and no map.
     Both sources stay in match.sources so ancestor matching obtains the full
     sample contig length. A true-panel configuration is for matching only.
     """
-    hmm = {name: value for name, value in hmm.items() if value is not None}
+    hmm = sample_hmm_settings(samples, hmm, include, exclude, sample_selection)
     rate = hmm.get("recombination_rate")
     if isinstance(rate, (str, pathlib.Path)):
         source_map = pathlib.Path(rate).expanduser()
@@ -170,7 +204,7 @@ def make_inference_config(
                 "ancestors": {
                     "node_flags": 0,
                     "create_individuals": False,
-                    **hmm,
+                    "sample_size": hmm["sample_size"],
                 },
                 "samples": {
                     "node_flags": 1,
@@ -306,8 +340,20 @@ def validate_config(config):
             raise ValueError(
                 "hmm.recombination_rate must be a nonnegative rate or map path"
             )
-    if not 0 < hmm["mismatch"] < 1:
+    mismatch = hmm.get("mismatch")
+    epsilon = hmm.get("mismatch_epsilon")
+    if (mismatch is None) == (epsilon is None):
+        raise ValueError("Choose exactly one of hmm.mismatch and hmm.mismatch_epsilon")
+    if mismatch is not None and not 0 < mismatch < 1:
         raise ValueError("hmm.mismatch must be between zero and one")
+    if epsilon is not None:
+        if not 0 < epsilon < 1:
+            raise ValueError("hmm.mismatch_epsilon must be between zero and one")
+        span = hmm.get("mismatch_span_bp")
+        if span is None or not np.isfinite(span) or span <= 0:
+            raise ValueError("hmm.mismatch_span_bp must be positive with epsilon")
+    elif hmm.get("mismatch_span_bp") is not None:
+        raise ValueError("hmm.mismatch_span_bp requires hmm.mismatch_epsilon")
     for name in (
         "blas_threads",
         "blosc_threads",

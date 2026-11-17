@@ -73,6 +73,12 @@ def tiny_config(tiny, smoke_config):
     shutil.copy2(
         tiny.reference, tiny.root / "ancestors" / f"{name}_inferred_ancestors.trees"
     )
+    (tiny.root / "samples" / f"{name}_samples_masked.zarr").symlink_to(
+        tiny.source, target_is_directory=True
+    )
+    (tiny.root / "ancestors" / f"{name}_inferred_ancestors.zarr").symlink_to(
+        tiny.panel, target_is_directory=True
+    )
     config = smoke_config
     config["data_dir"] = str(tiny.root)
     config["datasets"] = [

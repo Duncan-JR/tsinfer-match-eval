@@ -195,6 +195,7 @@ def make_hmm(model):
         model.panel,
         params.recombination,
         params.mismatch,
+        sample_size=params.sample_size,
         likelihood_threshold=params.likelihood_threshold,
         prune_threshold=params.prune_threshold,
         relative_prune_threshold=params.relative_prune_threshold,

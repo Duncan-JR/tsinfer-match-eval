@@ -81,15 +81,17 @@ def path_score(model, mapper, h, out, path, request):
     params = model.parameters
     rho = params.recombination[start:end]
     mu = params.mismatch[start:end]
-    transition = np.where(
-        switched, rho / model.panel.num_nodes, 1 - rho + rho / model.panel.num_nodes
-    )
+    sample_size = params.sample_size
+    if sample_size is None:
+        sample_size = model.panel.ts.num_samples
+    transition = np.where(switched, rho / sample_size, 1 - rho + rho / sample_size)
     if request.initial_state is not None:
         transition[0] = 1
     num_alleles = mapper.num_alleles_array()[start:end]
     observed = h[start:end]
-    matched = (observed < 0) | (observed == codes)
+    matched = observed == codes
     emission = np.where(matched, 1 - (num_alleles - 1) * mu, mu)
+    emission[observed < 0] = 1
     return float(np.sum(np.log(transition) + np.log(emission)))
 
 
