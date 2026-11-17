@@ -498,4 +498,32 @@ remains after completion.
   check using a source-tree import lacked installed distribution metadata;
   it passed after installing the final Git pin. No production fallback was added.
 - Commit 8 includes this record and concise generic usage/configuration docs.
-  Commit 9 and final pipeline integration validation remain pending.
+  Generic benchmark, regional-profile and Snakemake help commands passed.
+- Commit 8 (tsinfer-match-eval): bacb4012a1786f77a9d759ab3f6c06d958562008 — Document the matching workflow.
+- Commit 9: this final commit — Exclude focal regions touching zero
+  recombination blocks. The read-only prefix belongs to the prepared matching
+  model/worker, never ExactState. Matching and diagnostics explicitly filter
+  whole touching unions after minimum filtering, then guard actual one-site
+  candidates. Profiling uses the matching orchestration.
+- Final known answers passed for the initial sentinel, a touching union
+  extending into a plateau, entirely zero maps, terminal blocks and one-site
+  pieces introduced by inference boundaries or called-domain bounds.
+  A HapMap plateau converted through actual HMM probabilities marked the
+  expected incident sites. Conditioned and unconditioned matching agreed with
+  reconstructed diagnostic masks. Native partial writes, invalid-allele errors
+  and reuse after failed calls also passed bounded checks.
+- Final pipeline suite: 55 passed (existing Zarr v3 consolidated-metadata warnings
+  only). Final native suite: 688 passed. Pipeline Ruff lint and format checks
+  passed; relevant native formatting/lint and all Git whitespace checks passed.
+  Check artifacts and exit statuses are in the execution scratch directory;
+  final_checks_retry.exit and check5.exit are both zero.
+- Final audit: all nine planned commits are complete; no new permanent tests,
+  exploratory modules, benchmark runs or scientific diagnostics were added.
+  All original tracked changes were assigned as specified, including the
+  discarded TSLS mathematical-model addition and TSInfer packaging overrides.
+  TSInfer remains clean at 63837fd44b661714c774c3c5957904eea25d7210.
+  Final native dependencies use committed local Git sources, with a consistent
+  TSLS override; unrelated package versions equal the saved baseline.
+  Snakefile, repository instructions and config.yaml.example are unchanged.
+  Personal configurations, checkpoints, sample lists, logs and scratch files
+  were not modified by this execution. No blockers remain and nothing was pushed.

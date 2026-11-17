@@ -50,6 +50,25 @@ def make_state(catalog, packed=None):
     )
 
 
+def zero_recombination_prefix(recombination):
+    """Index sites incident to a zero-rate transition, excluding the r[0] sentinel.
+
+    A copied component touching either endpoint of such a transition must become
+    part of an HMM gap. Its conditioned endpoints then lie outside the complete
+    zero-rate block, where switching remains possible.
+    See :func:`filter_zero_recombination`.
+    """
+    zero = recombination[1:] == 0
+    incident = np.zeros(len(recombination), dtype=bool)
+    incident[:-1] |= zero
+    incident[1:] |= zero
+    prefix = np.empty(len(recombination) + 1, dtype=np.int32)
+    prefix[0] = 0
+    np.cumsum(incident, out=prefix[1:])
+    prefix.flags.writeable = False
+    return prefix
+
+
 def candidates(haplotype, state, start, end):
     """Prepare activated supports and exact intervals once for all minima."""
     catalog = state.catalog
@@ -84,6 +103,37 @@ def cover(state, order, minimum):
         state.run_right,
         state.run_ids,
     )
+
+
+def filter_zero_recombination(state, count, zero_prefix):
+    """Remove whole touching focal unions incident to zero-rate transitions."""
+    return remove_zero_recombination_components(
+        state.run_left, state.run_right, state.run_ids, count, zero_prefix
+    )
+
+
+@numba.njit(cache=True, nogil=True)
+def remove_zero_recombination_components(left, right, ids, count, zero_prefix):
+    """Compact touching components in place, removing any incident zero-rate site.
+
+    Remove the whole component, including runs extending into a zero-rate block
+    from outside. Removing only wholly flat regions can leave incompatible pins
+    or fixed switches inside the same block.
+    """
+    written = 0
+    first = 0
+    while first < count:
+        stop = first + 1
+        while stop < count and left[stop] == right[stop - 1]:
+            stop += 1
+        if zero_prefix[right[stop - 1]] == zero_prefix[left[first]]:
+            for index in range(first, stop):
+                left[written] = left[index]
+                right[written] = right[index]
+                ids[written] = ids[index]
+                written += 1
+        first = stop
+    return written
 
 
 @numba.njit(cache=True, nogil=True)
@@ -259,7 +309,7 @@ def _partition_intervals(run_left, run_right, run_ids, count, start, end, bounda
     return (left[:n], right[:n], ancestor[:n], left_neighbour[:n], right_neighbour[:n])
 
 
-def resolve_one_site_gaps(state, partition, haplotype):
+def resolve_one_site_gaps(state, partition, haplotype, zero_prefix):
     """Copy supported one-site gaps using their original neighbours."""
     catalog = state.catalog
     corrections, sites = _resolve_one_site_gaps(
@@ -275,6 +325,7 @@ def resolve_one_site_gaps(state, partition, haplotype):
         state.prefix_best,
         state.packed,
         haplotype,
+        zero_prefix,
     )
     return OneSiteCopies(corrections, sites)
 
@@ -293,6 +344,7 @@ def _resolve_one_site_gaps(
     prefix_best,
     packed,
     haplotype,
+    zero_prefix,
 ):
     corrections = np.empty(len(left), dtype=np.int64)
     num_corrections = 0
@@ -301,6 +353,10 @@ def _resolve_one_site_gaps(
         if ancestor[j] >= 0 or right[j] - left[j] != 1:
             continue
         site = left[j]
+        # Boundaries or the called domain can split a zero-rate block into
+        # one-site pieces. These remain HMM gaps after whole-union filtering.
+        if zero_prefix[site + 1] != zero_prefix[site]:
+            continue
         chosen = -1
         for candidate in (left_neighbour[j], right_neighbour[j]):
             if candidate >= 0 and starts[candidate] <= site < stops[candidate]:

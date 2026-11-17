@@ -290,11 +290,12 @@ class MaskRuns:
     end: int
 
 
-def mask_runs(state, order, minimum, start, end, boundaries, haplotype):
+def mask_runs(state, order, minimum, start, end, boundaries, haplotype, zero_prefix):
     """Coalesce the same copying/HMM decisions used by stitched matching."""
     count = greedy.cover(state, order, minimum)
+    count = greedy.filter_zero_recombination(state, count, zero_prefix)
     partition = greedy.partition_intervals(state, count, start, end, boundaries)
-    greedy.resolve_one_site_gaps(state, partition, haplotype)
+    greedy.resolve_one_site_gaps(state, partition, haplotype, zero_prefix)
     intervals = greedy.coalesce_copied(partition)
     is_gap = intervals.ancestor < 0
     first = np.ones(len(is_gap), dtype=bool)
@@ -686,6 +687,7 @@ class WorkerData:
     samples: haplotypes.SampleInput
     directory: pathlib.Path
     exact: greedy.ExactState
+    zero_recombination_prefix: np.ndarray
     axis: SiteAxis
     boundaries: np.ndarray
     labels: list[dict]
@@ -726,6 +728,7 @@ def _initialise_worker(
     full_index,
     stitched_indexes,
     catalog,
+    zero_prefix,
     labels,
     runs,
     helpers,
@@ -734,10 +737,12 @@ def _initialise_worker(
     _serial_helpers(helpers)
     boundary_sites = np.searchsorted(axis.positions, axis.inference_intervals.ravel())
     boundaries = np.unique(boundary_sites)
+    zero_prefix.flags.writeable = False
     _worker = WorkerData(
         samples,
         directory,
         greedy.make_state(catalog),
+        zero_prefix,
         axis,
         boundaries,
         labels,
@@ -771,7 +776,14 @@ def _analyse_haplotype(task):
         for run in state.runs:
             minimum = run.min_focal_region_size
             mask = mask_runs(
-                state.exact, order, minimum, start, end, state.boundaries, haplotype
+                state.exact,
+                order,
+                minimum,
+                start,
+                end,
+                state.boundaries,
+                haplotype,
+                state.zero_recombination_prefix,
             )
             stitched_path = state.stitched[run.min_region_size_kb][index]
             stitched = stitched_path.parents_at_sites(state.axis.positions)
@@ -1219,6 +1231,10 @@ def run(config, workers):
         cfg = matching._sample_config(inputs.config, inputs.reference, full_path)
         reference = tskit.load(inputs.reference)
         axis = SiteAxis.from_reference(reference)
+        parameters = tsinfer.matching.hmm_parameters(
+            cfg.match.sources["samples"], axis.positions
+        )
+        zero_prefix = greedy.zero_recombination_prefix(parameters.recombination)
         for item in products.runs:
             if item.dataset == dataset["name"]:
                 item.min_focal_region_size = utils.min_region_size_sites(
@@ -1328,6 +1344,7 @@ def run(config, workers):
                             full_index,
                             stitched_indexes,
                             catalog,
+                            zero_prefix,
                             labels,
                             runs,
                             config["helper_threads"],

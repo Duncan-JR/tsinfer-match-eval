@@ -159,6 +159,7 @@ class MatchingModel:
     parameters: tsinfer.matching.HmmParameters
     positions: np.ndarray
     boundaries: np.ndarray
+    zero_recombination_prefix: np.ndarray
 
 
 def prepare_model(reference, allele_mapper, parameters):
@@ -169,7 +170,8 @@ def prepare_model(reference, allele_mapper, parameters):
     boundaries = np.unique(np.searchsorted(positions, intervals.ravel()))
     panel = tsls.TreeSequence(reference, alleles=allele_mapper.forward_map())
     rates = tsinfer.matching.hmm_parameters(parameters, positions)
-    return MatchingModel(panel, rates, positions, boundaries)
+    zero_prefix = greedy.zero_recombination_prefix(rates.recombination)
+    return MatchingModel(panel, rates, positions, boundaries, zero_prefix)
 
 
 def numerical_settings(parameters):
@@ -210,6 +212,7 @@ class Worker:
     positions: np.ndarray
     sequence_length: float
     boundaries: np.ndarray
+    zero_recombination_prefix: np.ndarray
     matcher: tsls.Hmm
     match_out: np.ndarray
     numerical_settings: dict
@@ -223,6 +226,7 @@ def make_worker(model, catalog=None, packed=None):
         model.positions,
         model.panel.ts.sequence_length,
         model.boundaries,
+        model.zero_recombination_prefix,
         make_hmm(model),
         np.empty(len(model.positions), dtype=np.int8),
         numerical_settings(model.parameters),
@@ -231,10 +235,13 @@ def make_worker(model, catalog=None, packed=None):
         dummy = np.full(len(model.positions), -1, dtype=np.int8)
         dummy.flags.writeable = False
         order = greedy.candidates(dummy, exact, 0, len(dummy))
-        greedy.cover(exact, order, 1)
+        count = greedy.cover(exact, order, 1)
+        greedy.filter_zero_recombination(exact, count, worker.zero_recombination_prefix)
         catalog = exact.catalog
         partition = greedy.partition_intervals(exact, 0, 0, 0, worker.boundaries)
-        bridges = greedy.resolve_one_site_gaps(exact, partition, dummy)
+        bridges = greedy.resolve_one_site_gaps(
+            exact, partition, dummy, worker.zero_recombination_prefix
+        )
         intervals = greedy.coalesce_copied(partition)
         residual = greedy.residual_windows(
             intervals, catalog.parents, worker.boundaries, True
@@ -373,7 +380,8 @@ def match_stitched_haplotype(
 ):
     """Match one complete canonical haplotype against a prepared reference.
 
-    Filter exact components by size, then copy supported one-site gaps.
+    Filter exact unions by size and zero-rate transitions, then resolve
+    supported one-site gaps outside zero-rate blocks.
     Correct called bridge disagreements
     with sample mutations. Optionally condition residual HMM gaps on adjacent
     copied parents; disabling this also removes flanking observation padding.
@@ -386,6 +394,9 @@ def match_stitched_haplotype(
     with performance.measure(collector, "candidate_extension_cover", "thread"):
         order = greedy.candidates(haplotype, state, start, end)
         count = greedy.cover(state, order, minimum)
+        count = greedy.filter_zero_recombination(
+            state, count, worker.zero_recombination_prefix
+        )
     catalog = state.catalog
     with performance.measure(
         collector, "gap_matching_assembly", "thread", inclusive=True
@@ -399,7 +410,9 @@ def match_stitched_haplotype(
             partition = greedy.partition_intervals(
                 state, count, start, end, worker.boundaries
             )
-            bridges = greedy.resolve_one_site_gaps(state, partition, haplotype)
+            bridges = greedy.resolve_one_site_gaps(
+                state, partition, haplotype, worker.zero_recombination_prefix
+            )
             intervals = greedy.coalesce_copied(partition)
             residual = greedy.residual_windows(
                 intervals, catalog.parents, worker.boundaries, condition_gaps

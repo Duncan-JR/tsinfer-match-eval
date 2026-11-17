@@ -40,16 +40,22 @@ VCZ arrays must have consistent variant chunks.
    Stable-sort intervals and greedily take the furthest reach. Equal reaches
    keep the first ancestor in stable panel order. Apply the minimum to whole
    touching focal unions, so short intervals can bridge retained unions.
+   Then remove every whole touching focal union containing a site adjacent to
+   a real zero-recombination transition, including unions extending into a flat
+   block. Use exact zeros in the actual HMM probabilities and leave the map
+   unchanged; the artificial first probability is excluded.
 6. Partition copied spans and gaps within the domain and inference boundaries.
-   Resolve supported one-site gaps separately: prefer the original left
-   neighbour, then the original right neighbour, then the activated ancestor
+   Resolve supported one-site gaps outside zero-rate blocks separately: prefer
+   the original left neighbour, then the original right neighbour, then the
+   activated ancestor
    with furthest support end in stable support-start order. An unsupported
    fallback leaves an HMM gap. Correct called disagreements with mutations;
-   missing observations need no correction.
+   missing observations need no correction. Zero-rate one-site pieces created
+   by inference boundaries or the called domain remain HMM gaps.
 7. Merge compatible copied spans and construct residual windows. Condition on
    adjacent copied parents with one flanking observation per available anchor.
-   Inference boundaries prevent padding. `condition_gaps: false` removes pins
-   and padding while retaining one-site copying.
+   Inference boundaries prevent padding; anchors stay outside zero-rate blocks.
+   `condition_gaps: false` removes pins and padding while retaining one-site copying.
 8. Match all residual windows of one haplotype in one native batch, with
    independent likelihood resets. Clip paths to true gaps and assemble paths
    and mutations once. Append results, squash edges, sort and finalise output.

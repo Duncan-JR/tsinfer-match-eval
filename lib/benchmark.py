@@ -562,8 +562,11 @@ def _manifest(config, allocation):
         )
         parameters = cfg.match.sources["samples"]
         requested = utils.sample_hmm_settings(
-            paths.samples, config["hmm"], dataset.get("include"),
-            dataset.get("exclude"), cfg.sources["samples"].samples,
+            paths.samples,
+            config["hmm"],
+            dataset.get("include"),
+            dataset.get("exclude"),
+            cfg.sources["samples"].samples,
         )
         requested_rate = requested.get("recombination_rate")
         prepared_rate = parameters.recombination_rate
