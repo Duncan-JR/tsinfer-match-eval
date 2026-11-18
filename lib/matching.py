@@ -4,6 +4,7 @@ import collections
 import concurrent.futures as cf
 import contextlib
 import dataclasses
+import functools
 import json
 import logging
 import pathlib
@@ -121,7 +122,7 @@ class RegionMatch:
 
 @dataclasses.dataclass
 class ActiveSlab:
-    """Coordinator-owned descriptor and unappended result count."""
+    """Coordinator-owned slab and unappended result count."""
 
     slab: haplotypes.SampleSlab
     remaining: int
@@ -143,9 +144,9 @@ class HaplotypeResult:
 
 @dataclasses.dataclass
 class HaplotypeTask:
-    """One complete row in a slab; no decoded calls travel through queues."""
+    """A reference to one complete haplotype in a slab."""
 
-    slab: haplotypes.MappedCalls
+    slab: haplotypes.MappedCalls | np.ndarray
     row: int
     job_index: int
     chunk: int
@@ -521,9 +522,9 @@ def _worker_main(
             task = work.get()
             if task is None:
                 break
-            calls = task.slab.open()
+            calls = task.slab.open() if full_hmm else task.slab
+            row = calls[task.row]
             try:
-                row = calls[task.row]
                 collector = (
                     performance.Collector(stages=diagnostics) if collect else None
                 )
@@ -560,10 +561,14 @@ def _worker_main(
                     collector.diagnostics["traceback_allocator_bytes"] = (
                         worker.matcher.total_memory
                     )
-                del row
             finally:
-                haplotypes.close_mapping(calls)
-            events.put(("result", (task.chunk, result)))
+                del row
+                if full_hmm:
+                    haplotypes.close_mapping(calls)
+                del calls
+            chunk = task.chunk
+            del task
+            events.put(("result", (chunk, result)))
     except Exception:
         events.put(("error", traceback.format_exc()))
 
@@ -595,19 +600,16 @@ def _pack_reference(work, events, chunks, cap, collector):
             pending -= 1
 
 
-def _load_samples(inputs, directory, slots, stopping, events, sample_reader_threads):
+def _load_samples(chunks, load_chunk, slots, stopping, events):
     """Publish complete slabs; a slot covers loading, waiting and worker use."""
     try:
-        for chunk in inputs.chunks:
+        for chunk in chunks:
             slots.acquire()
             if stopping.is_set():
                 return
-            slab = haplotypes.load_sample_chunk(
-                inputs, chunk, directory, sample_reader_threads
-            )
-            if stopping.is_set():
-                return
+            slab = load_chunk(chunk)
             events.put(("slab", slab))
+            del slab
     except Exception:
         events.put(("error", traceback.format_exc()))
 
@@ -655,12 +657,13 @@ def _coordinate(
     cap,
     slots,
     collector,
+    live,
     resident_slabs,
     admitted,
+    full_hmm,
 ):
     """Drain events and refill continuously; pending includes unappended results."""
     ready = collections.deque()
-    live = {}
     next_row = 0
     pending = 0
     completed = 0
@@ -682,6 +685,7 @@ def _coordinate(
                 for slab in resident_slabs
             }
         )
+        resident_slabs.clear()
     while completed < len(jobs):
         while pending < cap and len(ready) > 0:
             slab = ready[0]
@@ -692,6 +696,7 @@ def _coordinate(
             if next_row == len(slab.job_indices):
                 ready.popleft()
                 next_row = 0
+            del slab
         with performance.measure(
             collector,
             "coordinator_result_wait",
@@ -722,6 +727,7 @@ def _coordinate(
                             service_s=slab.load_s,
                         )
                     )
+            del slab, payload
         elif kind == "result":
             if first_result and admitted is not None:
                 collector.elapsed(
@@ -768,7 +774,9 @@ def _coordinate(
             live[chunk].remaining -= 1
             if live[chunk].remaining == 0:
                 active = live.pop(chunk)
-                active.slab.calls.path.unlink()
+                if full_hmm:
+                    active.slab.calls.path.unlink()
+                del active
                 if resident_slabs is None:
                     slots.release()
             del result
@@ -798,9 +806,9 @@ def match_stitched_samples(
     """Share one immutable tsls panel and stream bounded whole-haplotype jobs.
 
     One persistent thread pool handles packing and matching; a loader owns
-    bounded sample Zarr reader threads. Outstanding
-    jobs and live decoded slabs have separate bounds. Temporary inputs are
-    removed only after the loader and workers stop. Returns the actual worker count.
+    bounded sample Zarr reader threads. Outstanding jobs and live decoded slabs
+    have separate bounds. On failure, the coordinator stops the loader and
+    workers before releasing their inputs. Returns the actual worker count.
 
     Diagnostic resident runs preload all slabs and initialise workers before
     ``window``; the benchmark limits their total size. Normal end-to-end timing
@@ -873,6 +881,8 @@ def match_stitched_samples(
     catalog = None
     panel_genotypes = None
     loader = None
+    live = {}
+    resident_slabs = None
     diagnostics = collector is not None and collector.stages
     if temp_dir is not None:
         temp_dir.mkdir(parents=True, exist_ok=True)
@@ -909,13 +919,14 @@ def match_stitched_samples(
                 )
                 live_count = len(slab_sizes) if resident else sample_prefetch_chunks
                 packed_bytes = 0 if catalog is None else catalog.packed.shape[0]
+                slab_bytes = sum(slab_sizes[:live_count])
                 collector.count(
-                    mapped_input_bound_bytes=sum(slab_sizes[:live_count]),
+                    mapped_input_bound_bytes=slab_bytes if full_hmm else 0,
                     packed_calls=packed_bytes,
                     eligible_ancestors=0 if catalog is None else len(catalog.seeds),
                 )
                 if not full_hmm:
-                    collector.count(resident_input_bound_bytes=packed_bytes)
+                    collector.count(resident_input_bound_bytes=packed_bytes + slab_bytes)
                 collector.diagnostics.update(
                     sample_chunk_shape=samples.chunk_shape,
                     haplotypes_per_slab=[
@@ -972,17 +983,24 @@ def match_stitched_samples(
                     _, measurements = _event(events)
                     if collector is not None:
                         collector.merge(measurements)
-            resident_slabs = None
+            if full_hmm:
+                load_chunk = functools.partial(
+                    haplotypes.load_sample_chunk,
+                    samples,
+                    directory=directory,
+                    sample_reader_threads=sample_reader_threads,
+                )
+            else:
+                load_chunk = functools.partial(
+                    haplotypes.load_resident_sample_chunk,
+                    samples,
+                    sample_reader_threads=sample_reader_threads,
+                )
             if resident:
                 with performance.measure(
                     collector, "resident_sample_preload", "coordinator"
                 ):
-                    resident_slabs = [
-                        haplotypes.load_sample_chunk(
-                            samples, chunk, directory, sample_reader_threads
-                        )
-                        for chunk in samples.chunks
-                    ]
+                    resident_slabs = [load_chunk(chunk) for chunk in samples.chunks]
                 if collector is not None:
                     collector.count(
                         sample_blocks_read=sum(
@@ -992,14 +1010,7 @@ def match_stitched_samples(
             else:
                 loader = threading.Thread(
                     target=_load_samples,
-                    args=(
-                        samples,
-                        directory,
-                        slots,
-                        stopping,
-                        events,
-                        sample_reader_threads,
-                    ),
+                    args=(samples.chunks, load_chunk, slots, stopping, events),
                 )
                 loader.start()
             with window if window is not None else contextlib.nullcontext():
@@ -1021,8 +1032,10 @@ def match_stitched_samples(
                         max_pending_haplotypes,
                         slots,
                         collector,
+                        live,
                         resident_slabs,
                         admitted,
+                        full_hmm,
                     )
         finally:
             with performance.measure(collector, "coordinator_shutdown", "coordinator"):
@@ -1043,7 +1056,8 @@ def match_stitched_samples(
                     executor.shutdown(wait=True)
                 for future in futures:
                     future.result()
-                del packed, model, catalog, cfg
+                live.clear()
+                del resident_slabs, packed, model, catalog, cfg
         with performance.measure(collector, "finalise_output"):
             tables.edges.squash()
             ts = tsinfer.matching.finalise_match_tables(tables)

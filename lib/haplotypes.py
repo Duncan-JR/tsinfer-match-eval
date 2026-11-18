@@ -92,7 +92,7 @@ class SampleSlab:
     """Published only when complete; rows are contiguous complete haplotypes."""
 
     chunk: int
-    calls: MappedCalls
+    calls: MappedCalls | np.ndarray
     job_indices: np.ndarray
     blocks_read: int
     load_s: float
@@ -188,37 +188,53 @@ def _load_variant_block(genotypes, inputs, chunk, block, slab):
     return genotypes.cdata_shape[2]
 
 
-def load_sample_chunk(inputs, chunk, directory, sample_reader_threads=1):
-    """Read each physical tile once; publish only after every block finishes."""
-    started = time.perf_counter()
+def _fill_sample_chunk(inputs, chunk, slab, sample_reader_threads):
+    """Decode each required physical tile once into disjoint slab columns."""
     store = tsinfer.vcz.open_store(inputs.path)
     genotypes = store["call_genotype"]
+    blocks_read = 0
+    if sample_reader_threads == 1:
+        for block in inputs.blocks:
+            blocks_read += _load_variant_block(genotypes, inputs, chunk, block, slab)
+    else:
+        blocks = iter(inputs.blocks)
+        with cf.ThreadPoolExecutor(max_workers=sample_reader_threads) as executor:
+            while batch := list(itertools.islice(blocks, sample_reader_threads)):
+                futures = [
+                    executor.submit(
+                        _load_variant_block, genotypes, inputs, chunk, block, slab
+                    )
+                    for block in batch
+                ]
+                for future in futures:
+                    blocks_read += future.result()
+    return blocks_read
+
+
+def load_sample_chunk(inputs, chunk, directory, sample_reader_threads=1):
+    """Decode a complete sample slab into a temporary mapping."""
+    started = time.perf_counter()
     descriptor = MappedCalls(
         directory / f"samples_{chunk.block}.bin",
         (len(chunk.job_indices), inputs.num_sites),
     )
     slab = descriptor.open("w+")
-    blocks_read = 0
     try:
-        if sample_reader_threads == 1:
-            for block in inputs.blocks:
-                blocks_read += _load_variant_block(genotypes, inputs, chunk, block, slab)
-        else:
-            blocks = iter(inputs.blocks)
-            with cf.ThreadPoolExecutor(max_workers=sample_reader_threads) as executor:
-                while batch := list(itertools.islice(blocks, sample_reader_threads)):
-                    futures = [
-                        executor.submit(
-                            _load_variant_block, genotypes, inputs, chunk, block, slab
-                        )
-                        for block in batch
-                    ]
-                    for future in futures:
-                        blocks_read += future.result()
+        blocks_read = _fill_sample_chunk(inputs, chunk, slab, sample_reader_threads)
     finally:
         close_mapping(slab)
     elapsed = time.perf_counter() - started
     return SampleSlab(chunk.block, descriptor, chunk.job_indices, blocks_read, elapsed)
+
+
+def load_resident_sample_chunk(inputs, chunk, sample_reader_threads=1):
+    """Decode and publish one read-only, sample-major array for greedy workers."""
+    started = time.perf_counter()
+    slab = np.empty((len(chunk.job_indices), inputs.num_sites), dtype=np.int8)
+    blocks_read = _fill_sample_chunk(inputs, chunk, slab, sample_reader_threads)
+    slab.flags.writeable = False
+    elapsed = time.perf_counter() - started
+    return SampleSlab(chunk.block, slab, chunk.job_indices, blocks_read, elapsed)
 
 
 def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, directory):

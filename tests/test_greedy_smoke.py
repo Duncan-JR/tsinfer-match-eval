@@ -7,6 +7,7 @@ import csv
 import dataclasses
 import json
 import multiprocessing as mp
+import weakref
 
 import numpy as np
 import pytest
@@ -141,7 +142,7 @@ class TestQualityBatches:
         spec = folder / "trial.json"
         spec.write_text(json.dumps({"config": tiny_config, "run": run}))
 
-        def fail(*args):
+        def fail(*args, **kwargs):
             raise ValueError("altered called allele")
 
         monkeypatch.setattr(benchmark, "quality_check", fail)
@@ -573,10 +574,12 @@ class TestMatchingLifetime:
             message = "not called and derived"
         elif failure in ["loader", "worker"]:
 
-            def fail(*args):
+            def fail(*args, **kwargs):
                 raise RuntimeError(f"{failure} failure")
 
-            target = "load_sample_chunk" if failure == "loader" else "make_worker"
+            target = (
+                "load_resident_sample_chunk" if failure == "loader" else "make_worker"
+            )
             module = haplotypes if failure == "loader" else matching
             monkeypatch.setattr(module, target, fail)
             message = f"{failure} failure"
@@ -611,22 +614,33 @@ class TestMatchingLifetime:
         assert not list(tiny.root.glob("greedy_*"))
 
     def test_resident_window_ends_before_shutdown(
-        self, tiny, tiny_config, lifetime_records
+        self, tiny, tiny_config, lifetime_records, monkeypatch
     ):
         boundaries = []
+        slabs = []
+        load = haplotypes.load_resident_sample_chunk
+
+        def load_slab(*args, **kwargs):
+            slab = load(*args, **kwargs)
+            slabs.append(weakref.ref(slab.calls))
+            return slab
+
+        monkeypatch.setattr(haplotypes, "load_resident_sample_chunk", load_slab)
 
         @contextlib.contextmanager
         def window():
             assert all(
                 thread.is_alive() for thread in lifetime_records["matching_threads"]
             )
-            assert list(tiny.root.glob("greedy_*/samples_*.bin"))
+            assert len(slabs) == 3
+            assert all(not slab().flags.writeable for slab in slabs)
+            assert not list(tiny.root.glob("greedy_*/*.bin"))
             boundaries.append("start")
             yield
             assert all(
                 thread.is_alive() for thread in lifetime_records["matching_threads"]
             )
-            assert not list(tiny.root.glob("greedy_*/samples_*.bin"))
+            assert all(slab() is None for slab in slabs)
             boundaries.append("end")
 
         matching.match_stitched_samples(

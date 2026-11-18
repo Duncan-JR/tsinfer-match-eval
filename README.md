@@ -228,9 +228,10 @@ windows and `hmm_batches` counts native calls. Optional
 `haplotype_timings.csv` records identities, workers, call start/end offsets,
 service/CPU times and workload counts.
 
-Greedy workers share one packed ancestor reference in memory. Process-based
-diagnostics use a mapped file for the packed reference. Private process-tree
-memory is sampled separately from mapped- and resident-input capacities. Traceback allocator
+Greedy workers share a packed ancestor reference and decoded sample slabs in
+memory. Full HMM sample slabs and process-based diagnostics use mapped files.
+Private process-tree memory is sampled separately from mapped- and resident-input
+capacities. Traceback allocator
 bytes measure that allocator alone. Sampling can miss short peaks; filesystem
 and Numba caches are reused.
 

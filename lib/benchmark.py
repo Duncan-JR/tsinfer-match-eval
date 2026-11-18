@@ -634,9 +634,10 @@ def _manifest(config, allocation):
             "included. Not comparable to historical precomputed-interval numbers."
         ),
         "memory": (
-            "Sampled sum of private process-tree USS; mapped input capacity "
-            "reported separately. Shared mappings are not multiplied by worker "
-            "count; samples can miss short peaks. Whole-trial peaks include validation; "
+            "Sampled sum of private process-tree USS. Mapped and resident input "
+            "capacities are reported separately and counted once across workers. "
+            "Memory samples can miss short peaks. "
+            "Whole-trial peaks include validation; "
             "matching comparisons use window_peak_private_bytes. The quality matrix "
             "budget excludes trees, one physical source tile and decoder scratch."
         ),
