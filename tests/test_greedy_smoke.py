@@ -379,7 +379,7 @@ class TestReferencePacking:
 
         monkeypatch.setattr(block_type, "__getitem__", read)
         monkeypatch.setattr(haplotypes.np, "searchsorted", searchsorted)
-        packed = catalog.packed.open("r+")
+        packed = catalog.packed.open("w+")
         try:
             actual_blocks = sum(
                 haplotypes.pack_reference_chunk(array, catalog, chunk, packed)
@@ -405,7 +405,7 @@ class TestReferencePacking:
         )
         panel = zarr.open_group(tiny.panel, mode="a", use_consolidated=False)
         panel["call_genotype"][catalog.seeds[0], catalog.columns[0], 0] = 0
-        packed = catalog.packed.open("r+")
+        packed = catalog.packed.open("w+")
         try:
             with pytest.raises(ValueError, match="not called and derived"):
                 haplotypes.pack_reference_chunk(
@@ -423,6 +423,7 @@ class TestReferencePacking:
             catalog = haplotypes.prepare_reference(
                 tiny.panel, samples, reference, 1, "left", directory
             )
+            haplotypes.close_mapping(catalog.packed.open("w+"))
             chunks = haplotypes.reference_chunks(tiny.panel, catalog)
             tasks = [(tiny.panel, catalog, chunk) for chunk in chunks]
             with cf.ProcessPoolExecutor(
@@ -658,7 +659,7 @@ class TestConditionedGaps:
             tiny.panel, samples, reference, 1, "left", tmp_path
         )
         genotypes = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
-        packed = catalog.packed.open("r+")
+        packed = catalog.packed.open("w+")
         try:
             for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
                 haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)
@@ -917,7 +918,7 @@ class TestStageTimings:
             tiny.panel, samples, reference, 1, "left", tmp_path
         )
         genotypes = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
-        packed = catalog.packed.open("r+")
+        packed = catalog.packed.open("w+")
         try:
             for chunk in haplotypes.reference_chunks(tiny.panel, catalog):
                 haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)

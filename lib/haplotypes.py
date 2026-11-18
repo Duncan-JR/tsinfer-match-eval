@@ -224,7 +224,7 @@ def load_sample_chunk(inputs, chunk, directory, sample_reader_threads=1):
 def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, directory):
     """Select by cohort-derived seed AF and clip supports before any extension.
 
-    Genotypes are packed by :func:`pack_reference_chunk` in the persistent pool.
+    The caller owns storage for :func:`pack_reference_chunk`.
     A shared seed does not collapse distinct panel ancestors.
     """
     panel = tsinfer.vcz.open_store(panel_path)
@@ -283,8 +283,6 @@ def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, di
     offsets = np.zeros(len(columns), dtype=np.int64)
     offsets[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
     descriptor = MappedCalls(directory / "ancestors.bin", (int(lengths.sum()),))
-    packed = descriptor.open("w+")
-    close_mapping(packed)
     parents = np.asarray([nodes[ids[col]] for col in columns], dtype=np.int32)
     catalog = ReferenceCatalog(
         parents, columns, seeds, starts, stops, offsets, descriptor

@@ -1315,7 +1315,7 @@ def run(config, workers):
                     chunks = haplotypes.reference_chunks(
                         native.ancestors[0].path, catalog
                     )
-                    packed = catalog.packed.open("r+")
+                    packed = catalog.packed.open("w+")
                     try:
                         pack = functools.partial(
                             haplotypes.pack_reference_chunk,

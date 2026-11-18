@@ -898,7 +898,7 @@ def match_stitched_samples(
                     chunks = haplotypes.reference_chunks(panel_path, catalog)
                     panel = tsinfer.vcz.open_store(panel_path)
                     panel_genotypes = panel["call_genotype"]
-                    packed = catalog.packed.open("r+")
+                    packed = np.empty(catalog.packed.shape, dtype=np.int8)
             if collector is not None:
                 slab_sizes = sorted(
                     [
@@ -910,10 +910,12 @@ def match_stitched_samples(
                 live_count = len(slab_sizes) if resident else sample_prefetch_chunks
                 packed_bytes = 0 if catalog is None else catalog.packed.shape[0]
                 collector.count(
-                    mapped_input_bound_bytes=packed_bytes + sum(slab_sizes[:live_count]),
+                    mapped_input_bound_bytes=sum(slab_sizes[:live_count]),
                     packed_calls=packed_bytes,
                     eligible_ancestors=0 if catalog is None else len(catalog.seeds),
                 )
+                if not full_hmm:
+                    collector.count(resident_input_bound_bytes=packed_bytes)
                 collector.diagnostics.update(
                     sample_chunk_shape=samples.chunk_shape,
                     haplotypes_per_slab=[
@@ -1041,9 +1043,7 @@ def match_stitched_samples(
                     executor.shutdown(wait=True)
                 for future in futures:
                     future.result()
-                if packed is not None:
-                    haplotypes.close_mapping(packed)
-                del model, catalog, cfg
+                del packed, model, catalog, cfg
         with performance.measure(collector, "finalise_output"):
             tables.edges.squash()
             ts = tsinfer.matching.finalise_match_tables(tables)

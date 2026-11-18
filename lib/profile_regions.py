@@ -231,45 +231,42 @@ def run(config_path, dataset_name, output):
         )
         panel = tsinfer.vcz.open_store(paths.ancestors)
         genotypes = panel["call_genotype"]
-        packed = catalog.packed.open("r+")
-        try:
-            for chunk in haplotypes.reference_chunks(paths.ancestors, catalog):
-                haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)
-            packed.flags.writeable = False
-            worker = matching.make_worker(model, catalog, packed)
-            recorder = RecordingMatcher(worker.matcher)
-            worker.matcher = recorder
-            limit = config["regional_profile"]["haplotypes"]
-            for chunk in samples.chunks:
-                slab = haplotypes.load_sample_chunk(samples, chunk, directory)
-                calls = slab.calls.open()
-                try:
-                    for row, job_index in enumerate(slab.job_indices):
-                        if len(queries) >= limit:
-                            break
-                        job_index = int(job_index)
-                        h = calls[row].copy()
-                        h.flags.writeable = False
-                        queries[job_index] = h
-                        recorder.job_index = job_index
-                        profiler.enable()
-                        matching.match_stitched_haplotype(
-                            job_index,
-                            h,
-                            worker,
-                            minimum,
-                            collector,
-                            condition_gaps=config["condition_gaps"],
-                        )
-                        profiler.disable()
-                finally:
-                    haplotypes.close_mapping(calls)
-                slab.calls.path.unlink()
-                if len(queries) >= limit:
-                    break
-        finally:
-            del worker
-            haplotypes.close_mapping(packed)
+        packed = np.empty(catalog.packed.shape, dtype=np.int8)
+        for chunk in haplotypes.reference_chunks(paths.ancestors, catalog):
+            haplotypes.pack_reference_chunk(genotypes, catalog, chunk, packed)
+        packed.flags.writeable = False
+        worker = matching.make_worker(model, catalog, packed)
+        recorder = RecordingMatcher(worker.matcher)
+        worker.matcher = recorder
+        limit = config["regional_profile"]["haplotypes"]
+        for chunk in samples.chunks:
+            slab = haplotypes.load_sample_chunk(samples, chunk, directory)
+            calls = slab.calls.open()
+            try:
+                for row, job_index in enumerate(slab.job_indices):
+                    if len(queries) >= limit:
+                        break
+                    job_index = int(job_index)
+                    h = calls[row].copy()
+                    h.flags.writeable = False
+                    queries[job_index] = h
+                    recorder.job_index = job_index
+                    profiler.enable()
+                    matching.match_stitched_haplotype(
+                        job_index,
+                        h,
+                        worker,
+                        minimum,
+                        collector,
+                        condition_gaps=config["condition_gaps"],
+                    )
+                    profiler.disable()
+            finally:
+                haplotypes.close_mapping(calls)
+            slab.calls.path.unlink()
+            if len(queries) >= limit:
+                break
+        del worker, packed
     requests = recorder.requests
     if not requests:
         raise ValueError("Selected haplotypes have no residual HMM windows")
