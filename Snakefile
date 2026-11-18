@@ -55,8 +55,13 @@ wildcard_constraints:
 
 
 inventory = diagnostics.inventory(config)
-full_outputs = inventory.full
-stitched_outputs = [run.stitched for run in inventory.runs]
+diagnostic_outputs = [
+    [run.mask for run in inventory.runs],
+    inventory.tables,
+    inventory.sites,
+    inventory.directory / "config.yaml",
+    inventory.directory / "manifest.json",
+]
 performance_outputs = (
     benchmark.final_products(config) if config.get("performance") is not None else []
 )
@@ -64,13 +69,12 @@ performance_outputs = (
 
 rule all:
     input:
-        full_outputs,
-        stitched_outputs,
+        diagnostic_outputs,
 
 
 rule diagnostics:
     input:
-        inventory.archive,
+        diagnostic_outputs,
 
 
 rule make_diagnostics:
@@ -82,12 +86,7 @@ rule make_diagnostics:
         configs=expand(data_dir / "configs" / "{name}_ancestor_inference.toml", name=names),
         population=lambda wildcards: diagnostics.population_sources(config),
     output:
-        archive=inventory.archive,
-        masks=[run.mask for run in inventory.runs],
-        tables=inventory.tables,
-        sites=inventory.sites,
-        snapshot=inventory.directory / "config.yaml",
-        manifest=inventory.directory / "manifest.json",
+        diagnostic_outputs,
     params:
         effective_config=config,
     threads: config["inference_threads"]

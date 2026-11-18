@@ -81,7 +81,7 @@ Ordinary matching runs their Cartesian product and shares one full-HMM baseline.
 
 | Option | Meaning |
 | --- | --- |
-| `config_name` | Lowercase experiment label using letters, digits and underscores. Distinct names keep diagnostic tables and archives separate. |
+| `config_name` | Lowercase experiment label using letters, digits and underscores. Distinct names keep diagnostic tables and manifests separate. |
 | `data_dir` | Ordinary output root. Use a separate directory for each biological configuration. |
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
@@ -130,7 +130,7 @@ Each `datasets` entry has:
 | `af_cutoff` | Inclusive maximum selected-cohort derived AF at the seed, between `0` and `1`; a scalar or nonempty list of distinct values. Missing calls do not enter the denominator. |
 | `min_region_size_kb` | Finite nonnegative number or nonempty list of distinct values; requested minimum connected focal-region size in kb. Converted to a rounded mean inference-site count over the first-to-last reference-site span, with a minimum of one site. `0` keeps all regions. |
 | `zarr_path` | Input VCZ store. |
-| `ts_path` | Optional truth tree sequence, used for explicit true-ancestor extraction, configured population joins and archive inclusion; otherwise `null`. |
+| `ts_path` | Optional truth tree sequence, used for explicit true-ancestor extraction, configured population joins and diagnostic provenance; otherwise `null`. |
 | `ancestral_state.field` | Array of ancestral allele strings. |
 | `ancestral_state.is_reference` | Alternative to `field`: `true` treats REF as ancestral. |
 | `include` | Optional native site filter, e.g. `'POS >= 1000000 & POS < 11000000'`. |
@@ -155,7 +155,7 @@ Their `match_eval` metadata records the requested minimum and resolved site coun
 uv run snakemake diagnostics --configfile configs/my_run.yaml --cores all
 ```
 
-Install `pigz` on PATH. Diagnostics reconstructs the same copying mask without
+The default target includes diagnostics. Diagnostics reconstructs the same copying mask without
 running HMM matching, then compares saved paths. With `performance: null`, it
 uses ordinary matching outputs. Otherwise `performance.diagnostics_run` selects
 completed trial trees; every diagnostic dataset and setting must have both
@@ -169,10 +169,7 @@ contain canonical haplotype identities, ragged half-open site-index intervals,
 `allow_pickle=False`. Site comparisons require parents in both paths; excluded
 inference intervals break switch adjacency.
 
-Archives contain selected trees compressed with TSZip, tables, masks, effective
-configuration, provenance and configured truth inputs. Use `tszip.decompress`
-to load archived tree sequences. Fresh matching or mask reconstruction requires
-the original input stores.
+The manifest records the original paths of the trees, tables and other inputs.
 
 ## Performance and regional profiling
 

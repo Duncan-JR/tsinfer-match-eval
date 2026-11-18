@@ -1,4 +1,4 @@
-"""Reconstruct greedy copying masks, compare raw paths and package one experiment.
+"""Reconstruct greedy copying masks, compare raw paths for one experiment.
 
 Matching never calls this module. The driver uses the native roster and packed
 reference helpers; workers reconstruct copying decisions and analyse raw paths.
@@ -15,10 +15,7 @@ import logging
 import multiprocessing as mp
 import os
 import pathlib
-import shutil
-import subprocess
 import sys
-import tarfile
 import tempfile
 import time
 
@@ -26,7 +23,6 @@ import numpy as np
 import pandas as pd
 import tsinfer
 import tskit
-import tszip
 import yaml
 
 from . import benchmark, greedy, haplotypes, matching, utils
@@ -54,14 +50,13 @@ class Inventory:
     full: list[pathlib.Path]
     runs: list[Run]
     directory: pathlib.Path
-    archive: pathlib.Path
     tables: list[pathlib.Path]
     sites: list[pathlib.Path]
     full_benchmark_runs: dict = dataclasses.field(default_factory=dict)
 
 
 def inventory(config):
-    """Use the same normalised grid in the DAG, analysis and archive manifest."""
+    """Use the same normalised grid in the DAG, analysis and provenance manifest."""
     root = pathlib.Path(config["data_dir"]).expanduser()
     directory = root / "diagnostics" / config["config_name"]
     full = []
@@ -94,8 +89,7 @@ def inventory(config):
             "sample_populations",
         )
     ]
-    archive = root / "diagnostics" / f"{config['config_name']}_diagnostics.tar.gz"
-    return Inventory(full, runs, directory, archive, tables, sites)
+    return Inventory(full, runs, directory, tables, sites)
 
 
 def matching_inputs(config, products):
@@ -122,17 +116,6 @@ def resolve_benchmark_outputs(config, products):
         )
         run.stitched = outputs[key].tree
         run.benchmark_run = outputs[key].run
-
-
-def _tree_archive_path(config, path):
-    if config.get("performance") is not None:
-        relative = path.relative_to(benchmark.output_directory(config))
-        return (
-            pathlib.Path("performance")
-            / config["performance"]["experiment_id"]
-            / relative
-        ).as_posix()
-    return path.relative_to(pathlib.Path(config["data_dir"]).expanduser()).as_posix()
 
 
 def population_sources(config):
@@ -909,21 +892,11 @@ def _write_rows(path, rows, fields, append=False):
         writer.writerows(rows)
 
 
-@dataclasses.dataclass
-class ArchiveFile:
-    """One unique source and its portable destination, before tree compression."""
-
-    source: pathlib.Path
-    archive: str
-    tree: bool
-
-
 def _versions():
     versions = {}
     for name in (
         "tsinfer",
         "tskit",
-        "tszip",
         "numpy",
         "numba",
         "zarr",
@@ -981,32 +954,15 @@ def _performance_files(config):
     return sorted(paths)
 
 
-def _archive_manifest(config, products, datasets, workers):
-    """Deduplicate paths, retaining distinct benchmark trial identities."""
-    files = {}
-    destinations = set()
+def _write_manifest(config, products, datasets, workers, performance_files):
+    """Record provenance and the paths of files in their original locations."""
 
-    def add(source, destination, tree=False):
-        source = source.expanduser().resolve()
-        if source in files:
-            return files[source].archive
-        if not source.is_file():
-            raise FileNotFoundError(source)
-        if tree:
-            destination += ".tsz"
-        if destination in destinations:
-            raise ValueError(f"Archive destination collision: {destination}")
-        destinations.add(destination)
-        files[source] = ArchiveFile(source, destination, tree)
-        return destination
+    def file_path(path):
+        return str(path.expanduser().resolve(strict=True))
 
     snapshot = products.directory / "config.yaml"
     manifest_path = products.directory / "manifest.json"
-    add(snapshot, "config.yaml")
-    # The manifest itself is added after it is written, below.
-    table_map = {
-        path.stem: add(path, f"diagnostics/{path.name}") for path in products.tables
-    }
+    table_map = {path.stem: file_path(path) for path in products.tables}
     dataset_map = []
     for dataset, information, full_path in zip(
         config["datasets"], datasets, products.full, strict=True
@@ -1015,15 +971,11 @@ def _archive_manifest(config, products, datasets, workers):
         inputs = benchmark.prepared_inputs(config, dataset)
         entry = {
             "name": name,
-            "native_config": add(inputs.config, f"configs/{inputs.config.name}"),
-            "reference": add(
-                inputs.reference, f"ancestors/{inputs.reference.name}", True
-            ),
-            "full_hmm": add(full_path, _tree_archive_path(config, full_path), True),
+            "native_config": file_path(inputs.config),
+            "reference": file_path(inputs.reference),
+            "full_hmm": file_path(full_path),
             "full_hmm_benchmark_run": products.full_benchmark_runs.get(name),
-            "sites": add(
-                products.directory / f"{name}_sites.npz", f"diagnostics/{name}_sites.npz"
-            ),
+            "sites": file_path(products.directory / f"{name}_sites.npz"),
             "population_provenance": dataset["population"],
             **information,
             "runs": [],
@@ -1032,43 +984,27 @@ def _archive_manifest(config, products, datasets, workers):
         rate = native.match.sources["samples"].recombination_rate
         if isinstance(rate, (str, pathlib.Path)):
             map_path = pathlib.Path(rate)
-            entry["recombination_map"] = add(map_path, f"configs/{map_path.name}")
+            entry["recombination_map"] = file_path(map_path)
         truth = dataset.get("ts_path")
         entry["truth"] = None
         if truth is not None:
-            entry["truth"] = add(pathlib.Path(truth), f"truth/{name}.trees", True)
+            entry["truth"] = file_path(pathlib.Path(truth))
         for run in products.runs:
             if run.dataset == name:
-                relative_mask = run.mask.relative_to(
-                    pathlib.Path(config["data_dir"]).expanduser()
-                )
                 entry["runs"].append(
                     {
                         "af_cutoff": run.af_cutoff,
                         "min_region_size_kb": run.min_region_size_kb,
                         "min_focal_region_size": run.min_focal_region_size,
-                        "stitched": add(
-                            run.stitched, _tree_archive_path(config, run.stitched), True
-                        ),
+                        "stitched": file_path(run.stitched),
                         "benchmark_run": run.benchmark_run,
-                        "mask": add(run.mask, relative_mask.as_posix()),
+                        "mask": file_path(run.mask),
                     }
                 )
         dataset_map.append(entry)
-    performance_files = []
-    for path in _performance_files(config):
-        relative = path.relative_to(benchmark.output_directory(config))
-        destination = (
-            pathlib.Path("performance")
-            / config["performance"]["experiment_id"]
-            / relative
-        )
-        performance_files.append(
-            add(path, destination.as_posix(), path.suffix == ".trees")
-        )
     manifest = {
         "config_name": config["config_name"],
-        "config": "config.yaml",
+        "config": file_path(snapshot),
         "diagnostics_time_utc": datetime.datetime.now(datetime.UTC).isoformat(),
         "diagnostics_time_versions": _versions(),
         "diagnostics_time_execution": {
@@ -1081,136 +1017,20 @@ def _archive_manifest(config, products, datasets, workers):
         ),
         "datasets": dataset_map,
         "tables": table_map,
-        "performance": performance_files,
+        "performance": [file_path(path) for path in performance_files],
         "sem_scope": (
             "Haplotype variability with equal weights; within-individual dependence "
             "is not accounted for."
         ),
-        "files": [],
     }
-    # Include the self mapping without depending on a previously existing manifest.
-    files[manifest_path.resolve()] = ArchiveFile(
-        manifest_path.resolve(), "manifest.json", False
-    )
-    manifest["files"] = [
-        {"source": str(item.source), "archive": item.archive, "tree": item.tree}
-        for item in files.values()
-    ]
     manifest_path.write_text(json.dumps(manifest, indent=2) + "\n")
-    return list(files.values())
-
-
-def _compress_tree(task):
-    source, destination = task
-    destination.parent.mkdir(parents=True, exist_ok=True)
-    ts = tskit.load(source)
-    tszip.compress(ts, destination)
-
-
-def package_archive(files, archive, workers, helpers):
-    """Stage unique tszipped trees, then stream tar through level-1 pigz."""
-    started = time.perf_counter()
-    pigz = shutil.which("pigz")
-    if pigz is None:
-        raise RuntimeError(
-            "Diagnostics requires pigz on PATH (compression uses level 1)"
-        )
-    archive.parent.mkdir(parents=True, exist_ok=True)
-    temporary = archive.with_name(f".{archive.name}.tmp")
-    try:
-        with tempfile.TemporaryDirectory(prefix="diagnostics_tsz_") as staging:
-            staging = pathlib.Path(staging)
-            trees = [
-                (item.source, staging / item.archive) for item in files if item.tree
-            ]
-            logger.info(
-                "Compressing %d unique trees with tszip using up to %d workers",
-                len(trees),
-                workers,
-            )
-            with cf.ProcessPoolExecutor(
-                max_workers=workers,
-                mp_context=mp.get_context("spawn"),
-                initializer=_serial_helpers,
-                initargs=(helpers,),
-            ) as pool:
-                futures = {
-                    pool.submit(_compress_tree, task): task[1].relative_to(staging)
-                    for task in trees
-                }
-                completed = 0
-                for future in cf.as_completed(futures):
-                    future.result()
-                    completed += 1
-                    logger.info(
-                        "Tree compression %d/%d complete: %s",
-                        completed,
-                        len(trees),
-                        futures[future],
-                    )
-            logger.info(
-                "Tree compression complete; streaming %d files through pigz "
-                "(%d threads, level 1) into %s",
-                len(files),
-                workers,
-                archive,
-            )
-            with temporary.open("wb") as output, tempfile.TemporaryFile() as errors:
-                with subprocess.Popen(
-                    [pigz, "-p", str(workers), "-1"],
-                    stdin=subprocess.PIPE,
-                    stdout=output,
-                    stderr=errors,
-                ) as compressor:
-                    pipe_error = None
-                    try:
-                        with tarfile.open(fileobj=compressor.stdin, mode="w|") as tar:
-                            for index, item in enumerate(files, start=1):
-                                source = (
-                                    staging / item.archive if item.tree else item.source
-                                )
-                                logger.info(
-                                    "Archiving file %d/%d: %s (%d bytes)",
-                                    index,
-                                    len(files),
-                                    item.archive,
-                                    source.stat().st_size,
-                                )
-                                tar.add(source, arcname=item.archive, recursive=False)
-                    except BrokenPipeError as error:
-                        pipe_error = error
-                    finally:
-                        try:
-                            compressor.stdin.close()
-                        except BrokenPipeError as error:
-                            pipe_error = error
-                    logger.info("Tar stream written; waiting for pigz to finish")
-                    status = compressor.wait()
-                    if status != 0:
-                        errors.seek(0)
-                        message = errors.read().decode()
-                        raise RuntimeError(f"pigz exited {status}: {message}")
-                    if pipe_error is not None:
-                        raise pipe_error
-            logger.info("Tar/pigz finished; removing staged tszip files")
-        temporary.replace(archive)
-        logger.info(
-            "Archive complete: %s (%d bytes), compression/packaging took %.1fs",
-            archive,
-            archive.stat().st_size,
-            time.perf_counter() - started,
-        )
-    finally:
-        temporary.unlink(missing_ok=True)
 
 
 def run(config, workers):
-    """Produce the configured grid and archive after all workflow inputs exist."""
+    """Produce the diagnostic tables, masks and provenance after all workflow inputs exist."""
     utils.validate_config(config)
-    if shutil.which("pigz") is None:
-        raise RuntimeError("Diagnostics requires pigz on PATH")
     population_sources(config)
-    _performance_files(config)
+    performance_files = _performance_files(config)
     products = inventory(config)
     resolve_benchmark_outputs(config, products)
     products.directory.mkdir(parents=True, exist_ok=True)
@@ -1446,12 +1266,4 @@ def run(config, workers):
         "population_id",
     ]
     _write_rows(products.tables[3], population_rows, population_fields)
-    packaging_started = time.perf_counter()
-    files = _archive_manifest(config, products, manifest_datasets, workers)
-    package_archive(files, products.archive, workers, config["helper_threads"])
-    logger.info(
-        "Diagnostic archive compression/packaging: %.3fs; wrote %s",
-        time.perf_counter() - packaging_started,
-        products.archive,
-    )
-    return products.archive
+    _write_manifest(config, products, manifest_datasets, workers, performance_files)
