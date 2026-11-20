@@ -1091,7 +1091,8 @@ def run(config, workers):
             full_index = prepare_paths(
                 full_path, reference, identities, dataset_directory / "full"
             )
-            for af in utils.parameter_values(dataset["af_cutoff"]):
+            af_cutoffs = utils.parameter_values(dataset["af_cutoff"])
+            for af in af_cutoffs:
                 runs = [
                     item
                     for item in products.runs
@@ -1128,6 +1129,7 @@ def run(config, workers):
                         af,
                         config.get("focal_choice", "left"),
                         workers,
+                        af_cutoffs=af_cutoffs,
                     )
                     results = {
                         item.min_region_size_kb: [None] * len(jobs) for item in runs

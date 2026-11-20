@@ -40,6 +40,10 @@ def panel_config(wildcards):
     return data_dir / "configs" / f"{wildcards.name}_{suffix}.toml"
 
 
+def focal_cutoffs(wildcards):
+    return utils.parameter_values(datasets[wildcards.name]["af_cutoff"])
+
+
 def greedy_input(wildcards, path):
     utils.validate_parameter_pair(
         datasets[wildcards.name], float(wildcards.af_cutoff),
@@ -236,15 +240,17 @@ rule prepare_focal_ancestors:
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",
     output:
-        directory(data_dir / "ancestors" / "focal" / f"{{name}}_inferred_ancestors_{focal_choice}_{{focal_af}}"),
+        directory(data_dir / "ancestors" / "focal" / f"{{name}}_inferred_ancestors_{focal_choice}_{{focal_group}}"),
+    params:
+        cutoffs=focal_cutoffs,
     threads: config["matching_threads"]
     log:
-        progress_dir / "prepare_focal_ancestors" / "{name}_{focal_af}.log",
+        progress_dir / "prepare_focal_ancestors" / "{name}_{focal_group}.log",
     run:
         utils.setup_log(pathlib.Path(log[0]))
         matching.prepare_focal_ancestors(
             pathlib.Path(input.config), pathlib.Path(input.reference),
-            float(wildcards.focal_af), focal_choice, threads,
+            params.cutoffs, focal_choice, threads,
         )
 
 
@@ -253,7 +259,7 @@ rule match_stitched_samples:
         reference=lambda wildcards: greedy_input(wildcards, str(data_dir / "ancestors" / "{name}_inferred_ancestors.trees")),
         focal=lambda wildcards: haplotypes.focal_directory(
             data_dir / "ancestors" / f"{wildcards.name}_inferred_ancestors.trees",
-            focal_choice, float(wildcards.af_cutoff),
+            focal_choice, focal_cutoffs(wildcards),
         ),
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
@@ -262,6 +268,7 @@ rule match_stitched_samples:
         trees=greedy_dir / "{name}_inferred_greedy_samples_raw.trees",
     params:
         af_cutoff=lambda wildcards: float(wildcards.af_cutoff),
+        af_cutoffs=focal_cutoffs,
         min_region_size_kb=lambda wildcards: float(wildcards.min_region_size_kb),
         focal_choice=focal_choice,
         condition_gaps=config.get("condition_gaps", True),
@@ -281,7 +288,8 @@ rule match_stitched_samples:
             raise ValueError(f"Greedy matching needs {required} CPUs including helpers; got {threads}")
         matching.match_stitched_samples(
             pathlib.Path(input.config), pathlib.Path(input.reference), pathlib.Path(output.trees),
-            af_cutoff=params.af_cutoff, min_region_size_kb=params.min_region_size_kb,
+            af_cutoff=params.af_cutoff, af_cutoffs=params.af_cutoffs,
+            min_region_size_kb=params.min_region_size_kb,
             focal_choice=params.focal_choice, workers=params.workers,
             condition_gaps=params.condition_gaps,
             sample_prefetch_chunks=params.sample_prefetch_chunks,

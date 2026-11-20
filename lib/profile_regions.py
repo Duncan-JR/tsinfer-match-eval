@@ -211,9 +211,9 @@ def run(config_path, dataset_name, output):
     model = matching.prepare_model(
         reference, samples.allele_mapper, cfg.match.sources["samples"]
     )
-    minimum = utils.min_region_size_sites(
-        reference.sites_position, dataset["min_region_size_kb"]
-    )
+    af_cutoffs = utils.parameter_values(dataset["af_cutoff"])
+    minimum_kb = utils.parameter_values(dataset["min_region_size_kb"])[0]
+    minimum = utils.min_region_size_sites(reference.sites_position, minimum_kb)
     output.mkdir(parents=True, exist_ok=True)
     queries = {}
     collector = performance.Collector()
@@ -225,9 +225,10 @@ def run(config_path, dataset_name, output):
             samples.path,
             paths.reference,
             reference,
-            dataset["af_cutoff"],
+            af_cutoffs[0],
             config.get("focal_choice", "left"),
             config["matching_threads"],
+            af_cutoffs=af_cutoffs,
         )
         packed = catalog.read_packed()
         worker = matching.make_worker(model, catalog, packed)
@@ -282,6 +283,8 @@ def run(config_path, dataset_name, output):
     result = {
         "config": config,
         "dataset": dataset_name,
+        "af_cutoff": af_cutoffs[0],
+        "min_region_size_kb": minimum_kb,
         "packages": {name: utils.package_revision(name) for name in ["tsinfer", "tsls"]},
         "numerical_settings": matching.numerical_settings(model.parameters),
         "requests": [dataclasses.asdict(request) for request in requests],

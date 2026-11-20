@@ -64,7 +64,8 @@ VCZ arrays must have consistent variant chunks.
 
 The catalog and packed calls are reused across minimum lengths, worker counts
 and gap-conditioning settings. Updating the ancestor panel, reference tree or
-cohort AF input triggers preparation.
+cohort AF input triggers preparation. Each configured cutoff sweep shares one
+payload. A match reads the prefix containing spans admitted by its cutoff.
 
 The minimum in kb becomes
 `max(1, round(kb * 1000 * num_sites / (last_position - first_position)))`

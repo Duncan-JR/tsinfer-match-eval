@@ -234,6 +234,8 @@ def trial(spec_path):
             ),
             "full_hmm": run["method"] == "full_hmm",
         }
+        if run["method"] == "greedy":
+            kwargs["af_cutoffs"] = utils.parameter_values(dataset["af_cutoff"])
         if run["mode"] == "from_reference":
             with window:
                 workers = matching.match_stitched_samples(

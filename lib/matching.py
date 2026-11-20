@@ -74,7 +74,7 @@ def _sample_config(config_path, ancestors_ts_path, output_path):
     )
 
 
-def prepare_focal_ancestors(config_path, reference_path, af_cutoff, choice, workers):
+def prepare_focal_ancestors(config_path, reference_path, af_cutoffs, choice, workers):
     """Build the greedy workflow product after the ancestor reference is complete."""
     native = tsinfer.config.Config.from_toml(config_path)
     return haplotypes.prepare_focal_reference(
@@ -82,9 +82,10 @@ def prepare_focal_ancestors(config_path, reference_path, af_cutoff, choice, work
         native.sources["samples"].path,
         reference_path,
         tskit.load(reference_path),
-        af_cutoff,
+        max(af_cutoffs),
         choice,
         workers,
+        af_cutoffs=af_cutoffs,
     )
 
 
@@ -779,6 +780,7 @@ def match_stitched_samples(
     resident: bool = False,
     window: performance.Window | None = None,
     full_hmm: bool = False,
+    af_cutoffs: list[float] | None = None,
 ) -> int:
     """Share one immutable tsls panel and stream bounded whole-haplotype jobs.
 
@@ -879,6 +881,7 @@ def match_stitched_samples(
                         focal_choice,
                         workers,
                         collector,
+                        af_cutoffs=af_cutoffs,
                     )
                 with performance.measure(collector, "reference_reload"):
                     packed = catalog.read_packed()

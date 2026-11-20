@@ -70,6 +70,15 @@ class ReferenceCatalog:
 
 
 @dataclasses.dataclass
+class FocalLayout:
+    """A panel-ordered catalog whose offsets follow cutoff admission order."""
+
+    catalog: ReferenceCatalog
+    admissions: np.ndarray
+    prefix_bytes: np.ndarray
+
+
+@dataclasses.dataclass
 class VariantBlock:
     """Reference-site rows selected from one physical variant block."""
 
@@ -253,11 +262,15 @@ def load_resident_sample_chunk(inputs, chunk, sample_reader_threads=1):
 
 
 def prepare_reference(panel_path, sample_path, reference, af_cutoff, choice, directory):
-    """Select by cohort-derived seed AF and clip supports before any extension.
+    """Select supported spans and assign offsets for a single cutoff."""
+    layout = _select_focal_spans(
+        panel_path, sample_path, reference, (af_cutoff,), choice, directory
+    )
+    return layout.catalog
 
-    The caller owns storage for :func:`pack_reference_chunk`.
-    A shared seed does not collapse distinct panel ancestors.
-    """
+
+def _select_focal_spans(panel_path, sample_path, reference, cutoffs, choice, directory):
+    """Clip support to inference intervals and assign offsets in cutoff order."""
     panel = tsinfer.vcz.open_store(panel_path)
     samples = tsinfer.vcz.open_store(sample_path)
     positions = reference.sites_position.astype(np.int32)
@@ -298,9 +311,11 @@ def prepare_reference(panel_path, sample_path, reference, af_cutoff, choice, dir
     sample_rows = site_rows(samples, positions)
     seed_rows = sample_rows[seeds]
     frequencies = samples["variant_match_eval_derived_af"].oindex[seed_rows]
-    eligible = frequencies <= af_cutoff
+    thresholds = np.asarray(cutoffs, dtype=frequencies.dtype)
+    eligible = frequencies <= thresholds[-1]
     columns = columns[eligible]
     seeds = seeds[eligible]
+    admissions = np.searchsorted(thresholds, frequencies[eligible], side="left")
     containing = np.searchsorted(intervals[:, 0], positions[seeds], side="right") - 1
     supports = intervals[containing]
     start_positions = np.maximum(
@@ -312,15 +327,21 @@ def prepare_reference(panel_path, sample_path, reference, af_cutoff, choice, dir
     if np.any(containing < 0) or np.any((seeds < starts) | (seeds >= stops)):
         raise ValueError("An ancestor seed is outside its clipped support")
     lengths = stops - starts
-    offsets = np.zeros(len(columns), dtype=np.int64)
-    offsets[1:] = np.cumsum(lengths[:-1], dtype=np.int64)
-    descriptor = MappedCalls(directory / "ancestors.bin", (int(lengths.sum()),))
+    order = np.argsort(admissions, kind="stable")
+    grouped_lengths = lengths[order]
+    grouped_ends = np.cumsum(grouped_lengths, dtype=np.int64)
+    offsets = np.empty(len(columns), dtype=np.int64)
+    offsets[order] = grouped_ends - grouped_lengths
+    tier_sizes = np.zeros(len(cutoffs), dtype=np.int64)
+    np.add.at(tier_sizes, admissions, lengths)
+    prefix_bytes = np.cumsum(tier_sizes)
+    descriptor = MappedCalls(directory / "ancestors.bin", (int(prefix_bytes[-1]),))
     parents = np.asarray([nodes[ids[col]] for col in columns], dtype=np.int32)
     catalog = ReferenceCatalog(
         parents, columns, seeds, starts, stops, offsets, descriptor
     )
     catalog.make_readonly()
-    return catalog
+    return FocalLayout(catalog, admissions, prefix_bytes)
 
 
 def reference_chunks(panel_path, catalog):
@@ -382,13 +403,17 @@ def _pack_tile(
             packed[offset + site - start] = tile[site - block_start, column, 0]
 
 
-def focal_directory(reference_path, choice, af_cutoff):
-    """Destination shared by matching, profiling and process-based diagnostics."""
-    return (
-        reference_path.parent
-        / "focal"
-        / f"{reference_path.stem}_{choice}_{float(af_cutoff)}"
-    )
+def _cutoff_group(cutoffs):
+    return tuple(sorted({float(cutoff) for cutoff in cutoffs}))
+
+
+def focal_directory(reference_path, choice, cutoffs):
+    """Destination shared by all greedy jobs in a configured cutoff group."""
+    cutoffs = _cutoff_group(cutoffs)
+    group_id = str(cutoffs[0])
+    if len(cutoffs) > 1:
+        group_id = hashlib.sha256(repr(cutoffs).encode()).hexdigest()
+    return reference_path.parent / "focal" / f"{reference_path.stem}_{choice}_{group_id}"
 
 
 def _fingerprint_path(digest, path):
@@ -425,8 +450,10 @@ def _fingerprint_path(digest, path):
         )
 
 
-def _focal_key(panel_path, sample_path, reference_path, choice, af_cutoff):
-    digest = hashlib.sha256(repr((choice, af_cutoff)).encode())
+def _focal_key(panel_path, sample_path, reference_path, choice, cutoffs):
+    # Use the original key for products with one tier.
+    settings = cutoffs[0] if len(cutoffs) == 1 else cutoffs
+    digest = hashlib.sha256(repr((choice, settings)).encode())
     _fingerprint_path(digest, panel_path)
     for name in ("zarr.json", "variant_position", "variant_match_eval_derived_af"):
         path = sample_path / name
@@ -436,8 +463,9 @@ def _focal_key(panel_path, sample_path, reference_path, choice, af_cutoff):
     return digest.hexdigest()
 
 
-def _write_focal_reference(panel_path, catalog, workers):
+def _write_focal_reference(panel_path, layout, workers):
     """Write disjoint spans directly into the product's only genotype buffer."""
+    catalog = layout.catalog
     genotypes = tsinfer.vcz.open_store(panel_path)["call_genotype"]
     chunks = np.unique(catalog.columns // genotypes.chunks[1])
     catalog.packed.path.touch()
@@ -454,8 +482,33 @@ def _write_focal_reference(panel_path, catalog, workers):
         field.name for field in dataclasses.fields(catalog) if field.name != "packed"
     )
     arrays = {name: getattr(catalog, name) for name in fields}
+    if len(layout.prefix_bytes) > 1:
+        arrays.update(admissions=layout.admissions, prefix_bytes=layout.prefix_bytes)
     np.savez(catalog.packed.path.with_name("catalog.npz"), **arrays)
     return tiles
+
+
+def _read_focal_catalog(product, tier):
+    """Read catalog metadata in panel order and describe the matching byte prefix."""
+    fields = (
+        field.name
+        for field in dataclasses.fields(ReferenceCatalog)
+        if field.name != "packed"
+    )
+    with np.load(product / "catalog.npz") as saved:
+        if "admissions" in saved.files:
+            eligible = saved["admissions"] <= tier
+            arrays = {name: saved[name][eligible] for name in fields}
+            size = int(saved["prefix_bytes"][tier])
+        else:
+            arrays = {name: saved[name] for name in fields}
+            size = int(np.sum(arrays["stops"] - arrays["starts"]))
+    payload = product / "ancestors.bin"
+    if payload.stat().st_size < size:
+        raise ValueError("Prepared focal ancestor payload is incomplete")
+    catalog = ReferenceCatalog(**arrays, packed=MappedCalls(payload, (size,)))
+    catalog.make_readonly()
+    return catalog
 
 
 def prepare_focal_reference(
@@ -467,6 +520,8 @@ def prepare_focal_reference(
     choice,
     workers,
     collector=None,
+    *,
+    af_cutoffs=None,
 ):
     """Publish the catalog and payload together and return an immutable catalog.
 
@@ -476,13 +531,17 @@ def prepare_focal_reference(
     af_cutoff = float(af_cutoff)
     panel_path = pathlib.Path(panel_path)
     sample_path = pathlib.Path(sample_path)
-    directory = focal_directory(reference_path, choice, af_cutoff)
+    if af_cutoffs is None:
+        af_cutoffs = (af_cutoff,)
+    cutoffs = _cutoff_group(af_cutoffs)
+    tier = cutoffs.index(af_cutoff)
+    directory = focal_directory(reference_path, choice, cutoffs)
     directory.mkdir(parents=True, exist_ok=True)
     tiles = 0
     started = time.perf_counter()
     with (directory / ".lock").open("a") as lock:
         fcntl.flock(lock, fcntl.LOCK_EX)
-        key = _focal_key(panel_path, sample_path, reference_path, choice, af_cutoff)
+        key = _focal_key(panel_path, sample_path, reference_path, choice, cutoffs)
         product = directory / key
         converted = not product.is_dir()
         if converted:
@@ -492,23 +551,19 @@ def prepare_focal_reference(
                 ) as tmp:
                     staging = pathlib.Path(tmp) / "product"
                     staging.mkdir()
-                    catalog = prepare_reference(
-                        panel_path, sample_path, reference, af_cutoff, choice, staging
+                    layout = _select_focal_spans(
+                        panel_path, sample_path, reference, cutoffs, choice, staging
                     )
-                    tiles = _write_focal_reference(panel_path, catalog, workers)
+                    tiles = _write_focal_reference(panel_path, layout, workers)
                     verified_key = _focal_key(
-                        panel_path, sample_path, reference_path, choice, af_cutoff
+                        panel_path, sample_path, reference_path, choice, cutoffs
                     )
                     if verified_key != key:
                         raise RuntimeError(
                             "Focal reference inputs changed during conversion"
                         )
                     staging.rename(product)
-    payload = product / "ancestors.bin"
-    descriptor = MappedCalls(payload, (payload.stat().st_size,))
-    with np.load(product / "catalog.npz") as arrays:
-        catalog = ReferenceCatalog(**arrays, packed=descriptor)
-    catalog.make_readonly()
+    catalog = _read_focal_catalog(product, tier)
     elapsed = time.perf_counter() - started
     if collector is not None:
         collector.count(ancestor_blocks_read=tiles)
@@ -518,7 +573,7 @@ def prepare_focal_reference(
         "Converted" if converted else "Opened",
         elapsed,
         tiles,
-        descriptor.shape[0],
+        catalog.packed.shape[0],
         product,
     )
     return catalog
