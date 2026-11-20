@@ -8,6 +8,7 @@ import pathlib
 import re
 import shutil
 import subprocess
+import tempfile
 import urllib.parse
 
 import numcodecs
@@ -53,14 +54,16 @@ def annotate_derived_counts(
     ancestral_state: dict,
     samples: str | None = None,
 ) -> None:
-    """Copy the VCZ and annotate derived counts for the native selected cohort.
+    """Annotate the selected cohort in a VCZ view of the source arrays.
 
     Retain both original axes. Read selected columns within physical tiles;
     missing calls do not enter either allele count or frequency denominator.
     Under the biallelic input contract, non-reference ancestry makes REF derived.
     """
-    shutil.copytree(source, output)
-    store = zarr.open_group(output, mode="a", use_consolidated=False)
+    if output.exists() or output.is_symlink():
+        raise FileExistsError(output)
+    source = source.resolve()
+    store = zarr.open_group(source, mode="r", use_consolidated=False)
     columns = tsinfer.vcz.resolve_samples_selection(store, samples)
     genotypes = store["call_genotype"]
     sample_blocks = columns // genotypes.chunks[1]
@@ -92,13 +95,29 @@ def annotate_derived_counts(
         allele_count[start:end] = counts
         np.divide(counts, called, out=frequency[start:end], where=called > 0)
     chunks = store["variant_position"].chunks
-    for name, values in (
-        ("variant_match_eval_derived_ac", allele_count),
-        ("variant_match_eval_derived_af", frequency),
-    ):
-        array = store.create_array(name, data=values, chunks=chunks, overwrite=True)
-        array.attrs["_ARRAY_DIMENSIONS"] = ["variants"]
-    zarr.consolidate_metadata(output)
+    annotations = {
+        "variant_match_eval_derived_ac": allele_count,
+        "variant_match_eval_derived_af": frequency,
+    }
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(dir=output.parent) as staging:
+        view = pathlib.Path(staging) / output.name
+        view.mkdir()
+        for entry in source.iterdir():
+            if entry.name in annotations:
+                continue
+            target = view / entry.name
+            if entry.is_dir():
+                target.symlink_to(entry, target_is_directory=True)
+            else:
+                # Consolidation writes root metadata, which belongs to this view.
+                shutil.copy2(entry, target)
+        annotated = zarr.open_group(view, mode="a", use_consolidated=False)
+        for name, values in annotations.items():
+            array = annotated.create_array(name, data=values, chunks=chunks)
+            array.attrs["_ARRAY_DIMENSIONS"] = ["variants"]
+        zarr.consolidate_metadata(view)
+        view.rename(output)
     logger.info(
         "Annotated %d variants for %d individuals", len(allele_count), len(columns)
     )

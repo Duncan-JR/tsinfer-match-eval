@@ -153,7 +153,9 @@ Each `datasets` entry has:
 
 Products beneath `data_dir` include annotated `samples/`, native TOML in
 `configs/`, ancestor panels/references in `ancestors/`, and raw sample trees
-in `matches/`. Greedy outputs use
+in `matches/`. Each annotated sample store links to the original VCZ arrays
+and stores its own derived counts and frequencies. Keep the source VCZ at
+its configured path while using these stores. Greedy outputs use
 `matches/af_{af_cutoff}/min_region_kb_{min_region_size_kb}/`.
 Their `match_eval` metadata records the requested minimum and resolved site count.
 
