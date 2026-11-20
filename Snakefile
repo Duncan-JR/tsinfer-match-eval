@@ -148,17 +148,18 @@ rule make_inference_config:
         )
 
 
-rule infer_ancestors:
-    input:
-        data_dir / "configs" / "{name}_ancestor_inference.toml",
-    output:
-        directory(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr"),
-    log:
-        progress_dir / "infer_ancestors" / "{name}_infer_ancestors.log",
-    threads: config["inference_threads"]
-    run:
-        utils.setup_log(pathlib.Path(log[0]))
-        ancestors.infer_ancestors(pathlib.Path(input[0]), threads)
+if not config.get("reuse_prepared_ancestors", False):
+    rule infer_ancestors:
+        input:
+            data_dir / "configs" / "{name}_ancestor_inference.toml",
+        output:
+            directory(data_dir / "ancestors" / "{name}_inferred_ancestors.zarr"),
+        log:
+            progress_dir / "infer_ancestors" / "{name}_infer_ancestors.log",
+        threads: config["inference_threads"]
+        run:
+            utils.setup_log(pathlib.Path(log[0]))
+            ancestors.infer_ancestors(pathlib.Path(input[0]), threads)
 
 
 rule extract_true_ancestors:
@@ -214,23 +215,24 @@ rule make_true_ancestors_config:
         )
 
 
-rule match_ancestors:
-    input:
-        ancestors=data_dir / "ancestors" / "{name}_{kind}_ancestors.zarr",
-        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
-        config=panel_config,
-    output:
-        data_dir / "ancestors" / "{name}_{kind}_ancestors.trees",
-    log:
-        progress_dir / "match_ancestors" / "{name}_{kind}_match_ancestors.log",
-    params:
-        cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
-    threads: config["matching_threads"]
-    run:
-        utils.setup_log(pathlib.Path(log[0]))
-        matching.match_ancestors(
-            pathlib.Path(input.config), pathlib.Path(output[0]), threads, params.cache_size
-        )
+if not config.get("reuse_prepared_ancestors", False):
+    rule match_ancestors:
+        input:
+            ancestors=data_dir / "ancestors" / "{name}_{kind}_ancestors.zarr",
+            samples=data_dir / "samples" / "{name}_samples_masked.zarr",
+            config=panel_config,
+        output:
+            data_dir / "ancestors" / "{name}_{kind}_ancestors.trees",
+        log:
+            progress_dir / "match_ancestors" / "{name}_{kind}_match_ancestors.log",
+        params:
+            cache_size=lambda wildcards: datasets[wildcards.name].get("matching_cache_size"),
+        threads: config["matching_threads"]
+        run:
+            utils.setup_log(pathlib.Path(log[0]))
+            matching.match_ancestors(
+                pathlib.Path(input.config), pathlib.Path(output[0]), threads, params.cache_size
+            )
 
 
 rule prepare_focal_ancestors:

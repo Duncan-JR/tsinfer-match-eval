@@ -93,6 +93,7 @@ Ordinary matching runs their Cartesian product and shares one full-HMM baseline.
 | `progress_dir` | Per-rule log root. |
 | `focal_choice` | `left` (default) or `right` endpoint focal seed. |
 | `condition_gaps` | Default `true`; condition residual greedy HMM gaps on adjacent copied parents. `false` removes conditioning and flanking observation padding. One-site-gap copying is unchanged. |
+| `reuse_prepared_ancestors` | Default `false`. Set to `true` when the required ancestor Zarr panels and matched reference trees already exist under `data_dir/ancestors/`. The workflow treats them as inputs and skips ancestor inference and matching. |
 | `hmm.recombination` | Constant HMM recombination probability between inference sites, strictly between 0 and 1. |
 | `hmm.recombination_rate` | Alternative to `hmm.recombination`: a nonnegative rate per bp per generation, or a HapMap file path. tsinfer converts genetic distances between inference sites to probabilities using Haldane's map function. Choose exactly one recombination setting. |
 | `hmm.mismatch` | Sample mismatch probability, strictly between 0 and 1. Mutually exclusive with `hmm.mismatch_epsilon`. Exact extension stops at called disagreements; one-site-gap copies can require sample mutations. |
