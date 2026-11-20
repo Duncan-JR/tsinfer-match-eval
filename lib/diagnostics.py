@@ -8,7 +8,6 @@ import concurrent.futures as cf
 import csv
 import dataclasses
 import datetime
-import functools
 import importlib.metadata
 import json
 import logging
@@ -1027,7 +1026,7 @@ def _write_manifest(config, products, datasets, workers, performance_files):
 
 
 def run(config, workers):
-    """Produce the diagnostic tables, masks and provenance after all workflow inputs exist."""
+    """Produce diagnostic tables, masks and provenance from completed workflow inputs."""
     utils.validate_config(config)
     population_sources(config)
     performance_files = _performance_files(config)
@@ -1121,32 +1120,15 @@ def run(config, workers):
                         )
                         for item in runs
                     }
-                    packing_started = time.perf_counter()
-                    catalog = haplotypes.prepare_reference(
+                    catalog = haplotypes.prepare_focal_reference(
                         native.ancestors[0].path,
-                        samples,
+                        samples.path,
+                        inputs.reference,
                         reference,
                         af,
                         config.get("focal_choice", "left"),
-                        directory,
+                        workers,
                     )
-                    panel = tsinfer.vcz.open_store(native.ancestors[0].path)
-                    genotypes = panel["call_genotype"]
-                    chunks = haplotypes.reference_chunks(
-                        native.ancestors[0].path, catalog
-                    )
-                    packed = catalog.packed.open("w+")
-                    try:
-                        pack = functools.partial(
-                            haplotypes.pack_reference_chunk,
-                            genotypes,
-                            catalog,
-                            packed=packed,
-                        )
-                        with cf.ThreadPoolExecutor(max_workers=workers) as packing_pool:
-                            list(packing_pool.map(pack, chunks))
-                    finally:
-                        haplotypes.close_mapping(packed)
                     results = {
                         item.min_region_size_kb: [None] * len(jobs) for item in runs
                     }
@@ -1170,11 +1152,6 @@ def run(config, workers):
                             config["helper_threads"],
                         ),
                     ) as pool:
-                        logger.info(
-                            "Diagnostic reference preparation/packing "
-                            "(including worker startup): %.3fs",
-                            time.perf_counter() - packing_started,
-                        )
                         for wave in _sample_waves(samples.chunks, workers):
                             started = time.perf_counter()
                             slabs = list(pool.map(_decode_chunk, wave))

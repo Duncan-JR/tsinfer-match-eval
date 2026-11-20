@@ -2,7 +2,7 @@ import csv
 import pathlib
 import re
 
-from lib import ancestors, benchmark, diagnostics, matching, utils
+from lib import ancestors, benchmark, diagnostics, haplotypes, matching, utils
 
 
 configfile: "config.yaml"
@@ -229,9 +229,32 @@ rule match_ancestors:
         )
 
 
+rule prepare_focal_ancestors:
+    input:
+        reference=data_dir / "ancestors" / "{name}_inferred_ancestors.trees",
+        ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
+        samples=data_dir / "samples" / "{name}_samples_masked.zarr",
+        config=data_dir / "configs" / "{name}_ancestor_inference.toml",
+    output:
+        directory(data_dir / "ancestors" / "focal" / f"{{name}}_inferred_ancestors_{focal_choice}_{{focal_af}}"),
+    threads: config["matching_threads"]
+    log:
+        progress_dir / "prepare_focal_ancestors" / "{name}_{focal_af}.log",
+    run:
+        utils.setup_log(pathlib.Path(log[0]))
+        matching.prepare_focal_ancestors(
+            pathlib.Path(input.config), pathlib.Path(input.reference),
+            float(wildcards.focal_af), focal_choice, threads,
+        )
+
+
 rule match_stitched_samples:
     input:
         reference=lambda wildcards: greedy_input(wildcards, str(data_dir / "ancestors" / "{name}_inferred_ancestors.trees")),
+        focal=lambda wildcards: haplotypes.focal_directory(
+            data_dir / "ancestors" / f"{wildcards.name}_inferred_ancestors.trees",
+            focal_choice, float(wildcards.af_cutoff),
+        ),
         ancestors=data_dir / "ancestors" / "{name}_inferred_ancestors.zarr",
         samples=data_dir / "samples" / "{name}_samples_masked.zarr",
         config=data_dir / "configs" / "{name}_ancestor_inference.toml",

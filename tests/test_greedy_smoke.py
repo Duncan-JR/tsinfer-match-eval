@@ -343,7 +343,7 @@ class TestReferencePacking:
             frequencies[2] = 0.1
         store["variant_match_eval_derived_af"][:] = frequencies
         catalog = haplotypes.prepare_reference(
-            tiny.panel, samples, reference, 0.5, "left", tmp_path
+            tiny.panel, samples.path, reference, 0.5, "left", tmp_path
         )
         snapshot = {
             field.name: getattr(catalog, field.name).copy()
@@ -402,7 +402,7 @@ class TestReferencePacking:
     def test_invalid_derived_seed(self, tiny, tmp_path):
         reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
         catalog = haplotypes.prepare_reference(
-            tiny.panel, samples, reference, 1, "left", tmp_path
+            tiny.panel, samples.path, reference, 1, "left", tmp_path
         )
         panel = zarr.open_group(tiny.panel, mode="a", use_consolidated=False)
         panel["call_genotype"][catalog.seeds[0], catalog.columns[0], 0] = 0
@@ -422,7 +422,7 @@ class TestReferencePacking:
             directory = tmp_path / f"w{workers}"
             directory.mkdir()
             catalog = haplotypes.prepare_reference(
-                tiny.panel, samples, reference, 1, "left", directory
+                tiny.panel, samples.path, reference, 1, "left", directory
             )
             haplotypes.close_mapping(catalog.packed.open("w+"))
             chunks = haplotypes.reference_chunks(tiny.panel, catalog)
@@ -594,7 +594,8 @@ class TestMatchingLifetime:
 
             monkeypatch.setattr(tsinfer.matching, "finalise_match_tables", fail)
             message = "finaliser failure"
-        with pytest.raises(RuntimeError, match=message):
+        error = ValueError if failure == "seed" else RuntimeError
+        with pytest.raises(error, match=message):
             matching.match_stitched_samples(
                 tiny.config,
                 tiny.reference,
@@ -670,7 +671,7 @@ class TestConditionedGaps:
     def worker(self, tiny, tmp_path):
         reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
         catalog = haplotypes.prepare_reference(
-            tiny.panel, samples, reference, 1, "left", tmp_path
+            tiny.panel, samples.path, reference, 1, "left", tmp_path
         )
         genotypes = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
         packed = catalog.packed.open("w+")
@@ -876,12 +877,15 @@ class TestStageTimings:
             collectors.append(collector)
             outputs.append(smoke_helpers.canonical(output))
         assert outputs[0] == outputs[1]
-        assert collectors[0].workload == collectors[1].workload
+        first = collectors[0].workload.copy()
+        reused = collectors[1].workload.copy()
+        assert first.pop("ancestor_blocks_read") > 0
+        assert reused.pop("ancestor_blocks_read") == 0
+        assert first == reused
         assert collectors[0].records == {}
         records = {record.stage: record for record in collectors[1].records.values()}
         phases = [
             "coordinator_thread_startup",
-            "coordinator_packing_completion",
             "coordinator_worker_readiness",
             "coordinator_matching_drain",
             "coordinator_shutdown",
@@ -929,7 +933,7 @@ class TestStageTimings:
     def test_native_counts_and_shortcuts(self, tiny, tiny_config, tmp_path, kind):
         reference, _, samples = smoke_helpers.prepared(tiny, tmp_path)
         catalog = haplotypes.prepare_reference(
-            tiny.panel, samples, reference, 1, "left", tmp_path
+            tiny.panel, samples.path, reference, 1, "left", tmp_path
         )
         genotypes = tsinfer.vcz.open_store(tiny.panel)["call_genotype"]
         packed = catalog.packed.open("w+")

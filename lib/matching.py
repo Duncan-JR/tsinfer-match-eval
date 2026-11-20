@@ -74,6 +74,20 @@ def _sample_config(config_path, ancestors_ts_path, output_path):
     )
 
 
+def prepare_focal_ancestors(config_path, reference_path, af_cutoff, choice, workers):
+    """Build the greedy workflow product after the ancestor reference is complete."""
+    native = tsinfer.config.Config.from_toml(config_path)
+    return haplotypes.prepare_focal_reference(
+        native.ancestors[0].path,
+        native.sources["samples"].path,
+        reference_path,
+        tskit.load(reference_path),
+        af_cutoff,
+        choice,
+        workers,
+    )
+
+
 def match_samples(
     config_path: pathlib.Path,
     ancestors_ts_path: pathlib.Path,
@@ -477,7 +491,6 @@ def _worker_main(
     start_matching,
     stopping,
     worker_index,
-    panel_genotypes,
     model,
     catalog,
     packed,
@@ -488,26 +501,8 @@ def _worker_main(
     condition_gaps,
     full_hmm,
 ):
-    """Persistent packing and matching loop with a readiness barrier."""
+    """Initialise a worker and wait for the matching window to start."""
     try:
-        while not stopping.is_set():
-            chunk = work.get()
-            if chunk is None:
-                break
-            collector = performance.Collector(stages=diagnostics)
-            with performance.measure(
-                collector,
-                "reference_packing",
-                "thread",
-                parent_stage="coordinator_packing_completion",
-            ):
-                count = haplotypes.pack_reference_chunk(
-                    panel_genotypes, catalog, chunk, packed
-                )
-            collector.count(ancestor_blocks_read=count)
-            events.put(("packed", collector))
-        if stopping.is_set():
-            return
         collector = performance.Collector(stages=diagnostics)
         with performance.measure(
             collector,
@@ -578,26 +573,6 @@ def _event(events):
     if kind == "error":
         raise RuntimeError(payload)
     return kind, payload
-
-
-def _pack_reference(work, events, chunks, cap, collector):
-    """Bound submitted-but-uncollected preparation tasks with one admission count."""
-    chunks = iter(chunks)
-    pending = 0
-    exhausted = False
-    while not exhausted or pending > 0:
-        while not exhausted and pending < cap:
-            chunk = next(chunks, None)
-            if chunk is None:
-                exhausted = True
-            else:
-                work.put(chunk)
-                pending += 1
-        if pending > 0:
-            _, measurements = _event(events)
-            if collector is not None:
-                collector.merge(measurements)
-            pending -= 1
 
 
 def _load_samples(chunks, load_chunk, slots, stopping, events):
@@ -730,9 +705,11 @@ def _coordinate(
             del slab, payload
         elif kind == "result":
             if first_result and admitted is not None:
+                completed_at = time.perf_counter()
+                collector.diagnostics["first_result_timestamp"] = completed_at
                 collector.elapsed(
                     "first_result_latency",
-                    time.perf_counter() - admitted,
+                    completed_at - admitted,
                     parent_stage="coordinator_matching_drain",
                     inclusive=True,
                 )
@@ -805,7 +782,7 @@ def match_stitched_samples(
 ) -> int:
     """Share one immutable tsls panel and stream bounded whole-haplotype jobs.
 
-    One persistent thread pool handles packing and matching; a loader owns
+    One thread pool matches against a shared prepared reference; a loader owns
     bounded sample Zarr reader threads. Outstanding jobs and live decoded slabs
     have separate bounds. On failure, the coordinator stops the loader and
     workers before releasing their inputs. Returns the actual worker count.
@@ -823,9 +800,6 @@ def match_stitched_samples(
             "max_pending_haplotypes must be at least the worker count; "
             "use null to derive it from workers"
         )
-    native = tsinfer.config.Config.from_toml(config_path)
-    panel_path = native.ancestors[0].path
-    del native
     cfg = _sample_config(config_path, ancestors_ts_path, output_path)
     if helper_threads is not None:
         utils.configure_helpers(helper_threads)
@@ -879,7 +853,6 @@ def match_stitched_samples(
     packed = None
     model = None
     catalog = None
-    panel_genotypes = None
     loader = None
     live = {}
     resident_slabs = None
@@ -894,21 +867,21 @@ def match_stitched_samples(
                 model = prepare_model(
                     reference, samples.allele_mapper, cfg.match.sources["samples"]
                 )
-                catalog = None
-                chunks = []
-                if not full_hmm:
-                    catalog = haplotypes.prepare_reference(
-                        panel_path,
-                        samples,
+            if not full_hmm:
+                native = tsinfer.config.Config.from_toml(config_path)
+                with performance.measure(collector, "reference_prepare", inclusive=True):
+                    catalog = haplotypes.prepare_focal_reference(
+                        native.ancestors[0].path,
+                        samples.path,
+                        ancestors_ts_path,
                         reference,
                         af_cutoff,
                         focal_choice,
-                        directory,
+                        workers,
+                        collector,
                     )
-                    chunks = haplotypes.reference_chunks(panel_path, catalog)
-                    panel = tsinfer.vcz.open_store(panel_path)
-                    panel_genotypes = panel["call_genotype"]
-                    packed = np.empty(catalog.packed.shape, dtype=np.int8)
+                with performance.measure(collector, "reference_reload"):
+                    packed = catalog.read_packed()
             if collector is not None:
                 slab_sizes = sorted(
                     [
@@ -950,7 +923,6 @@ def match_stitched_samples(
                             start_matching,
                             stopping,
                             worker_index,
-                            panel_genotypes,
                             model,
                             catalog,
                             packed,
@@ -964,21 +936,10 @@ def match_stitched_samples(
                     )
             with performance.measure(
                 collector,
-                "coordinator_packing_completion",
-                "coordinator",
-                inclusive=True,
-            ):
-                _pack_reference(work, events, chunks, max_pending_haplotypes, collector)
-                if packed is not None:
-                    packed.flags.writeable = False
-            with performance.measure(
-                collector,
                 "coordinator_worker_readiness",
                 "coordinator",
                 inclusive=True,
             ):
-                for _ in futures:
-                    work.put(None)
                 for _ in futures:
                     _, measurements = _event(events)
                     if collector is not None:

@@ -32,7 +32,9 @@ VCZ arrays must have consistent variant chunks.
 2. Infer and match ancestors to create a reference. Explicit `true` targets
    can extract true ancestors when a truth tree sequence is available.
 3. Run an independent full-HMM sample baseline.
-4. Select each eligible ancestor's leftmost or rightmost focal seed, applying
+4. Prepare the focal ancestor catalog and supported calls under
+   `data_dir/ancestors/focal/` once the ancestor tree is ready. Select each
+   eligible ancestor's leftmost or rightmost focal seed, applying
    the selected-cohort derived-AF cutoff. Pack support clipped to its containing
    inference interval. A derived sample call at the seed activates the ancestor.
 5. Extend exact matches, skipping missing observations and stopping at called
@@ -59,6 +61,10 @@ VCZ arrays must have consistent variant chunks.
 8. Match all residual windows of one haplotype in one native batch, with
    independent likelihood resets. Clip paths to true gaps and assemble paths
    and mutations once. Append results, squash edges, sort and finalise output.
+
+The catalog and packed calls are reused across minimum lengths, worker counts
+and gap-conditioning settings. Updating the ancestor panel, reference tree or
+cohort AF input triggers preparation.
 
 The minimum in kb becomes
 `max(1, round(kb * 1000 * num_sites / (last_position - first_position)))`

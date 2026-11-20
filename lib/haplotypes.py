@@ -2,14 +2,21 @@
 
 import concurrent.futures as cf
 import dataclasses
+import fcntl
+import functools
+import hashlib
 import itertools
 import logging
+import os
 import pathlib
+import tempfile
 import time
 
 import numba
 import numpy as np
 import tsinfer
+
+from . import performance
 
 logger = logging.getLogger(__name__)
 
@@ -46,6 +53,14 @@ class ReferenceCatalog:
     stops: np.ndarray
     offsets: np.ndarray
     packed: MappedCalls
+
+    def read_packed(self):
+        """Load the supported calls sequentially into one read-only int8 array."""
+        packed = np.fromfile(self.packed.path, dtype=np.int8, count=self.packed.shape[0])
+        if packed.shape != self.packed.shape:
+            raise ValueError("Prepared focal ancestor payload is incomplete")
+        packed.flags.writeable = False
+        return packed
 
     def make_readonly(self):
         for field in dataclasses.fields(self):
@@ -237,18 +252,19 @@ def load_resident_sample_chunk(inputs, chunk, sample_reader_threads=1):
     return SampleSlab(chunk.block, slab, chunk.job_indices, blocks_read, elapsed)
 
 
-def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, directory):
+def prepare_reference(panel_path, sample_path, reference, af_cutoff, choice, directory):
     """Select by cohort-derived seed AF and clip supports before any extension.
 
     The caller owns storage for :func:`pack_reference_chunk`.
     A shared seed does not collapse distinct panel ancestors.
     """
     panel = tsinfer.vcz.open_store(panel_path)
-    samples = tsinfer.vcz.open_store(sample_input.path)
+    samples = tsinfer.vcz.open_store(sample_path)
     positions = reference.sites_position.astype(np.int32)
     if not np.array_equal(panel["variant_position"][:], positions):
         raise ValueError("Ancestor panel and reference site axes disagree")
-    if not np.array_equal(panel["variant_allele"][:, 0], sample_input.ancestral):
+    ancestral = np.asarray([site.ancestral_state for site in reference.sites()])
+    if not np.array_equal(panel["variant_allele"][:, 0], ancestral):
         raise ValueError("Ancestor panel and reference polarisation disagree")
     intervals = np.asarray(reference.metadata["sequence_intervals"])
     if not np.array_equal(panel["sequence_intervals"][:], intervals):
@@ -279,7 +295,7 @@ def prepare_reference(panel_path, sample_input, reference, af_cutoff, choice, di
     if np.any(positions[selected_seeds] != selected_focal):
         raise ValueError("An ancestor seed is absent from the reference")
     seeds = selected_seeds
-    sample_rows = sample_input.source_rows
+    sample_rows = site_rows(samples, positions)
     seed_rows = sample_rows[seeds]
     frequencies = samples["variant_match_eval_derived_af"].oindex[seed_rows]
     eligible = frequencies <= af_cutoff
@@ -364,3 +380,145 @@ def _pack_tile(
         offset = offsets[ancestor] + start - starts[ancestor]
         for site in range(start, stop):
             packed[offset + site - start] = tile[site - block_start, column, 0]
+
+
+def focal_directory(reference_path, choice, af_cutoff):
+    """Destination shared by matching, profiling and process-based diagnostics."""
+    return (
+        reference_path.parent
+        / "focal"
+        / f"{reference_path.stem}_{choice}_{float(af_cutoff)}"
+    )
+
+
+def _fingerprint_path(digest, path):
+    """Fingerprint local file identities without reading genotype tiles."""
+    resolved = path.resolve(strict=True)
+    digest.update(os.fsencode(resolved))
+    if resolved.is_dir():
+        for root, directories, files in os.walk(resolved, followlinks=True):
+            directories.sort()
+            for name in sorted(files):
+                entry = pathlib.Path(root, name)
+                stat = entry.stat()
+                identity = (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+                digest.update(os.fsencode(entry.relative_to(resolved)))
+                digest.update(repr(identity).encode())
+    else:
+        stat = resolved.stat()
+        digest.update(
+            repr(
+                (
+                    stat.st_dev,
+                    stat.st_ino,
+                    stat.st_size,
+                    stat.st_mtime_ns,
+                    stat.st_ctime_ns,
+                )
+            ).encode()
+        )
+
+
+def _focal_key(panel_path, sample_path, reference_path, choice, af_cutoff):
+    digest = hashlib.sha256(repr((choice, af_cutoff)).encode())
+    _fingerprint_path(digest, panel_path)
+    for name in ("zarr.json", "variant_position", "variant_match_eval_derived_af"):
+        path = sample_path / name
+        if path.exists():
+            _fingerprint_path(digest, path)
+    _fingerprint_path(digest, reference_path)
+    return digest.hexdigest()
+
+
+def _write_focal_reference(panel_path, catalog, workers):
+    """Write disjoint spans directly into the product's only genotype buffer."""
+    genotypes = tsinfer.vcz.open_store(panel_path)["call_genotype"]
+    chunks = np.unique(catalog.columns // genotypes.chunks[1])
+    catalog.packed.path.touch()
+    packed = catalog.packed.open("w+")
+    try:
+        pack = functools.partial(pack_reference_chunk, genotypes, catalog, packed=packed)
+        with cf.ThreadPoolExecutor(max_workers=workers) as pool:
+            tiles = sum(pool.map(pack, chunks))
+        if isinstance(packed, np.memmap):
+            packed.flush()
+    finally:
+        close_mapping(packed)
+    fields = (
+        field.name for field in dataclasses.fields(catalog) if field.name != "packed"
+    )
+    arrays = {name: getattr(catalog, name) for name in fields}
+    np.savez(catalog.packed.path.with_name("catalog.npz"), **arrays)
+    return tiles
+
+
+def prepare_focal_reference(
+    panel_path,
+    sample_path,
+    reference_path,
+    reference,
+    af_cutoff,
+    choice,
+    workers,
+    collector=None,
+):
+    """Publish the catalog and payload together and return an immutable catalog.
+
+    Inputs are immutable during a workflow job. Recheck their identities before
+    publishing so a replaced input cannot leave a product under its previous key.
+    """
+    af_cutoff = float(af_cutoff)
+    panel_path = pathlib.Path(panel_path)
+    sample_path = pathlib.Path(sample_path)
+    directory = focal_directory(reference_path, choice, af_cutoff)
+    directory.mkdir(parents=True, exist_ok=True)
+    tiles = 0
+    started = time.perf_counter()
+    with (directory / ".lock").open("a") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        key = _focal_key(panel_path, sample_path, reference_path, choice, af_cutoff)
+        product = directory / key
+        converted = not product.is_dir()
+        if converted:
+            with performance.measure(collector, "reference_conversion"):
+                with tempfile.TemporaryDirectory(
+                    dir=directory, prefix=".packing_"
+                ) as tmp:
+                    staging = pathlib.Path(tmp) / "product"
+                    staging.mkdir()
+                    catalog = prepare_reference(
+                        panel_path, sample_path, reference, af_cutoff, choice, staging
+                    )
+                    tiles = _write_focal_reference(panel_path, catalog, workers)
+                    verified_key = _focal_key(
+                        panel_path, sample_path, reference_path, choice, af_cutoff
+                    )
+                    if verified_key != key:
+                        raise RuntimeError(
+                            "Focal reference inputs changed during conversion"
+                        )
+                    staging.rename(product)
+    payload = product / "ancestors.bin"
+    descriptor = MappedCalls(payload, (payload.stat().st_size,))
+    with np.load(product / "catalog.npz") as arrays:
+        catalog = ReferenceCatalog(**arrays, packed=descriptor)
+    catalog.make_readonly()
+    elapsed = time.perf_counter() - started
+    if collector is not None:
+        collector.count(ancestor_blocks_read=tiles)
+        collector.diagnostics["focal_reference_converted"] = converted
+    logger.info(
+        "%s focal reference in %.3fs (%d genotype tiles, %d useful bytes): %s",
+        "Converted" if converted else "Opened",
+        elapsed,
+        tiles,
+        descriptor.shape[0],
+        product,
+    )
+    return catalog

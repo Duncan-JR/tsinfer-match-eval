@@ -263,8 +263,10 @@ def trial(spec_path):
             _write_csv(
                 folder / timing_path, [{"run_id": run["run_id"], **row} for row in rows]
             )
+        first_result = collector.diagnostics["first_result_timestamp"]
         result = {
             "status": "ok",
+            "time_to_first_result_s": first_result - window.start_timestamp,
             "haplotype_timings": timing_path,
             "window": dataclasses.asdict(window),
             "actual_workers": workers,
@@ -847,6 +849,8 @@ def _trial_row(run, result):
             {key: result["window"][key] for key in ("wall_s", "user_s", "system_s")}
         )
         row.update(result["workload"])
+        if "time_to_first_result_s" in result:
+            row["time_to_first_result_s"] = result["time_to_first_result_s"]
         row["actual_workers"] = result["actual_workers"]
         row["window_peak_private_bytes"] = result["window_peak_private_bytes"]
         row["window_peak_pss_bytes"] = result["window_peak_pss_bytes"]
